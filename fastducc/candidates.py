@@ -849,12 +849,41 @@ def _stack_tables_or_empty(tables):
     return T
 
 def consolidate_chunk_catalogues(
-    out_dir: str = "./catalogues",
-    var_csv_pattern: str = "./chunk*_candidates_variance.csv",
-    box_csv_pattern: str = "./chunk*_candidates_boxcar.csv",
+    *,
+    ms_base: str,                         # e.g., "example" from "example.ms"
+    out_dir: str,                         # e.g., "<MS parent>/candidates"
+    var_csv_pattern: str,                 # e.g., "<candidates>/<ms_base>_chunk_*_var_candidates.csv"
+    box_csv_pattern: str,                 # e.g., "<candidates>/<ms_base>_chunk_*_boxcar_candidates.csv"
     remove_chunk_catalogues: bool = True
 ):
-    """Consolidate per-chunk catalogues from disk and optionally remove them."""
+    """
+    Consolidate per-chunk catalogues from disk into MS-local `candidates/`,
+    write consolidated CSV+VOT with names like:
+        <out_dir>/<ms_base>_variance_all.csv
+        <out_dir>/<ms_base>_variance_all.vot
+        <out_dir>/<ms_base>_boxcar_all.csv
+        <out_dir>/<ms_base>_boxcar_all.vot
+    Optionally remove per-chunk CSV/VOT files afterwards.
+
+    Parameters
+    ----------
+    ms_base : str
+        Base name of the measurement set (e.g., "example" for "example.ms").
+    out_dir : str
+        Destination directory (the `candidates/` folder next to the MS).
+    var_csv_pattern : str
+        Glob pattern for variance per-chunk CSV files.
+        Example: os.path.join(candidates_dir, f"{ms_base}_chunk_*_var_candidates.csv")
+    box_csv_pattern : str
+        Glob pattern for boxcar per-chunk CSV files.
+        Example: os.path.join(candidates_dir, f"{ms_base}_chunk_*_boxcar_candidates.csv")
+    remove_chunk_catalogues : bool
+        If True, delete per-chunk CSV/VOT files after consolidation.
+
+    Returns
+    -------
+    None
+    """
     os.makedirs(out_dir, exist_ok=True)
 
     # 1) Glob per-chunk CSV files
@@ -870,14 +899,14 @@ def consolidate_chunk_catalogues(
     t_var_all = _stack_tables_or_empty(var_tables)
     t_box_all = _stack_tables_or_empty(box_tables)
 
-    # 3) Write consolidated catalogues (CSV + VOT)
-    var_out_csv = os.path.join(out_dir, "candidates_variance_all.csv")
-    var_out_vot = os.path.join(out_dir, "candidates_variance_all.vot")
+    # 3) Write consolidated catalogues (CSV + VOT) into candidates dir with ms_base prefix
+    var_out_csv = os.path.join(out_dir, f"{ms_base}_variance_all.csv")
+    var_out_vot = os.path.join(out_dir, f"{ms_base}_variance_all.vot")
     t_var_all.write(var_out_csv, format="csv", overwrite=True)
     t_var_all.write(var_out_vot, format="votable", overwrite=True)
 
-    box_out_csv = os.path.join(out_dir, "candidates_boxcar_all.csv")
-    box_out_vot = os.path.join(out_dir, "candidates_boxcar_all.vot")
+    box_out_csv = os.path.join(out_dir, f"{ms_base}_boxcar_all.csv")
+    box_out_vot = os.path.join(out_dir, f"{ms_base}_boxcar_all.vot")
     t_box_all.write(box_out_csv, format="csv", overwrite=True)
     t_box_all.write(box_out_vot, format="votable", overwrite=True)
 
@@ -889,7 +918,7 @@ def consolidate_chunk_catalogues(
         var_vot_files = sorted(glob.glob(var_csv_pattern.replace(".csv", ".vot")))
         box_vot_files = sorted(glob.glob(box_csv_pattern.replace(".csv", ".vot")))
         removed = 0
-        for p in var_csv_files + box_vot_files + var_vot_files + box_csv_files:
+        for p in (var_csv_files + var_vot_files + box_csv_files + box_vot_files):
             try:
                 os.remove(p)
                 removed += 1

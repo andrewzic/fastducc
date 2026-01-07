@@ -33,6 +33,13 @@ except Exception as e:
 from fastducc import wcs as ducc_wcs
 from fastducc import filters, kernels, candidates, ms_utils, detection, imaging
 
+# Helper for per-chunk prefix roots (consistent naming)
+def chunk_prefix_root(start_idx: int) -> str:
+    # e.g., /.../candidates/example_chunk_000000 (use start index for uniqueness)
+    return os.path.join(candidates_dir, f"{ms_base}_chunk_{start_idx:06d}")
+
+    
+
 def main():
     parser = argparse.ArgumentParser(description='Image MS in time chunks using ducc0 wgridder')
     parser.add_argument('--msname', required=True, help='Path to Measurement Set')
@@ -79,6 +86,17 @@ def main():
     start = 0
     chunk_size = max(1, args.chunk_size)
     chunk_id = 0
+
+
+
+    # ---- Derive output directory: <MS parent>/candidates and a base tag from MS name ----
+    ms_path = os.path.abspath(args.msname.rstrip('/'))
+    ms_dir  = os.path.dirname(ms_path)             # e.g., /fred/oz451/azic/data/blahblah
+    ms_tag  = os.path.basename(ms_path)            # e.g., example.ms
+    ms_base = ms_tag[:-3] if ms_tag.endswith('.ms') else ms_tag  # e.g., example
+    
+    candidates_dir = os.path.join(ms_dir, "candidates")
+    os.makedirs(candidates_dir, exist_ok=True)
     
     #t_main = table(args.msname, readonly=True)
     while start < total_chunks:
@@ -145,14 +163,11 @@ def main():
         #    hdr["EQUINOX"] = wcs_full.wcs.equinox
 
         # Choose an output path (per chunk)
-        std_fits_path = f"./chunk{chunk_id:03d}_std_map.fits"
 
-        # Write (float32 is typical for images; overwrite if exists)
+        std_fits_path = os.path.join(candidates_dir, f"{ms_base}_chunk_{start:06d}_std_map.fits")
         fits.writeto(std_fits_path, data=std_map.astype(np.float32), header=hdr, overwrite=True)
-
-        
-
-        
+        print(f"[Chunk {chunk_id}] wrote variance std-map FITS -> {std_fits_path}")
+              
         print(f"[Chunk {chunk_id}] variance map: spatial NMS on SNR")
         var_detections_nms = filters.nms_snr_map_2d(
             snr_2d=std_map / max(np.nanstd(std_map), 1e-9),  # normalized SNR if desired
@@ -185,7 +200,7 @@ def main():
         print(f"[Chunk {chunk_id}] generating std-map snippets & lightcurves for variance candidates")
         ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(args.msname, field_name=None)
 
-        var_cand_prefix = f"{args.msname.replace('.ms/', '.ms').replace('.ms', '_chunk')}_var_{start}"
+        var_root = f"{chunk_prefix_root(start)}_var"
         
         for i, cand in enumerate(annotated_var):
             # 1) std-map snippet
@@ -193,7 +208,7 @@ def main():
             # 2) lightcurves + figure (use std-map images in top panels)
             lc_paths = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
-                out_prefix=f"{var_cand_prefix}_cand_{i:03d}_lc",
+                out_prefix=f"{var_root}_cand_{i:03d}_lc",
                 spatial_size=50, save_format="npz",
                 center_policy="right", cmap="gray", dpi=180,
                 # WCS / scale
@@ -207,7 +222,7 @@ def main():
             #    (GIF will have a single frame; PNG+FITS get TAN WCS and correct CDELT)
             prod_paths = candidates.save_candidate_snippet_products(
                 snippet_rec=std_snip,
-                out_prefix=f"{var_cand_prefix}_cand_{i:03d}_snip",
+                out_prefix=f"{var_root}_cand_{i:03d}_snip",
                 pixscale_rad=pix_rad,
                 ra_rad=float(cand["ra_rad"]),
                 dec_rad=float(cand["dec_rad"]),
@@ -224,10 +239,12 @@ def main():
         t_var = candidates.candidates_to_astropy_table(annotated_var)
 
         candidates.save_candidates_table(t_var,
-                              csv_path=f"{var_cand_prefix}_boxcar_candidates.csv",
-                              vot_path=f"{var_cand_prefix}_boxcar_candidates.vot"
+                              csv_path=f"{var_root}_candidates.csv",
+                              vot_path=f"{var_root}_candidates.vot"
                               )
             
+        print(f"[Chunk {chunk_id}] wrote {len(t_var)} variance candidates -> {var_csv}, {var_vot}")
+
         #print(len(times), cube.shape)
         widths = [1, 2, 4, 8, 16, 32, 64]
         print(f"[Chunk {chunk_id}] boxcar searching with widths {widths}")
@@ -289,13 +306,18 @@ def main():
             t = candidates.candidates_to_astropy_table(annotated)
 
             cand_prefix = f"{args.msname.replace('.ms/', '.ms').replace('.ms', '_chunk')}_boxcar_{start}"
+            box_root = f"{chunk_prefix_root(start)}_boxcar"
+
+            
+            box_csv = f"{box_root}_candidates.csv"
+            box_vot = f"{box_root}_candidates.vot"
 
             candidates.save_candidates_table(t,
-                                  csv_path=f"{cand_prefix}_boxcar_candidates.csv",
-                                  vot_path=f"{cand_prefix}_boxcar_candidates.vot"
+                                             csv_path=box_csv,
+                                             vot_path=box_vot
                                   )
-            print(f"Saved {len(t)} candidates to {cand_prefix}_candidates.csv and {cand_prefix}_candidates.vot")
-
+            
+            print(f"Saved {len(t)} candidates to {box_csv} and {box_vot}")
 
             pix_rad = args.pixsize_arcsec / 206265.0
             ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(args.msname, field_name=None)
@@ -305,7 +327,7 @@ def main():
                     times=times,
                     cube=cube,
                     candidate=cand,
-                    out_prefix=f"{cand_prefix}_cand_{i:03d}_lc",
+                    out_prefix=f"{box_root}_cand_{i:03d}_lc",
                     spatial_size=50,
                     save_format="npz",                 # or "ascii"
                     center_policy="right",
@@ -333,7 +355,7 @@ def main():
 
             
             for i, s in enumerate(snippets):
-                snip_cand_prefix = f"{args.msname.replace('.ms/', '.ms').replace('.ms', '_chunk')}_boxcar_{start}_cand_{i:03d}_snip"
+                snip_cand_prefix = f"{box_root}_cand_{i:03d}_snip"
                 cand = s["candidate"]
                 # Pull world coords from the annotated candidate dict
                 ra_rad = float(cand["ra_rad"])
@@ -355,13 +377,20 @@ def main():
         
         start = end + 1
         chunk_id += 1
-    
-    candidates.consolidate_chunk_catalogues(
-        out_dir="./catalogues",
-        var_csv_pattern="./chunk*_candidates_variance.csv",
-        box_csv_pattern="./chunk*_candidates_boxcar.csv",
+
+
+    var_pattern = os.path.join(candidates_dir, f"{ms_base}_chunk_*_var_candidates.csv")
+    box_pattern = os.path.join(candidates_dir, f"{ms_base}_chunk_*_boxcar_candidates.csv")
+
+    # Consolidated outputs go to the same candidates dir
+
+    consolidate_chunk_catalogues(
+        ms_base=ms_base,
+        out_dir=candidates_dir,
+        var_csv_pattern=var_pattern,
+        box_csv_pattern=box_pattern,
         remove_chunk_catalogues=True
-        )
+    )
         
 if __name__ == '__main__':
     main()
