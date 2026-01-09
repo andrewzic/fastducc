@@ -595,7 +595,7 @@ def save_candidate_lightcurves(
     # Top-left: WCS full frame
     ax_full = fig.add_subplot(2, 2, 1, projection=wcs_full)
     im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=5, color="cyan")
+    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=15, color="cyan")
     ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_full.set_xlabel("Right Ascension")
     ax_full.set_ylabel("Declination")
@@ -606,7 +606,7 @@ def save_candidate_lightcurves(
     # Top-right: WCS cutout
     ax_cut = fig.add_subplot(2, 2, 2, projection=wcs_cut)
     im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=5, color="cyan")
+    ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=15, color="cyan")
     ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_cut.set_xlabel("Right Ascension")
     ax_cut.set_ylabel("Declination")
@@ -753,7 +753,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
     ax_img.set_xlabel("Right Ascension")
     ax_img.set_ylabel("Declination")
-    ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=5, color="cyan")
+    ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=15, color="cyan")
     cb = fig2.colorbar(im2, ax=ax_img, fraction=0.046, pad=0.04)
     cb.set_label("Intensity (arb. units)")
     # Title with RA/Dec, SNR if available
@@ -847,6 +847,38 @@ def _stack_tables_or_empty(tables):
     T.fill_value = np.nan
     T = T.filled()
     return T
+
+
+def _read_csv_tables(paths):
+    """Read a list of CSV files into Astropy Tables (skip missing)."""
+    tables = []
+    for p in paths:
+        try:
+            t = Table.read(p, format="csv")
+            tables.append(t)
+        except Exception as e:
+            print(f"[Consolidation] Skipping '{p}' (read error: {e})")
+    return tables
+
+def _stack_tables_or_empty(tables):
+    """Vstack a list of tables (outer join), return a filled table or empty schema."""
+    if len(tables) == 0:
+        # Create a minimal empty table with common columns used in your pipeline
+        return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
+                            "ra_hms","dec_dms","snr","std","width_samples",
+                            "time_start","time_end","time_center","t0_idx","t1_idx_excl",
+                            "center_idx","phase_center_field","chunk_id","algo"],
+                     dtype=[int,int,float,float,float,float,float,float,
+                            "U20","U20",float,float,int,
+                            float,float,float,int,int,
+                            int,"U64",int,"U16"])
+    # Use outer join to be resilient to column differences across chunks
+    T = vstack(tables, join_type="outer", metadata_conflicts="silent")
+    # Fill masked values (NA) with sensible defaults for CSV/VOT output
+    T.fill_value = np.nan
+    T = T.filled()
+    return T
+
 
 def consolidate_chunk_catalogues(
     *,

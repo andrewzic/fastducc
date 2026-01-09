@@ -323,3 +323,131 @@ def variance_search(
     snr_cubes = {"std": snr.astype(np.float32, copy=False)} if return_snr_cubes else None
     return detections, snr_cubes
 
+
+def variance_search_welford(
+    std_map: np.ndarray,                      # (Ny, Nx) final (or partial) Welford std map
+    *,
+    threshold_sigma: float = 5.0,
+    return_snr_image: bool = False,           # renamed for clarity
+    keep_top_k: Optional[int] = None,
+    valid_mask: Optional[np.ndarray] = None,  # (Ny, Nx) True=valid
+    spatial_estimator: str = "clipped_rms",   # "mad" | "clipped_rms"
+    clip_sigma: float = 3.0,
+    subtract_mean_of_std_map: bool = True    # if True, SNR = (std - mean(std)) / sigma
+) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
+    """
+    Detect variability from a precomputed per-pixel standard deviation map (Welford result).
+
+    Steps:
+      1) Robustly estimate a spatial sigma on std_map (MAD or clipped RMS).
+      2) Form SNR map: snr = std_map / spatial_sigma (or mean-subtracted variant).
+      3) Apply mask, threshold, optional Top-K.
+      4) Return detections and (optionally) the SNR image.
+
+    Parameters
+    ----------
+    std_map : (Ny, Nx) ndarray
+        Per-pixel standard deviation across the *full observation* computed via Welford.
+    threshold_sigma : float
+        SNR threshold applied to the 2-D SNR map.
+    return_snr_image : bool
+        If True, returns the SNR image (float32) as the second element of the tuple.
+    keep_top_k : Optional[int]
+        If set, retain only the top-K detections by SNR across the image.
+    valid_mask : Optional[(Ny, Nx) ndarray of bool]
+        Mask of valid pixels. True=valid. If None, all pixels are valid.
+    spatial_estimator : {"mad", "clipped_rms"}
+        Robust spatial estimator used to convert std_map to an SNR map.
+    clip_sigma : float
+        Sigma parameter for the sigma-clipped RMS estimator.
+    subtract_mean_of_std_map : bool
+        If True, SNR is computed as (std_map - mean(std_map_valid)) / spatial_sigma.
+        If False, SNR is std_map / spatial_sigma.
+
+    Returns
+    -------
+    detections : list of dict
+        Each dict contains:
+          {
+            "y": int,
+            "x": int,
+            "snr": float,
+            "std": float,           # the per-pixel std at (y,x)
+            "time_start": None,     # placeholders for API compatibility
+            "time_end": None,
+            "time_center": None,
+            "center_idx": None,
+            "width_samples": 1      # variance search is window-less.
+          }
+    snr_image : Optional[np.ndarray]
+        If return_snr_image is True: the 2-D SNR image (Ny, Nx), dtype float32.
+        Otherwise, None.
+    """
+    # --- validate inputs ---
+    if std_map.ndim != 2:
+        raise ValueError("std_map must be (Ny, Nx)")
+    Ny, Nx = std_map.shape
+
+    if valid_mask is None:
+        valid_mask = np.ones((Ny, Nx), dtype=bool)
+    elif valid_mask.shape != (Ny, Nx):
+        raise ValueError("valid_mask must be shape (Ny, Nx)")
+
+    # --- robust spatial sigma for std_map ---
+    std_map64 = std_map.astype(np.float64, copy=False)
+    if spatial_estimator == "mad":
+        spatial_sigma = kernels._mad_sigma_2d(std_map64, valid_mask.astype(np.bool_, copy=False))
+    elif spatial_estimator == "clipped_rms":
+        spatial_sigma = kernels._clipped_rms_sigma_2d(std_map64, valid_mask.astype(np.bool_, copy=False),
+                                              clip_sigma=clip_sigma)
+    else:
+        raise ValueError(f"Unknown spatial_estimator='{spatial_estimator}'")
+
+    if (not np.isfinite(spatial_sigma)) or (spatial_sigma <= 0.0):
+        spatial_sigma = 1.0
+
+    # --- SNR map: mean-subtracted or direct ratio ---
+    if subtract_mean_of_std_map:
+        mu = np.nanmean(std_map64[valid_mask])
+        snr = (std_map64 - mu) / spatial_sigma
+    else:
+        snr = std_map64 / spatial_sigma
+
+    # --- gate invalid pixels ---
+    snr = np.where(valid_mask, snr, 0.0)
+
+    # --- threshold ---
+    ys, xs = np.where(snr >= threshold_sigma)
+    if ys.size == 0:
+        detections: List[Dict[str, Any]] = []
+        snr_out = snr.astype(np.float32, copy=False) if return_snr_image else None
+        return detections, snr_out
+
+    # --- optional Top-K by descending SNR ---
+    snr_vals = snr[ys, xs]
+    order = np.argsort(snr_vals)[::-1]
+    if (keep_top_k is not None) and (ys.size > keep_top_k):
+        order = order[:keep_top_k]
+    ys = ys[order]
+    xs = xs[order]
+    snr_vals = snr_vals[order]
+
+    # --- pack detections with boxcar-style keys for downstream API compatibility ---
+    detections: List[Dict[str, Any]] = []
+    for y, x, s in zip(ys, xs, snr_vals):
+        det = {
+            "y": int(y),
+            "x": int(x),
+            "snr": float(s),
+            "std": float(std_map64[y, x]),
+            # placeholders to satisfy downstream code
+            "time_start": None,
+            "time_end": None,
+            "time_center": None,
+            "center_idx": None,
+            "width_samples": 1,
+        }
+        detections.append(det)
+
+    snr_out = snr.astype(np.float32, copy=False) if return_snr_image else None
+    return detections, snr_out

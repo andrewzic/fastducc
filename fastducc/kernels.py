@@ -411,6 +411,53 @@ def _compute_boxcar_1d(lc_full: np.ndarray, w: int) -> Tuple[np.ndarray, int]:
     lc_sm = (csum[w:] - csum[:-w]) / float(w)  # length T - w + 1
     return lc_sm, (T - w + 1)
 
+###
+# welford std algorithm
+@njit(inline='always')
+def _welford_update(c, m, M2, x):
+    """
+    One online update step: given aggregate (c, m, M2) and new sample x,
+    return updated (c, m, M2).
+    """
+    c += 1
+    delta = x - m
+    m += delta / c
+    M2 += delta * (x - m)
+    return c, m, M2
 
-    
 
+@njit(parallel=True)
+def welford_update_cube(count, mean, M2, cube, ignore_nan=True):
+    """
+    Update running per-pixel aggregates using all samples in `cube` (T, Ny, Nx).
+    In-place updates on `count`, `mean`, `M2`.
+    """
+    T, Ny, Nx = cube.shape
+    for y in prange(Ny):
+        for x in range(Nx):
+            c = count[y, x]
+            m = mean[y, x]
+            m2 = M2[y, x]
+            for t in range(T):
+                val = np.float64(cube[t, y, x])
+                if ignore_nan and not np.isfinite(val):
+                    continue
+                c, m, m2 = _welford_update(c, m, m2, val)
+            count[y, x] = c
+            mean[y, x]  = m
+            M2[y, x]    = m2
+
+
+@njit(parallel=True)
+def welford_finalise_std(count, M2, ddof=1):
+    """
+    Compute per-pixel std from aggregates: std = sqrt(M2 / (count - ddof)).
+    Returns 2-D array (Ny, Nx). If count <= ddof, returns NaN.
+    """
+    Ny, Nx = count.shape
+    out = np.empty((Ny, Nx), dtype=np.float64)
+    for y in prange(Ny):
+        for x in range(Nx):
+            denom = count[y, x] - ddof
+            out[y, x] = np.sqrt(M2[y, x] / denom) if denom > 0 else np.nan
+    return out
