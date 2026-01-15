@@ -1,4 +1,4 @@
-# ducc_dirty
+# fastducc
 
 ## installation
 ```
