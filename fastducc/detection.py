@@ -442,9 +442,9 @@ def variance_search_welford(
             "std": float(std_map64[y, x]),
             # placeholders to satisfy downstream code
             "time_start": 0,
-            "time_end": 0,
-            "time_center": 0,
-            "center_idx": 0,
+            "time_end": 20,
+            "time_center": 10,
+            "center_idx": 10,
             "width_samples": 1,
         }
         detections.append(det)

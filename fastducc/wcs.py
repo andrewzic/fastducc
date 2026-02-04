@@ -65,26 +65,100 @@ def radec_from_lm(l: float, m: float, ra0_rad: float, dec0_rad: float) -> Tuple[
     dec = math.asin(m*math.cos(dec0_rad) + n*math.sin(dec0_rad))
     return ra, dec
 
-def rad_to_hmsdms(ra_rad: float, dec_rad: float) -> Tuple[str, str]:
+
+
+def rad_to_hmsdms(ra_rad: float, dec_rad: float, dp: int = 1) -> Tuple[str, str]:
+
     """
-    Format RA,Dec (radians) as sexagesimal strings 'hh:mm:ss.s', '+dd:mm:ss.s'.
+    Format RA,Dec (radians) as sexagesimal strings 'hh:mm:ss.s', '+dd:mm:ss.s',
+    with proper rounding and carry to prevent '60.0' seconds/minutes.
     """
-    def to_hms(r):
-        r = (r % (2*math.pi))
-        hours = r * 12.0 / math.pi
-        h = int(hours)
-        m = int((hours - h)*60.0)
-        s = (hours - h - m/60.0)*3600.0
-        return f"{h:02d}:{m:02d}:{s:05.2f}"
-    def to_dms(r):
+    def to_hms(r, dp = 1):
+        
+        r = r % (2 * np.pi)
+        total_hours = r * 12.0 / np.pi
+
+        h = int(total_hours)  # 0..23
+        rem_hours = total_hours - h
+        total_minutes = rem_hours * 60.0
+
+        m = int(total_minutes)  # 0..59
+        rem_minutes = total_minutes - m
+        s = rem_minutes * 60.0
+
+        # Round to one decimal
+        s = round(s, dp)
+
+        # Carry if seconds hit 60.0
+        if s >= 60.0:
+            s = 0.0
+            m += 1
+
+        # Carry if minutes hit 60
+        if m >= 60:
+            m = 0
+            h += 1
+
+        # Wrap hour 24 -> 0
+        if h >= 24:
+            h = 0
+
+        return f"{h:02d}:{m:02d}:{s:0{3+dp}.{dp}f}"  # width 4 covers '0.0'..'59.9'
+
+    def to_dms(r, dp = 1):
         deg = math.degrees(r)
         sign = '+' if deg >= 0 else '-'
         deg = abs(deg)
-        d = int(deg)
-        m = int((deg - d)*60.0)
-        s = (deg - d - m/60.0)*3600.0
-        return f"{sign}{d:02d}:{m:02d}:{s:05.2f}"
-    return to_hms(ra_rad), to_dms(dec_rad)
+
+        d = int(deg)  # degrees 0..90 
+
+        rem_deg = deg - d
+        total_arcmin = rem_deg * 60.0
+
+        m = int(total_arcmin)  # 0..59
+        rem_arcmin = total_arcmin - m
+        s = rem_arcmin * 60.0
+
+        # Round to one decimal
+        s = round(s, dp)
+
+        # Carry if seconds hit 60.0
+        if s >= 60.0:
+            s = 0.0
+            m += 1
+
+        # Carry if minutes hit 60
+        if m >= 60:
+            m = 0
+            d += 1
+
+        # Cap to 90 degrees if rounding/carry pushes it over (rare edge case)
+        if d > 90:
+            d = 90
+            m = 0
+            s = 0.0
+
+        return f"{sign}{d:02d}:{m:02d}:{s:0{3+dp}.{dp}f}"
+
+    return to_hms(ra_rad, dp=dp), to_dms(dec_rad, dp=dp)
+
+def hmsdms_to_srcname(ra_hms, dec_dms):
+    """
+    Format RA, Dec (hh:mm:ss.s, dd:mm:ss.s) to sourcename str:
+    Jhhmmss.s+ddmmss.s
+    """
+    hhmmss  = ra_hms.split(':')
+    src_hhmmss = "".join(hhmmss)
+    
+    if "-" in dec_dms:
+        sign="-"
+    else:
+        sign="+"
+    dec_dms = dec_dms.replace("-", "").replace("+", "")
+    ddmmss = dec_dms.split(':')
+    src_ddmmss = "".join(ddmmss)
+    srcname = f"J{src_hhmmss}{sign}{src_ddmmss}"
+    return srcname
 
 def annotate_candidates_with_sky_coords(
         msname: str,
@@ -105,11 +179,13 @@ def annotate_candidates_with_sky_coords(
         l, m = lm_from_xy(x, y, npix_x, npix_y, pixsize_x, pixsize_y, flip_u, flip_v)
         ra, dec = radec_from_lm(l, m, ra0_rad, dec0_rad)
         ra_hms, dec_dms = rad_to_hmsdms(ra, dec)
+        srcname = hmsdms_to_srcname(ra_hms, dec_dms)
         det2 = dict(det)
         det2.update({
             "l": l, "m": m,
             "ra_rad": ra, "dec_rad": dec,
             "ra_hms": ra_hms, "dec_dms": dec_dms,
+            "srcname": srcname,
             "phase_center_field": used_field
         })
         out.append(det2)

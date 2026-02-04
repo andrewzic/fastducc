@@ -23,8 +23,8 @@ class Config:
     enable_boxcar: bool
     var_threshold: float
     var_keep_k: Optional[int]
-    var_clip_sigma: float
-    var_nms_radius: int
+    rms_clip_sigma: float
+    nms_radius: int
     boxcar_widths: List[int]
     boxcar_threshold: float
     do_plot: bool

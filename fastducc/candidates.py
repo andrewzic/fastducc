@@ -595,7 +595,7 @@ def save_candidate_lightcurves(
     # Top-left: WCS full frame
     ax_full = fig.add_subplot(2, 2, 1, projection=wcs_full)
     im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=15, color="cyan")
+    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="red")
     ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_full.set_xlabel("Right Ascension")
     ax_full.set_ylabel("Declination")
@@ -606,7 +606,7 @@ def save_candidate_lightcurves(
     # Top-right: WCS cutout
     ax_cut = fig.add_subplot(2, 2, 2, projection=wcs_cut)
     im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=15, color="cyan")
+    ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="red")
     ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_cut.set_xlabel("Right Ascension")
     ax_cut.set_ylabel("Declination")
@@ -731,7 +731,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     ax.set_xlabel("Right Ascension")
     ax.set_ylabel("Declination")
     # Mark the detection pixel at center
-    ax.plot([x_center], [y_center], marker=reticle(which='rt'), ms=4, color="cyan")
+    ax.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
     # Title updates with time
     def _update(k: int):
         im.set_data(cube[k])
@@ -753,7 +753,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
     ax_img.set_xlabel("Right Ascension")
     ax_img.set_ylabel("Declination")
-    ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=15, color="cyan")
+    ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
     cb = fig2.colorbar(im2, ax=ax_img, fraction=0.046, pad=0.04)
     cb.set_label("Intensity (arb. units)")
     # Title with RA/Dec, SNR if available

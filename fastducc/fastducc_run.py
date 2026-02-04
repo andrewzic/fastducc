@@ -35,11 +35,11 @@ from fastducc.types import Config, WelfordState
 from fastducc import filters, kernels, candidates, ms_utils, detection, imaging
 
 def build_cli():
-    
+
     parser = argparse.ArgumentParser(description='Image MS in time chunks using ducc0 wgridder')
     parser.add_argument('--msname', required=True, help='Path to Measurement Set')
-    parser.add_argument('--chunk-size', type=int, default=1000,
-                        help='Number of time samples per chunk (default: 1000)')
+    parser.add_argument('--chunk-size', type=int, default=512,
+                        help='Number of time samples per chunk (default: 512)')
     parser.add_argument('--corr-mode', choices=['average','stokesI','single'], default='single',
                         help='Correlation handling mode (default: single)')
     parser.add_argument('--basis', choices=['auto','linear','circular'], default='linear',
@@ -59,12 +59,12 @@ def build_cli():
     parser.add_argument('--boxcar-widths', nargs='+', type=int,
                         help='Widths (in samples) to perform boxcar search over (default: [1, 2, 4, 8, 16, 32, 64])',
                         default=[1, 2, 4, 8, 16, 32, 64])
-    parser.add_argument('--threshold-sigma', type=float, default=8.0, help="S/N threshold to use for detections (default: 8.0)")
+    parser.add_argument('--threshold-sigma', type=float, default=8.0, help="S/N threshold to use for boxcar detections (default: 8.0)")
     parser.add_argument('--do-plot', action='store_true')
-    parser.add_argument('--var-threshold-sigma', type=float, default=8.0)
+    parser.add_argument('--var-threshold-sigma', type=float, default=5.0, help="S/N threshold to use for boxcar detections (default: 5.0)")
     parser.add_argument('--var-keep-top-k', type=int, default=None)
-    parser.add_argument('--var-clip-sigma', type=float, default=3.0)
-    parser.add_argument('--var-nms-radius', type=int, default=10)
+    parser.add_argument('--rms-clip-sigma', type=float, default=3.0)
+    parser.add_argument('--nms-radius', type=int, default=6)
     # --- Search toggles ---
     parser.add_argument(
         '--enable-boxcar', dest='enable_boxcar', action='store_true',
@@ -95,18 +95,18 @@ def build_cli():
     parser.set_defaults(enable_var_chunk=False)
     parser.add_argument('--save-var-lightcurves',  dest='save_var_lightcurves',  action='store_true', help='Save lightcurves for variance candidates')
     parser.add_argument('--no-save-var-lightcurves',  dest='save_var_lightcurves',  action='store_false')
-    parser.set_defaults(save_var_lightcurves=True)    
+    parser.set_defaults(save_var_lightcurves=True)
     parser.add_argument('--save-var-snippets',     dest='save_var_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for variance candidates')
     parser.add_argument('--no-save-var-snippets',  dest='save_var_snippets',     action='store_false')
-    parser.set_defaults(save_var_snippets=True)    
+    parser.set_defaults(save_var_snippets=True)
     parser.add_argument('--save-box-lightcurves',  dest='save_box_lightcurves',  action='store_true', help='Save lightcurves for boxcar candidates')
     parser.add_argument('--no-save-box-lightcurves',  dest='save_box_lightcurves',  action='store_false')
-    parser.set_defaults(save_box_lightcurves=True)    
+    parser.set_defaults(save_box_lightcurves=True)
     parser.add_argument('--save-box-snippets',     dest='save_box_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for boxcar candidates')
     parser.add_argument('--no-save-box-snippets',  dest='save_box_snippets',     action='store_false')
     parser.set_defaults(save_box_snippets=True)
-    
-    # --- Parallel execution flags ---   
+
+    # --- Parallel execution flags ---
     parser.add_argument(
         '--parallel-mode',
         choices=['serial', 'dask-local', 'dask-slurm'],
@@ -136,9 +136,9 @@ def build_cli():
     parser.add_argument('--slurm-interface', default=None,
                         help='Network interface name (if needed for TCP comms)')
 
-    
+
     args = parser.parse_args()
-    
+
     return args
 
 def make_config(args, paths) -> Config:
@@ -160,7 +160,7 @@ def make_config(args, paths) -> Config:
         save_box_lightcurves=args.save_box_lightcurves,
         save_box_snippets=args.save_box_snippets,
         var_threshold=args.var_threshold_sigma, var_keep_k=args.var_keep_top_k,
-        var_clip_sigma=args.var_clip_sigma, var_nms_radius=args.var_nms_radius,
+        rms_clip_sigma=args.rms_clip_sigma, nms_radius=args.nms_radius,
         boxcar_widths=args.boxcar_widths, boxcar_threshold=args.threshold_sigma,
         do_plot=args.do_plot,
         ms_base=ms_base, candidates_dir=candidates_dir,
@@ -195,7 +195,7 @@ def process_variance_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx
         keep_top_k=cfg.var_keep_k,
         valid_mask=None,
         spatial_estimator="clipped_rms",
-        clip_sigma=cfg.var_clip_sigma,
+        clip_sigma=cfg.rms_clip_sigma,
         subtract_mean_of_std_map=True
     )
 
@@ -203,7 +203,7 @@ def process_variance_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx
     var_nms = filters.nms_snr_map_2d(
         snr_2d=snr_img, base_detections=var_dets,
         threshold_sigma=cfg.var_threshold,
-        spatial_radius=cfg.var_nms_radius,
+        spatial_radius=cfg.nms_radius,
         valid_mask=None,
         times=times, cube=cube, time_tag_policy="peak_absdev"
     )
@@ -225,11 +225,12 @@ def process_variance_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx
 
    # 7) Lightcurves + snippet products for each VAR candidate (using std map)
     for i, cand in enumerate(annotated_var):
+        srcname = cand["srcname"]
         # Lightcurves figure (top panels use std-map images)
         if cfg.save_var_lightcurves:
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
-                out_prefix=f"{var_root}_cand_{i:03d}_lc",
+                out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
                 spatial_size=50, save_format="npz",
                 center_policy="right", cmap="gray", dpi=180,
                 # WCS / scale
@@ -246,11 +247,11 @@ def process_variance_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx
             std_snip = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
             _ = candidates.save_candidate_snippet_products(
                 snippet_rec=std_snip,
-                out_prefix=f"{var_root}_cand_{i:03d}_snip",
+                out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                 pixscale_rad=cfg.pix_rad,
                 ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
                 ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=1, dpi=180
-            )    
+            )
     return annotated_var
 
 def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
@@ -269,13 +270,13 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
     dets_by_w = filters.nms_snr_maps_per_width(
         snr_cubes, times,
         threshold_sigma=cfg.boxcar_threshold,
-        spatial_radius=10,
+        spatial_radius=cfg.nms_radius,
         time_radius=2,
         valid_mask=None
     )
     final_dets = filters.group_filter_across_widths(
         dets_by_w, times,
-        spatial_radius=10,
+        spatial_radius=cfg.nms_radius,
         time_radius=0,
         policy="max_snr",
         max_per_time_group=1,
@@ -302,11 +303,13 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
 
     # Lightcurves + snippet products (boxcar)
     for i, cand in enumerate(annotated):
+        srcname = cand["srcname"]
+        w = max(1, int(cand.get("width_samples", 1)))
         # Lightcurves figure (top panels show the full-res frame)
         if cfg.save_box_lightcurves:
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
-                out_prefix=f"{box_root}_cand_{i:03d}_lc",
+                out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
                 spatial_size=50, save_format="npz",
                 center_policy="right", cmap="gray", dpi=180,
                 # WCS / scale:
@@ -332,7 +335,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
             snip = snippets[0]
             _ = candidates.save_candidate_snippet_products(
                 snippet_rec=snip,
-                out_prefix=f"{box_root}_cand_{i:03d}_snip",
+                out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
                 pixscale_rad=cfg.pix_rad,
                 ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
                 ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
@@ -397,14 +400,14 @@ def finalise_welford(cfg: Config, wf: WelfordState, times, cube):
             keep_top_k=cfg.var_keep_k,
             valid_mask=None,
             spatial_estimator="clipped_rms",
-            clip_sigma=cfg.var_clip_sigma,
+            clip_sigma=cfg.rms_clip_sigma,
             subtract_mean_of_std_map=True
         )
         if len(var_final) > 0:
             var_nms = filters.nms_snr_map_2d(
                 snr_2d=snr_img, base_detections=var_final,
                 threshold_sigma=cfg.var_threshold,
-                spatial_radius=cfg.var_nms_radius,
+                spatial_radius=cfg.nms_radius,
                 valid_mask=None,
                 times=times, cube=cube, time_tag_policy="peak_absdev"
             )
@@ -470,7 +473,7 @@ def finalise_welford_parallel(
         start_ += nsub
 
     all_cube = all_cube[order]
-    
+
     # --- 2) Finalise to full std-map ---
     std_map_full = kernels.welford_finalise_std(count_acc, M2_acc, ddof=1)
 
@@ -501,15 +504,15 @@ def finalise_welford_parallel(
             keep_top_k=cfg.var_keep_k,
             valid_mask=None,
             spatial_estimator="clipped_rms",
-            clip_sigma=cfg.var_clip_sigma,
+            clip_sigma=cfg.rms_clip_sigma,
             subtract_mean_of_std_map=True
         )
         if len(var_final) > 0:
-            
+
             var_nms = filters.nms_snr_map_2d(
                 snr_2d=snr_img, base_detections=var_final,
                 threshold_sigma=cfg.var_threshold,
-                spatial_radius=cfg.var_nms_radius,
+                spatial_radius=cfg.nms_radius,
                 valid_mask=None,
                 times=all_times, cube=all_cube, time_tag_policy="none"
             )
@@ -521,11 +524,16 @@ def finalise_welford_parallel(
             )
             var_root = cfg.all_prefix_root + "_var"
             t_var = candidates.candidates_to_astropy_table(annotated_var)
+            candidates.save_candidates_table(t_var,
+                                             csv_path=f"{var_root}_candidates.csv",
+                                             vot_path=f"{var_root}_candidates.vot"
+                                             )            
             for i, cand in enumerate(annotated_var):
+                srcname = cand["srcname"]
                 if cfg.save_var_lightcurves:
                     candidates.save_candidate_lightcurves(
                         all_times, all_cube, cand,
-                        out_prefix=f"{var_root}_cand_{i:03d}_lc",
+                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
                         spatial_size=50, save_format="npz",
                         center_policy="right", cmap="gray", dpi=180,
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
@@ -537,7 +545,7 @@ def finalise_welford_parallel(
                     std_snip = candidates.make_stdmap_snippet(std_map_full, cand, spatial_size=50)
                     candidates.save_candidate_snippet_products(
                         snippet_rec=std_snip,
-                        out_prefix=f"{var_root}_cand_{i:03d}_snip",
+                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
                         ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=1, dpi=180
@@ -553,7 +561,7 @@ def finalise_welford_serial(cfg: Config, wf_state: WelfordState, *, run_final_va
     agg_list = [(wf_state.count, wf_state.mean, wf_state.M2)]
     return finalise_welford_parallel(cfg, agg_list, run_final_variance=run_final_variance)
 
-            
+
 def consolidate_catalogues(cfg: Config):
     var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
     box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_chunk_*_boxcar_candidates.csv")
@@ -602,14 +610,14 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
             keep_top_k=cfg.var_keep_k,
             valid_mask=None,
             spatial_estimator="clipped_rms",
-            clip_sigma=cfg.var_clip_sigma,
+            clip_sigma=cfg.rms_clip_sigma,
             subtract_mean_of_std_map=True
         )
         if len(var_dets) > 0:
             var_nms = filters.nms_snr_map_2d(
                 snr_2d=snr_img, base_detections=var_dets,
                 threshold_sigma=cfg.var_threshold,
-                spatial_radius=cfg.var_nms_radius,
+                spatial_radius=cfg.nms_radius,
                 valid_mask=None,
                 times=times, cube=cube, time_tag_policy="peak_absdev"
             )
@@ -626,10 +634,11 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                                              vot_path=f"{var_root}_candidates.vot"
                                              )
             for i, cand in enumerate(annotated_var):
+                srcname = cand["srcname"]
                 if cfg.save_var_lightcurves:
                     candidates.save_candidate_lightcurves(
                         times, cube, cand,
-                        out_prefix=f"{var_root}_cand_{i:03d}_lc",
+                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
                         spatial_size=50, save_format="npz",
                         center_policy="right", cmap="gray", dpi=180,
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
@@ -641,7 +650,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     std_snip = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
                     candidates.save_candidate_snippet_products(
                         snippet_rec=std_snip,
-                        out_prefix=f"{var_root}_cand_{i:03d}_snip",
+                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
                         ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=1, dpi=180
@@ -662,11 +671,11 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
         dets_by_w = filters.nms_snr_maps_per_width(
             snr_cubes, times,
             threshold_sigma=cfg.boxcar_threshold,
-            spatial_radius=10, time_radius=2, valid_mask=None
+            spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None
         )
         final_dets = filters.group_filter_across_widths(
             dets_by_w, times,
-            spatial_radius=10, time_radius=0,
+            spatial_radius=cfg.nms_radius, time_radius=0,
             policy="max_snr", max_per_time_group=1,
             ny_nx=(cube.shape[1], cube.shape[2])
         )
@@ -684,10 +693,12 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 vot_path=f"{box_root}_candidates.vot"
             )
             for i, cand in enumerate(annotated):
+                w = max(1, int(cand.get("width_samples", 1)))
                 if cfg.save_box_lightcurves:
+                    srcname = cand["srcname"]
                     candidates.save_candidate_lightcurves(
                         times, cube, cand,
-                        out_prefix=f"{box_root}_cand_{i:03d}_lc",
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
                         spatial_size=50, save_format="npz",
                         center_policy="right", cmap="gray", dpi=180,
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
@@ -705,7 +716,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     snip = snippets[0]
                     candidates.save_candidate_snippet_products(
                         snippet_rec=snip,
-                        out_prefix=f"{box_root}_cand_{i:03d}_snip",
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
                         ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
@@ -719,23 +730,23 @@ def main_serial(args):
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = ms_utils.derive_paths(args.msname)
     cfg = make_config(args, (ms_base, candidates_dir, chunk_prefix_root, all_prefix_root))
     t_main, total_chunks, time_col = ms_utils.open_ms(args.msname)
-    # Discover total number of time chunks via iter    
+    # Discover total number of time chunks via iter
     print(f"Found {total_chunks} time chunks in MS: {args.msname}")
-    
+
     # Convert arcsec to radians
     pix_rad = args.pixsize_arcsec / 206265.0
     ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(args.msname, field_name=None)
-    
+
     start = 0
     chunk_size = max(1, args.chunk_size)
     chunk_id = 0
 
     wf = init_welford(cfg)
-    
+
     #t_main = table(args.msname, readonly=True)
     while start < total_chunks:
         end = min(start + chunk_size - 1, total_chunks - 1)
-        
+
         print(f"[Chunk {chunk_id}] imaging time_idx {start}..{end}")
         times, cube = imaging.image_time_samples(msname=args.msname,
                                          t_main=t_main,
@@ -756,7 +767,7 @@ def main_serial(args):
                                          do_plot=args.do_plot,
                                          )
 
-        
+
         # Variance/Welford chunk
         var_ann = process_variance_chunk(cfg, times, cube, wf, start)
 
@@ -765,7 +776,7 @@ def main_serial(args):
 
         start = end + 1
         chunk_id += 1
-        
+
     # Finalisation
     finalise_welford(cfg, wf, times, cube)
     consolidate_catalogues(cfg)
@@ -778,7 +789,7 @@ def main():
     if args.parallel_mode == "serial":
         main_serial(args)
         return None
-    
+
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = ms_utils.derive_paths(args.msname)
     cfg = make_config(args, (ms_base, candidates_dir, chunk_prefix_root, all_prefix_root))
 
@@ -847,9 +858,9 @@ def main():
 
     else:
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
-    
+
     _ = finalise_welford_parallel(cfg, agg_list, run_final_variance=True)
-    
+
     # Consolidate per-chunk catalogues into candidates/
     var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
     box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_chunk_*_boxcar_candidates.csv")
@@ -860,6 +871,6 @@ def main():
         box_csv_pattern=box_pattern,
         remove_chunk_catalogues=True
     )
-    
+
 if __name__ == '__main__':
     main()
