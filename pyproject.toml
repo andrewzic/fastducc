@@ -19,7 +19,9 @@ dependencies = [
 ]
 
 [project.scripts]
-fastducc = "fastducc.fastducc_run:main"
+
+fastducc = "fastducc.cli:main"
+fastducc-run = "fastducc.fastducc_run:main"
 ducc-continuum-img = "fastducc.ducc_continuum_img:main"
 
 [tool.setuptools]

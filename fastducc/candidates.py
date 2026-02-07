@@ -1,8 +1,10 @@
+# -*- coding: utf-8 -*-
 import argparse
 import glob
 import os
 import shutil
 import sys
+import re
 from typing import Iterable, Tuple, List, Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -13,6 +15,7 @@ from tqdm import tqdm
 
 import astropy.constants as const
 import astropy.units as u
+from astropy.coordinates import SkyCoord
 from astropy.visualization.wcsaxes import WCSAxes
 from astropy.wcs import WCS
 from astropy.io import fits
@@ -879,7 +882,6 @@ def _stack_tables_or_empty(tables):
     T = T.filled()
     return T
 
-
 def consolidate_chunk_catalogues(
     *,
     ms_base: str,                         # e.g., "example" from "example.ms"
@@ -957,3 +959,301 @@ def consolidate_chunk_catalogues(
             except Exception as e:
                 print(f"[Consolidation] Could not remove '{p}': {e}")
         print(f"[Consolidation] Removed {removed} per-chunk catalogue files.")
+
+
+def _parse_beam_and_chunk_from_filename(path: str) -> tuple[str, str, str, str]:
+    """Extract beam id (e.g. 'beam14') and chunk id (e.g. '20251015072402') from a filename.
+
+    Expected filename style (dot-separated tokens plus suffix), for example:
+        cracoData.<field>.SB77974.beam14.20251015072402.<...>_boxcar_all.csv
+
+    Returns
+    -------
+    (beam_id, chunk_id) : tuple[str, str]
+        Empty strings if not found.
+    """
+    fname = os.path.basename(path)
+    fieldname = ''
+    beam = ''
+    chunk = ''
+    m_field = re.search(r'(LTR_\d{4}(?:\+/-|-)\d{4})', fname)
+    if m_field:
+        field = m_field.group(1)
+    m_sbid = re.search(r'SB\d{5}', fname)
+    if m_sbid:
+        sbid = m_sbid.group(1)
+    m_beam = re.search(r'(beam\d+)', fname)
+    if m_beam:
+        beam = m_beam.group(1)
+    m_chunk = re.search(r'(\d{14})', fname)
+    if m_chunk:
+        chunk = m_chunk.group(1)
+    
+    return field, sbid, beam, chunk
+
+
+def _connected_components_from_pairs(n: int, i_idx, j_idx) -> List[List[int]]:
+    """Compute connected components from undirected edge lists.
+
+    Parameters
+    ----------
+    n : int
+        Number of nodes.
+    i_idx, j_idx : iterable[int]
+        Edge endpoints (same-length iterables). Self-edges are ignored.
+
+    Returns
+    -------
+    comps : list[list[int]]
+        Each component is a list of node indices.
+    """
+    adj: List[List[int]] = [[] for _ in range(n)]
+    for a, b in zip(i_idx, j_idx):
+        a = int(a)
+        b = int(b)
+        if a == b:
+            continue
+        adj[a].append(b)
+        adj[b].append(a)
+
+    seen = [False] * n
+    comps: List[List[int]] = []
+    for s in range(n):
+        if seen[s]:
+            continue
+        stack = [s]
+        seen[s] = True
+        comp = [s]
+        while stack:
+            v = stack.pop()
+            for w in adj[v]:
+                if not seen[w]:
+                    seen[w] = True
+                    stack.append(w)
+                    comp.append(w)
+        comps.append(comp)
+    return comps
+
+
+def aggregate_beam_candidate_tables(
+        csv_files: List[str],
+        *,
+        kind: str,
+        time_tol_s: float = 0.3,
+        sky_tol_arcsec: float = 35.0,
+        out_dir: Optional[str] = None,
+        # out_csv: Optional[str] = None,
+        # out_vot: Optional[str] = None,
+) -> Table:
+    """Crossmatch candidates across beams and build a field-level summary table.
+
+    This is intentionally lightweight:
+      * Time grouping: detections are sorted by time_center and split into groups
+        whose span is <= time_tol_s (default 0.3 s).
+      * Spatial crossmatch within each time group uses Astropy's spherical search
+        (KD-tree accelerated), via SkyCoord.search_around_sky.
+      * Clustering: connected components over the returned neighbor pairs.
+      * Summary: the max-SNR detection in each cluster defines the reported
+        time_center, ra_deg, dec_deg, and max_snr.
+
+    Parameters
+    ----------
+    vot_files : list[str]
+        List of per-beam consolidated candidate VOTs (e.g. '*_boxcar_all.vot'
+        or '*_variance_all.vot').
+    kind : {'boxcar','variance'}
+        Candidate type. If 'boxcar', widths are aggregated.
+    time_tol_s : float
+        Time tolerance (seconds) for grouping.
+    sky_tol_arcsec : float
+        Spatial tolerance (arcsec) for crossmatch.
+    out_csv, out_vot : str, optional
+        If set, write outputs to these paths.
+
+    Returns
+    -------
+    astropy.table.Table
+        One row per crossmatched event.
+    """
+    
+    if out_dir is None:
+        out_dir = obs_root
+    os.makedirs(out_dir, exist_ok=True)
+    
+    kind = kind.lower().strip()
+    if kind not in ('boxcar', 'variance'):
+        raise ValueError("kind must be 'boxcar' or 'variance'")
+
+    rows: List[Dict[str, Any]] = []
+    for p in vot_files:
+        try:
+            t = Table.read(p, format='votable')
+        except Exception as e:
+            print(f"[Aggregate] Skipping '{p}' (read error: {e})")
+            continue
+
+        field_name, sbid, beam_id, chunk_id = _parse_beam_and_chunk_from_filename(p)
+        out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.csv")
+        out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.vot")
+        
+        for col in ('time_center', 'ra_deg', 'dec_deg', 'snr'):
+            if col not in t.colnames:
+                raise ValueError(f"Missing required column '{col}' in {p}")
+
+        for r in t:
+            d = {name: r[name] for name in t.colnames}
+            d['beam_id'] = beam_id
+            d['chunk_id'] = chunk_id
+            d['field'] = field
+            d['sbid'] = sbid
+            rows.append(d)
+
+    if len(rows) == 0:
+        names = ['event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr', 'beam_id', 'field', 'sbid']
+        if kind == 'boxcar':
+            names.append('width_samples')
+        names += ['chunk_ids', 'n_beams', 'n_detections']
+        out = Table(names=names)
+        if out_csv:
+            out.write(out_csv, format='csv', overwrite=True)
+        if out_vot:
+            out.write(out_vot, format='votable', overwrite=True)
+        return out
+
+    times = np.array([float(r['time_center']) for r in rows], dtype=np.float64)
+    order = np.argsort(times)
+    rows = [rows[i] for i in order]
+    times = times[order]
+
+    time_groups: List[Tuple[int, int]] = []
+    i0 = 0
+    N = len(rows)
+    while i0 < N:
+        t0 = times[i0]
+        i1 = i0 + 1
+        while i1 < N and (times[i1] - t0) <= time_tol_s:
+            i1 += 1
+        time_groups.append((i0, i1))
+        i0 = i1
+
+    events: List[Dict[str, Any]] = []
+
+    for (a0, a1) in time_groups:
+        k = a1 - a0
+        if k == 1:
+            det = rows[a0]
+            beams = sorted({det.get('beam_id', '')})
+            chunks = sorted({det.get('chunk_id', '')})
+            fields = sorted({det.get('field', '')})
+            sbids = sorted({det.get('sbid', '')})
+            ev = {
+                'time_center': float(det['time_center']),
+                'ra_deg': float(det['ra_deg']),
+                'dec_deg': float(det['dec_deg']),
+                'max_snr': float(det['snr']),
+                'beam_ids': ','.join([b for b in beams if b]),
+                'chunk_ids': ','.join([c for c in chunks if c]),
+                'fields': ','.join([f for f in fields]),
+                'sbids': ','.join([s for s in sbids]),
+                'n_beams': len([b for b in beams if b]),
+                'n_detections': 1,
+            }
+            if kind == 'boxcar':
+                w = det.get('width_samples', None)
+                ev['width_samples'] = str(int(w)) if w is not None else ''
+            events.append(ev)
+            continue
+
+        ra = np.array([float(rows[a0+i]['ra_deg']) for i in range(k)], dtype=float)
+        dec = np.array([float(rows[a0+i]['dec_deg']) for i in range(k)], dtype=float)
+
+        coords = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
+        i_idx, j_idx, sep2d, _ = coords.search_around_sky(coords, seplimit=sky_tol_arcsec*u.arcsec)
+
+        comps = _connected_components_from_pairs(k, i_idx, j_idx)
+
+        for comp in comps:
+            inds = [a0 + int(ii) for ii in comp]
+            sub = [rows[ii] for ii in inds]
+            best = max(sub, key=lambda r: float(r.get('snr', -np.inf)))
+
+            beams = sorted({r.get('beam_id', '') for r in sub})
+            chunks = sorted({r.get('chunk_id', '') for r in sub})
+            fields = sorted({det.get('field', '')})
+            sbids = sorted({det.get('sbid', '')})            
+
+            ev = {
+                'time_center': float(best['time_center']),
+                'ra_deg': float(best['ra_deg']),
+                'dec_deg': float(best['dec_deg']),
+                'max_snr': float(best['snr']),
+                'beam_ids': ','.join([b for b in beams if b]),
+                'chunk_ids': ','.join([c for c in chunks if c]),
+                'fields': ','.join([f for f in fields]),
+                'sbids': ','.join([s for s in sbids]),                
+                'n_beams': len([b for b in beams if b]),
+                'n_detections': len(sub),
+            }
+
+            if kind == 'boxcar':
+                widths = sorted({int(r.get('width_samples', -1)) for r in sub if r.get('width_samples', None) is not None})
+                widths = [w for w in widths if w >= 0]
+                ev['width_samples'] = ','.join([str(w) for w in widths])
+
+            events.append(ev)
+
+    events.sort(key=lambda r: r['time_center'])
+    for i, ev in enumerate(events):
+        ev['event_id'] = i
+
+    colnames = ['event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr', 'beam_ids']
+    if kind == 'boxcar':
+        colnames.append('width_samples')
+    colnames += ['chunk_ids', 'n_beams', 'n_detections']
+
+    out = Table(rows=[[ev.get(c) for c in colnames] for ev in events], names=colnames)
+
+    if out_csv:
+        out.write(out_csv, format='csv', overwrite=True)
+    if out_vot:
+        out.write(out_vot, format='votable', overwrite=True)
+
+    return out
+
+
+def aggregate_observation(
+    obs_root: str,
+    *,
+    kind: str = 'boxcar',
+    time_tol_s: float = 0.3,
+    sky_tol_arcsec: float = 35.0,
+    out_dir: Optional[str] = None,
+    pattern: Optional[str] = None,
+) -> Table:
+    """Discover per-beam candidate tables under obs_root and write a field-level summary."""
+    kind = kind.lower().strip()
+    if pattern is None:
+        suf = '*_boxcar_all.vot' if kind == 'boxcar' else '*_variance_all.vot'
+        pattern = os.path.join(obs_root, '**', 'candidates', suf) #obs_root/candidates/*.vot
+        
+
+    files = sorted(glob.glob(pattern, recursive=True))
+
+    if out_dir is None:
+        out_dir = obs_root
+    os.makedirs(out_dir, exist_ok=True)
+
+    # out_csv = os.path.join(out_dir, f"field_{kind}_summary.csv")
+    # out_vot = os.path.join(out_dir, f"field_{kind}_summary.vot")
+    print(f"[Aggregate] Found {len(files)} '{kind}' tables under '{obs_root}'")
+
+    return aggregate_beam_candidate_tables(
+        files,
+        kind=kind,
+        time_tol_s=time_tol_s,
+        sky_tol_arcsec=sky_tol_arcsec,
+        out_dir=out_dir,
+        # out_csv=out_csv,
+        # out_vot=out_vot,
+    )
+

@@ -141,6 +141,26 @@ def build_cli():
 
     return args
 
+def build_cli_aggregate(argv=None):
+    p = argparse.ArgumentParser(
+        prog="fastducc aggregate",
+        description="Aggregate per-beam candidate catalogues",
+    )
+    p.add_argument("--obs-root", required=True, help="Root directory containing per-beam outputs")
+    p.add_argument("--kind", choices=["boxcar", "variance"], default="boxcar",
+                   help="Which candidate type to aggregate (default: boxcar)")
+    p.add_argument("--time-tol", type=float, default=0.3,
+                   help="Time tolerance in seconds (default: 0.3)")
+    p.add_argument("--sky-tol-arcsec", type=float, default=35.0,
+                   help="Sky tolerance in arcsec (default: 35)")
+    p.add_argument("--pattern", default=None,
+                   help="Optional glob pattern to discover input CSVs (overrides default)")
+    p.add_argument("--outdir", default=None,
+                   help="Output directory (default: obs-root)")
+
+    args = p.parse_args(argv)
+    return args
+
 def make_config(args, paths) -> Config:
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = paths
     ra0_rad, dec0_rad, _ = ms_utils.get_phase_center(args.msname, field_name=None)
@@ -329,7 +349,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
                 time_factor=5,
                 pad_mode="constant", pad_value=0.0,
                 return_indices=True,
-                center_policy="right"  # or "left" as you prefer
+                center_policy="right"  # or "left"
             )
             # There will be exactly one snippet for this cand
             snip = snippets[0]
@@ -784,6 +804,11 @@ def main_serial(args):
 
 
 def main():
+
+    if sys.argv[1] == "aggregate":
+        aggregate_main(sys.argv)
+        return None
+    
     args = build_cli()
 
     if args.parallel_mode == "serial":
@@ -872,5 +897,21 @@ def main():
         remove_chunk_catalogues=True
     )
 
+
+def aggregate_main(argv=None):
+
+    args = build_cli_aggregate(argv)
+    
+    candidates.aggregate_observation(
+        obs_root=args.obs_root,
+        kind=args.kind,
+        time_tol_s=args.time_tol,
+        sky_tol_arcsec=args.sky_tol_arcsec,
+        out_dir=args.outdir,
+        pattern=args.pattern,
+    )
+    return 0
+
+    
 if __name__ == '__main__':
     main()
