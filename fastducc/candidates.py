@@ -594,7 +594,7 @@ def save_candidate_lightcurves(
     
     # --- Build the figure ---
     out_fig = f"{out_prefix}_lightcurves.png"
-    fig = plt.figure(figsize=(10, 8), dpi=dpi)
+    fig = plt.figure(figsize=(10, 10), dpi=dpi)
 
     
     # Top-left: WCS full frame
@@ -643,7 +643,7 @@ def save_candidate_lightcurves(
     ax_lc_box.set_ylabel(f"Flux (boxcar mean, w={w})")
     ax_lc_box.grid(True, alpha=0.3)
 
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.08, wspace=0.22, hspace=0.35)
+    #fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.08, wspace=0.22, hspace=0.35)
     fig.savefig(out_fig, bbox_inches="tight")
     plt.close(fig)
 
@@ -728,7 +728,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     out_fits = f"{out_prefix}_det.fits"
 
     # 1) Animated GIF with WCSAxes
-    fig = plt.figure(figsize=(5, 4), dpi=dpi)
+    fig = plt.figure(figsize=(10, 10), dpi=dpi)
     ax = fig.add_subplot(111, projection=wcs2d)
     im = ax.imshow(cube[0], origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     # Sky grid and labels
@@ -751,7 +751,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     plt.close(fig)
 
     # 2) Static PNG at detection frame + light curve
-    fig2 = plt.figure(figsize=(6, 6), dpi=dpi)
+    fig2 = plt.figure(figsize=(10, 10), dpi=dpi)
     # Top: WCSAxes image
     ax_img = fig2.add_subplot(2, 1, 1, projection=wcs2d)
     im2 = ax_img.imshow(det_frame, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
@@ -793,7 +793,6 @@ def save_candidate_snippet_products(snippet_rec: dict,
     ax_lc.set_ylabel("Pixel value at detection location")
     ax_lc.grid(True, alpha=0.3)
 
-    fig2.tight_layout()
     fig2.savefig(out_png, bbox_inches="tight")
     plt.close(fig2)
 
