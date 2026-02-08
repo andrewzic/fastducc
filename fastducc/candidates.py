@@ -1075,6 +1075,8 @@ def aggregate_beam_candidate_tables(
     astropy.table.Table
         One row per crossmatched event.
     """
+
+    obs_root = os.path.abspath(os.path.dirname(vot_files[0]))
     
     if out_dir is None:
         out_dir = obs_root
@@ -1085,6 +1087,16 @@ def aggregate_beam_candidate_tables(
         raise ValueError("kind must be 'boxcar' or 'variance'")
 
     rows: List[Dict[str, Any]] = []
+
+    for p in vot_files:
+        
+        field_name, sbid, beam_id, chunk_id = _parse_beam_and_chunk_from_filename(p)
+        if field_name != "" and sbid != "" and chunk_id != "":
+            out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.csv")
+            out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.vot")
+            break
+        
+    
     for p in vot_files:
         try:
             t = Table.read(p, format='votable')
@@ -1093,8 +1105,7 @@ def aggregate_beam_candidate_tables(
             continue
 
         field_name, sbid, beam_id, chunk_id = _parse_beam_and_chunk_from_filename(p)
-        out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.csv")
-        out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.vot")
+
         
         for col in ('time_center', 'ra_deg', 'dec_deg', 'snr'):
             if col not in t.colnames:
@@ -1177,10 +1188,16 @@ def aggregate_beam_candidate_tables(
             sub = [rows[ii] for ii in inds]
             best = max(sub, key=lambda r: float(r.get('snr', -np.inf)))
 
+            
+            fields = sorted({r.get('field', '') for r in sub})
+            sbids  = sorted({r.get('sbid', '') for r in sub})
+
+            
             beams = sorted({r.get('beam_id', '') for r in sub})
             chunks = sorted({r.get('chunk_id', '') for r in sub})
-            fields = sorted({det.get('field', '')})
-            sbids = sorted({det.get('sbid', '')})            
+
+            fields = sorted({r.get('field', '') for r in sub})
+            sbids  = sorted({r.get('sbid', '') for r in sub})
 
             ev = {
                 'time_center': float(best['time_center']),
