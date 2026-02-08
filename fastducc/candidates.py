@@ -1094,8 +1094,8 @@ def aggregate_beam_candidate_tables(
         
         field_name, sbid, beam_id, chunk_id = _parse_beam_and_chunk_from_filename(p)
         if field_name != "" and sbid != "" and chunk_id != "":
-            out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.csv")
-            out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{kind}_summary.vot")
+            out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{chunk_id}_{kind}_summary.csv")
+            out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{chunk_id}_{kind}_summary.vot")
             break
         
     
@@ -1250,6 +1250,237 @@ def aggregate_beam_candidate_tables(
     if out_vot:
         out.write(out_vot, format='votable', overwrite=True)
 
+    # -------------------------------------------------------------------------
+    # Super-summary: marginalise over event time by clustering events by sky pos
+    # -------------------------------------------------------------------------
+
+    def _parse_list_str(val):
+        # Parse comma-separated lists like "beam00,beam15" or "4,8,12".
+        # Returns list of stripped tokens; empty list for blank/None.
+        if val is None:
+            return []
+        s = str(val).strip().strip('"')
+        if not s:
+            return []
+        return [p.strip() for p in s.split(",") if p.strip()]
+
+    def _parse_list_int(val):
+        out_set = set()
+        for tok in _parse_list_str(val):
+            try:
+                out_set.add(int(tok))
+            except Exception:
+                pass
+        return out_set
+
+    def _parse_list_set_str(val):
+        return set(_parse_list_str(val))
+
+    def _uf_find(parent, a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def _uf_union(parent, rank, a, b):
+        ra = _uf_find(parent, a)
+        rb = _uf_find(parent, b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    # If the event-level aggregate did not include these columns, we can compute them
+    # from ra_deg/dec_deg using the existing wcs helpers.
+    have_ra_hms = ("ra_hms" in out.colnames)
+    have_dec_dms = ("dec_dms" in out.colnames)
+    have_srcname = ("srcname" in out.colnames)
+
+    if (not have_ra_hms) or (not have_dec_dms) or (not have_srcname):
+        # Compute missing sexagesimal and srcname using fastducc.wcs functions.
+        # wcs.rad_to_hmsdms and wcs.hmsdms_to_srcname exist in wcs.py. [2](blob:https://www.microsoft365.com/30301a87-85d6-4efa-95ee-6407397d0361)
+        if "ra_hms" not in out.colnames:
+            out["ra_hms"] = ["" for _ in range(len(out))]
+        if "dec_dms" not in out.colnames:
+            out["dec_dms"] = ["" for _ in range(len(out))]
+        if "srcname" not in out.colnames:
+            out["srcname"] = ["" for _ in range(len(out))]
+
+        for i in range(len(out)):
+            ra_deg_i = float(out["ra_deg"][i])
+            dec_deg_i = float(out["dec_deg"][i])
+            ra_rad_i = math.radians(ra_deg_i)
+            dec_rad_i = math.radians(dec_deg_i)
+            ra_hms_i, dec_dms_i = ducc_wcs.rad_to_hmsdms(ra_rad_i, dec_rad_i, dp=1)
+            out["ra_hms"][i] = ra_hms_i
+            out["dec_dms"][i] = dec_dms_i
+            out["srcname"][i] = ducc_wcs.hmsdms_to_srcname(ra_hms_i, dec_dms_i)
+
+    # Build SkyCoord for all event rows and cluster by 35 arcsec across all times.
+    super_seplimit = sky_tol_arcsec * u.arcsec
+    coords_all = SkyCoord(
+        ra=np.array(out["ra_deg"], dtype=float) * u.deg,
+        dec=np.array(out["dec_deg"], dtype=float) * u.deg,
+        frame="icrs",
+    )
+
+    idx1, idx2, sep2d, _ = coords_all.search_around_sky(coords_all, seplimit=super_seplimit)
+
+    n_ev = len(out)
+    parent = list(range(n_ev))
+    rank = [0] * n_ev
+
+    for a, b in zip(idx1, idx2):
+        a = int(a)
+        b = int(b)
+        if a == b:
+            continue
+        _uf_union(parent, rank, a, b)
+
+    comp_map = {}
+    for i in range(n_ev):
+        r = _uf_find(parent, i)
+        comp_map.setdefault(r, []).append(i)
+
+    # Build super-summary rows (one per sky-clustered source).
+    super_rows = []
+    for comp_inds in comp_map.values():
+        sub = out[comp_inds]
+
+        # Count events and detections
+        n_events = len(sub)
+        if "n_detections" in sub.colnames:
+            n_dets_total = int(np.nansum(np.array(sub["n_detections"], dtype=float)))
+        else:
+            # Fallback: assume 1 detection per event row
+            n_dets_total = int(n_events)
+
+        # Union of beams/widths/chunks across all events
+        beams_all = set()
+        widths_all = set()
+        chunks_all = set()
+
+        if "beam_ids" in sub.colnames:
+            for v in sub["beam_ids"]:
+                beams_all |= _parse_list_set_str(v)
+
+        if kind == "boxcar" and ("width_samples" in sub.colnames):
+            for v in sub["width_samples"]:
+                widths_all |= _parse_list_int(v)
+
+        if "chunk_ids" in sub.colnames:
+            for v in sub["chunk_ids"]:
+                chunks_all |= _parse_list_set_str(v)
+
+        # Find the event row with the maximum max_snr
+        max_snr_vals = np.array(sub["max_snr"], dtype=float) if ("max_snr" in sub.colnames) else np.full(n_events, np.nan)
+        j_best = int(np.nanargmax(max_snr_vals)) if np.any(np.isfinite(max_snr_vals)) else 0
+        best = sub[j_best]
+
+        # Representative position/name from the max-SNR event
+        rep_srcname = str(best["srcname"]) if ("srcname" in sub.colnames) else ""
+        rep_ra_deg = float(best["ra_deg"])
+        rep_dec_deg = float(best["dec_deg"])
+        rep_ra_hms = str(best["ra_hms"]) if ("ra_hms" in sub.colnames) else ""
+        rep_dec_dms = str(best["dec_dms"]) if ("dec_dms" in sub.colnames) else ""
+
+        # Max-SNR event details
+        max_snr = float(best["max_snr"]) if ("max_snr" in sub.colnames) else float("nan")
+        max_time = float(best["time_center"]) if ("time_center" in sub.colnames) else float("nan")
+
+        best_event_beams = _parse_list_str(best["beam_ids"]) if ("beam_ids" in sub.colnames) else []
+        best_event_widths = _parse_list_str(best["width_samples"]) if (kind == "boxcar" and "width_samples" in sub.colnames) else []
+
+        # If the best event has multiple beams/widths listed, it is ambiguous which single beam/width
+        # produced the max_snr within that event cluster. Keep the event-level lists, and only
+        # populate max_snr_beam/max_snr_width when unambiguous.
+        max_snr_beam = best_event_beams[0] if len(best_event_beams) == 1 else ""
+        max_snr_width = int(best_event_widths[0]) if (len(best_event_widths) == 1 and best_event_widths[0].isdigit()) else -1
+
+        super_row = {
+            "source_id": -1,  # filled after sorting
+            "srcname": rep_srcname,
+            "ra_deg": rep_ra_deg,
+            "dec_deg": rep_dec_deg,
+            "ra_hms": rep_ra_hms,
+            "dec_dms": rep_dec_dms,
+            "n_events": int(n_events),
+            "n_detections_total": int(n_dets_total),
+            "beams_all": ",".join(sorted([b for b in beams_all if b])),
+            "chunks_all": ",".join(sorted([c for c in chunks_all if c])),
+            "max_snr": max_snr,
+            "max_snr_time_center": max_time,
+            "max_snr_event_beams": ",".join(best_event_beams),
+        }
+
+        if kind == "boxcar":
+            super_row["width_samples_all"] = ",".join([str(w) for w in sorted(widths_all)])
+            super_row["max_snr_event_widths"] = ",".join(best_event_widths)
+            super_row["max_snr_beam"] = max_snr_beam
+            super_row["max_snr_width"] = max_snr_width
+
+        super_rows.append(super_row)
+
+    # Sort sources by max_snr descending, then assign source_id
+    super_rows.sort(key=lambda r: (float(r.get("max_snr", -np.inf))), reverse=True)
+    for i, r in enumerate(super_rows):
+        r["source_id"] = i
+
+    # Define output column order
+    super_cols = [
+        "source_id",
+        "srcname",
+        "ra_deg",
+        "dec_deg",
+        "ra_hms",
+        "dec_dms",
+        "n_events",
+        "n_detections_total",
+        "beams_all",
+        "chunks_all",
+        "max_snr",
+        "max_snr_time_center",
+        "max_snr_event_beams",
+    ]
+    if kind == "boxcar":
+        super_cols += [
+            "width_samples_all",
+            "max_snr_event_widths",
+            "max_snr_beam",
+            "max_snr_width",
+        ]
+
+    super_tab = Table(rows=[[r.get(c) for c in super_cols] for r in super_rows], names=super_cols)
+
+    # Write super-summary alongside the event summary.
+    # Derive name from the event-level out_csv/out_vot if available.
+    super_csv = None
+    super_vot = None
+    try:
+        if out_csv:
+            super_csv = str(out_csv).replace("_summary.csv", "_super_summary.csv")
+        if out_vot:
+            super_vot = str(out_vot).replace("_summary.vot", "_super_summary.vot")
+    except Exception:
+        super_csv = None
+        super_vot = None
+
+    if not super_csv:
+        super_csv = os.path.join(out_dir, f"field_{kind}_super_summary.csv")
+    if not super_vot:
+        super_vot = os.path.join(out_dir, f"field_{kind}_super_summary.vot")
+
+    super_tab.write(super_csv, format="csv", overwrite=True)
+    super_tab.write(super_vot, format="votable", overwrite=True)
+
+
+
+        
     return out
 
 
