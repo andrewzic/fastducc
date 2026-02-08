@@ -979,7 +979,7 @@ def _parse_beam_and_chunk_from_filename(path: str) -> tuple[str, str, str, str]:
     m_field = re.search(r'(LTR_\d{4}(?:\+/-|-)\d{4})', fname)
     if m_field:
         field = m_field.group(1)
-    m_sbid = re.search(r'SB\d{5}', fname)
+    m_sbid = re.search(r'(SB\d{5})', fname)
     if m_sbid:
         sbid = m_sbid.group(1)
     m_beam = re.search(r'(beam\d+)', fname)
@@ -1036,7 +1036,7 @@ def _connected_components_from_pairs(n: int, i_idx, j_idx) -> List[List[int]]:
 
 
 def aggregate_beam_candidate_tables(
-        csv_files: List[str],
+        vot_files: List[str],
         *,
         kind: str,
         time_tol_s: float = 0.3,
@@ -1104,7 +1104,7 @@ def aggregate_beam_candidate_tables(
             d = {name: r[name] for name in t.colnames}
             d['beam_id'] = beam_id
             d['chunk_id'] = chunk_id
-            d['field'] = field
+            d['field'] = field_name
             d['sbid'] = sbid
             rows.append(d)
 
