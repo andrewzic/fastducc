@@ -352,12 +352,12 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
     if len(annotated) == 0:
         # return an empty table with typical schema
         t = Table(names=[
-            "x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
+            "srcname","x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
             "ra_hms","dec_dms","snr","width_samples",
             "time_start","time_end","time_center",
             "t0_idx","t1_idx_excl","center_idx","phase_center_field"
         ], dtype=[
-            int,int,float,float,float,float,float,float,
+            str, int,int,float,float,float,float,float,float,
             "U20","U20",float,int,
             float,float,float,
             int,int,int,"U64"
@@ -369,6 +369,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
         return [c.get(key, default) for c in annotated]
 
     # Base numeric columns
+    srcname = np.array(col("srcname", default=""), dtype=str)
     xs  = np.array(col("x", default=np.int64(-1)), dtype=np.int64)
     ys  = np.array(col("y", default=np.int64(-1)), dtype=np.int64)
     ls  = np.array(col("l"), dtype=float)
@@ -402,6 +403,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
 
     # Build Astropy Table
     t = Table()
+    t["srcname"] = srcname
     t["x"] = xs
     t["y"] = ys
     t["l"] = ls * u.dimensionless_unscaled          # direction cosine
@@ -1157,10 +1159,19 @@ def aggregate_beam_candidate_tables(
             chunks = sorted({det.get('chunk_id', '')})
             fields = sorted({det.get('field', '')})
             sbids = sorted({det.get('sbid', '')})
+            # Convert degrees to radians
+            ra_rad = math.radians(float(det["ra_deg"]))
+            dec_rad = math.radians(float(det["dec_deg"]))
+            ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(ra_rad, dec_rad, dp=1)
+            srcname = ducc_wcs.hmsdms_to_srcname(ra_hms, dec_dms)
+            
             ev = {
+                'srcname': str(srcname),
                 'time_center': float(det['time_center']),
                 'ra_deg': float(det['ra_deg']),
                 'dec_deg': float(det['dec_deg']),
+                'ra_hms': str(ra_hms),
+                'dec_dms', str(dec_dms),
                 'max_snr': float(det['snr']),
                 'beam_ids': ','.join([b for b in beams if b]),
                 'chunk_ids': ','.join([c for c in chunks if c]),
@@ -1189,20 +1200,24 @@ def aggregate_beam_candidate_tables(
             best = max(sub, key=lambda r: float(r.get('snr', -np.inf)))
 
             
-            fields = sorted({r.get('field', '') for r in sub})
-            sbids  = sorted({r.get('sbid', '') for r in sub})
-
-            
             beams = sorted({r.get('beam_id', '') for r in sub})
             chunks = sorted({r.get('chunk_id', '') for r in sub})
-
             fields = sorted({r.get('field', '') for r in sub})
             sbids  = sorted({r.get('sbid', '') for r in sub})
 
+            # Convert degrees to radians
+            ra_rad = math.radians(float(best["ra_deg"]))
+            dec_rad = math.radians(float(best["dec_deg"]))
+            ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(ra_rad, dec_rad, dp=1)
+            srcname = ducc_wcs.hmsdms_to_srcname(ra_hms, dec_dms)
+            
             ev = {
+                'srcname': srcname,
                 'time_center': float(best['time_center']),
                 'ra_deg': float(best['ra_deg']),
                 'dec_deg': float(best['dec_deg']),
+                'ra_hms': str(ra_hms),
+                'dec_dms': str(dec_dms),
                 'max_snr': float(best['snr']),
                 'beam_ids': ','.join([b for b in beams if b]),
                 'chunk_ids': ','.join([c for c in chunks if c]),
@@ -1223,7 +1238,7 @@ def aggregate_beam_candidate_tables(
     for i, ev in enumerate(events):
         ev['event_id'] = i
 
-    colnames = ['event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr', 'beam_ids']
+    colnames = ['event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms', 'max_snr', 'beam_ids']
     if kind == 'boxcar':
         colnames.append('width_samples')
     colnames += ['chunk_ids', 'n_beams', 'n_detections']
