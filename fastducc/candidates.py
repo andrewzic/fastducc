@@ -1171,7 +1171,7 @@ def aggregate_beam_candidate_tables(
                 'ra_deg': float(det['ra_deg']),
                 'dec_deg': float(det['dec_deg']),
                 'ra_hms': str(ra_hms),
-                'dec_dms', str(dec_dms),
+                'dec_dms': str(dec_dms),
                 'max_snr': float(det['snr']),
                 'beam_ids': ','.join([b for b in beams if b]),
                 'chunk_ids': ','.join([c for c in chunks if c]),
