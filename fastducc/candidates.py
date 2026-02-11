@@ -610,31 +610,31 @@ def save_candidate_lightcurves(
     im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="red")
     ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
-    ax_full.set_xlabel("Right Ascension")
-    ax_full.set_ylabel("Declination")
+    ax_full.set_xlabel("Right Ascension (J2000)")
+    ax_full.set_ylabel("Declination (J2000)")
     ax_full.set_title(f"Full image @ t={times[t_full_center]:.3f}s (idx {t_full_center})")
     cbar1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
-    cbar1.set_label("Intensity (arb. units)")
+    cbar1.set_label("Flux Density (mJy/beam)")
     
     # Top-right: WCS cutout
     ax_cut = fig.add_subplot(gs[0,1], projection=wcs_cut)
     im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="red")
     ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
-    ax_cut.set_xlabel("Right Ascension")
-    ax_cut.set_ylabel("Declination")
+    ax_cut.set_xlabel("Right Ascension (J2000)")
+    ax_cut.set_ylabel("Declination (J2000)")
     ax_cut.set_title(f"Cutout")
 
 
     cbar2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
-    cbar2.set_label("Intensity (arb. units)")    
+    cbar2.set_label("Flux density (mJy/beam)")    
 
 
     # Middle: full-res light curve
     ax_lc_full = fig.add_subplot(gs[1, :])  # spans full width below
     ax_lc_full.plot(times, lc_full, color="tab:blue", lw=1.6)
     ax_lc_full.axvline(times[t_full_center], color="red", ls="--", lw=1.0, label="Detection time")
-    ax_lc_full.set_ylabel("Flux (full-res)")
+    ax_lc_full.set_ylabel("Flux density (mJy/beam)")
     ax_lc_full.grid(True, alpha=0.3)
     ax_lc_full.legend(loc="best")
 
@@ -648,7 +648,7 @@ def save_candidate_lightcurves(
         ax_lc_box.text(0.5, 0.5, f"Width {w} > T; no smoothed LC",
                        transform=ax_lc_box.transAxes, ha="center", va="center", color="red")
     ax_lc_box.set_xlabel("Time (s)")
-    ax_lc_box.set_ylabel(f"Flux (boxcar mean, w={w})")
+    ax_lc_box.set_ylabel(f"Flux density - boxcar mean, w={w} (mJy/beam)")
     ax_lc_box.grid(True, alpha=0.3)
 
     #fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.08, wspace=0.22, hspace=0.35)
@@ -741,8 +741,8 @@ def save_candidate_snippet_products(snippet_rec: dict,
     im = ax.imshow(cube[0], origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     # Sky grid and labels
     ax.coords.grid(True, color="white", alpha=0.3, ls=":")
-    ax.set_xlabel("Right Ascension")
-    ax.set_ylabel("Declination")
+    ax.set_xlabel("Right Ascension (J2000)")
+    ax.set_ylabel("Declination (J2000)")
     # Mark the detection pixel at center
     ax.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
     # Title updates with time
@@ -770,15 +770,15 @@ def save_candidate_snippet_products(snippet_rec: dict,
     ax_img = fig2.add_subplot(gs[0:2, :], projection=wcs2d)
     im2 = ax_img.imshow(det_frame, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
-    ax_img.set_xlabel("Right Ascension")
-    ax_img.set_ylabel("Declination")
+    ax_img.set_xlabel("Right Ascension (J2000)")
+    ax_img.set_ylabel("Declination (J2000)")
     ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
     cb = fig2.colorbar(im2, ax=ax_img, fraction=0.046, pad=0.04)
     cb.set_label("Intensity (arb. units)")
     # Title with RA/Dec, SNR if available
     ra_hms = cand.get("ra_hms", None)
     dec_dms = cand.get("dec_dms", None)
-    title_txt = "Detection frame"
+    title_txt = "Candidate frame"
     if ra_hms and dec_dms:
         title_txt += f"  |  RA={ra_hms}  Dec={dec_dms}"
     ax_img.set_title(title_txt)
@@ -795,7 +795,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     print(cand)
     try:
         tline = cand.get("time_center_peak", cand["time_center"])
-        ax_lc.axvline(tline, color="red", ls="--", lw=1.0, label="Detection (peak)")
+        ax_lc.axvline(tline, color="red", ls="--", lw=1.0, label="Candidate peak")
 
     except KeyError:
         print("time_center not found")
@@ -804,7 +804,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     #     ax_lc.axvline(t0, color="red", ls="--", lw=1.0, label="Detection time")
     #     ax_lc.legend(loc="best")
     ax_lc.set_xlabel("Time (s)")
-    ax_lc.set_ylabel("Pixel value at detection location")
+    ax_lc.set_ylabel("Peak flux density (mJy/beam)")
     ax_lc.grid(True, alpha=0.3)
 
     fig2.savefig(out_png, bbox_inches="tight")
