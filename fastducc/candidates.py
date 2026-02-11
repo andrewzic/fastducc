@@ -22,6 +22,7 @@ from astropy.io import fits
 from astropy.table import Table, vstack
 
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 from matplotlib.animation import FuncAnimation, PillowWriter
 from ligo.skymap.plot.marker import reticle
 
@@ -93,7 +94,7 @@ def extract_candidate_snippets(
     detections: List[Dict[str, Any]],
     *,
     spatial_size: int = 50,
-    time_factor: int = 5,            # in units of *smoothed* frames
+    time_factor: int = 25,            # in units of *smoothed* frames
     pad_mode: str = "constant",
     pad_value: float = 0.0,
     return_indices: bool = True,
@@ -596,20 +597,27 @@ def save_candidate_lightcurves(
     out_fig = f"{out_prefix}_lightcurves.png"
     fig = plt.figure(figsize=(10, 10), dpi=dpi)
 
+    gs = GridSpec(
+        nrows=3, ncols=2, figure=fig,
+        height_ratios=[1.1, 1.0, 1.0],   # give images slightly more height
+        width_ratios=[1, 1],
+    )
+
+    
     
     # Top-left: WCS full frame
-    ax_full = fig.add_subplot(2, 2, 1, projection=wcs_full)
+    ax_full = fig.add_subplot(gs[0,0], projection=wcs_full)
     im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="red")
     ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_full.set_xlabel("Right Ascension")
     ax_full.set_ylabel("Declination")
     ax_full.set_title(f"Full image @ t={times[t_full_center]:.3f}s (idx {t_full_center})")
-    cbar1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.04)
+    cbar1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
     cbar1.set_label("Intensity (arb. units)")
     
     # Top-right: WCS cutout
-    ax_cut = fig.add_subplot(2, 2, 2, projection=wcs_cut)
+    ax_cut = fig.add_subplot(gs[0,1], projection=wcs_cut)
     im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="red")
     ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
@@ -618,12 +626,12 @@ def save_candidate_lightcurves(
     ax_cut.set_title(f"Cutout")
 
 
-    cbar2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.04)
+    cbar2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
     cbar2.set_label("Intensity (arb. units)")    
 
 
     # Middle: full-res light curve
-    ax_lc_full = fig.add_subplot(3, 1, 2)  # spans full width below
+    ax_lc_full = fig.add_subplot(gs[1, :])  # spans full width below
     ax_lc_full.plot(times, lc_full, color="tab:blue", lw=1.6)
     ax_lc_full.axvline(times[t_full_center], color="red", ls="--", lw=1.0, label="Detection time")
     ax_lc_full.set_ylabel("Flux (full-res)")
@@ -631,7 +639,7 @@ def save_candidate_lightcurves(
     ax_lc_full.legend(loc="best")
 
     # Bottom: boxcar-smoothed light curve
-    ax_lc_box = fig.add_subplot(3, 1, 3)
+    ax_lc_box = fig.add_subplot(gs[2, :])
     if T_eff > 0:
         ax_lc_box.plot(times_sm, lc_sm, color="tab:green", lw=1.6)
         ax_lc_box.axvline(times_sm[k_center], color="red", ls="--", lw=1.0, label=f"Smoothed center (w={w})")
@@ -752,8 +760,14 @@ def save_candidate_snippet_products(snippet_rec: dict,
 
     # 2) Static PNG at detection frame + light curve
     fig2 = plt.figure(figsize=(10, 10), dpi=dpi)
+    gs = GridSpec(
+        nrows=3, ncols=2, figure=fig,
+        height_ratios=[1.0, 1.0, 1.0],   # give images slightly more height
+        width_ratios=[1, 1],
+    )
+    
     # Top: WCSAxes image
-    ax_img = fig2.add_subplot(2, 1, 1, projection=wcs2d)
+    ax_img = fig2.add_subplot(gs[0:2, :], projection=wcs2d)
     im2 = ax_img.imshow(det_frame, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
     ax_img.set_xlabel("Right Ascension")
@@ -770,7 +784,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     ax_img.set_title(title_txt)
 
     # Bottom: light curve of detection pixel
-    ax_lc = fig2.add_subplot(2, 1, 2)
+    ax_lc = fig2.add_subplot(gs[2, :])
     lc = cube[:, y_center, x_center]
     # Mask NaNs from pad zones
     good = np.isfinite(times) & np.isfinite(lc)

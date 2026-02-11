@@ -346,7 +346,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
             snippets = candidates.extract_candidate_snippets(
                 times, cube, [cand],   # pass single cand to get one snippet
                 spatial_size=50,
-                time_factor=5,
+                time_factor=50,
                 pad_mode="constant", pad_value=0.0,
                 return_indices=True,
                 center_policy="right"  # or "left"
@@ -729,7 +729,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 if cfg.save_box_snippets:
                     snippets = candidates.extract_candidate_snippets(
                         times, cube, [cand],
-                        spatial_size=50, time_factor=5,
+                        spatial_size=50, time_factor=50,
                         pad_mode="constant", pad_value=0.0,
                         return_indices=True, center_policy="right"
                     )
