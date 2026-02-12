@@ -98,7 +98,7 @@ def build_cli():
     parser.set_defaults(save_var_lightcurves=True)
     parser.add_argument('--save-full-var-lightcurves',  dest='save_full_var_lightcurves',  action='store_true', help='Save full lightcurves (over all chunks) for variance candidates')
     parser.add_argument('--no-save-full-var-lightcurves',  dest='save_full_var_lightcurves',  action='store_false')
-    parser.set_defaults(save_var_lightcurves=False)    
+    parser.set_defaults(save_full_var_lightcurves=False)    
     parser.add_argument('--save-var-snippets',     dest='save_var_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for variance candidates')
     parser.add_argument('--no-save-var-snippets',  dest='save_var_snippets',     action='store_false')
     parser.set_defaults(save_var_snippets=True)
@@ -851,7 +851,7 @@ def main():
         for (start, end) in chunk_bounds:
             print(f"[Serial] Chunk {start}..{end}")
             times, cube, c, m, M2 = process_chunk_task(cfg, ms_base, candidates_dir, start, end)
-            agg_list.append((times, c, m, M2))
+            agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2))
 
     elif args.parallel_mode == 'dask-local':
         from dask.distributed import Client, LocalCluster
