@@ -96,6 +96,9 @@ def build_cli():
     parser.add_argument('--save-var-lightcurves',  dest='save_var_lightcurves',  action='store_true', help='Save lightcurves for variance candidates')
     parser.add_argument('--no-save-var-lightcurves',  dest='save_var_lightcurves',  action='store_false')
     parser.set_defaults(save_var_lightcurves=True)
+    parser.add_argument('--save-full-var-lightcurves',  dest='save_full_var_lightcurves',  action='store_true', help='Save full lightcurves (over all chunks) for variance candidates')
+    parser.add_argument('--no-save-full-var-lightcurves',  dest='save_full_var_lightcurves',  action='store_false')
+    parser.set_defaults(save_var_lightcurves=False)    
     parser.add_argument('--save-var-snippets',     dest='save_var_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for variance candidates')
     parser.add_argument('--no-save-var-snippets',  dest='save_var_snippets',     action='store_false')
     parser.set_defaults(save_var_snippets=True)
@@ -176,6 +179,7 @@ def make_config(args, paths) -> Config:
         enable_var=args.enable_var, enable_boxcar=args.enable_boxcar,
         enable_var_chunk=args.enable_var_chunk,
         save_var_lightcurves=args.save_var_lightcurves,
+        save_full_var_lightcurves=args.save_full_var_lightcurves,
         save_var_snippets=args.save_var_snippets,
         save_box_lightcurves=args.save_box_lightcurves,
         save_box_snippets=args.save_box_snippets,
@@ -195,7 +199,7 @@ def init_welford(cfg: Config) -> WelfordState:
         M2=np.zeros((Ny, Nx), dtype=np.float64)
     )
 
-def process_variance_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx: int):
+def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx: int):
     # Accumulate Welford
     kernels.welford_update_cube(wf.count, wf.mean, wf.M2, cube, ignore_nan=True)
     if not cfg.enable_var:
@@ -477,22 +481,26 @@ def finalise_welford_parallel(
     mean_acc  = np.zeros((Ny, Nx), dtype=np.float64)
     M2_acc    = np.zeros((Ny, Nx), dtype=np.float64)
 
+    
     for (times, cube, c, m, M2) in agg_list:
         # combine per-chunk aggregate into the accumulator
         count_acc, mean_acc, M2_acc = welford_combine_aggregates(count_acc, mean_acc, M2_acc, c, m, M2)
-
+        
     all_times = np.concatenate([a[0] for a in agg_list])
     order = np.argsort(all_times)
     all_times = all_times[order]
-    all_cube = np.empty((int(np.sum(a[1].shape[0] for a in agg_list)), cfg.npix_y, cfg.npix_x), dtype=agg_list[0][1].dtype)
-    start_ = 0
-    for a in agg_list:
-        nsub = a[1].shape[0]
-        end_ = start_ + nsub
-        all_cube[start_:end_] = a[1]
-        start_ += nsub
+    if cfg.save_full_var_lightcurves:
+        all_cube = np.empty((int(np.sum(a[1].shape[0] for a in agg_list)), cfg.npix_y, cfg.npix_x), dtype=agg_list[0][1].dtype)
+        start_ = 0
+        for a in agg_list:
+            nsub = a[1].shape[0]
+            end_ = start_ + nsub
+            all_cube[start_:end_] = a[1]
+            start_ += nsub
 
-    all_cube = all_cube[order]
+        all_cube = all_cube[order]
+    else:
+        all_cube = None
 
     # --- 2) Finalise to full std-map ---
     std_map_full = kernels.welford_finalise_std(count_acc, M2_acc, ddof=1)
@@ -534,7 +542,7 @@ def finalise_welford_parallel(
                 threshold_sigma=cfg.var_threshold,
                 spatial_radius=cfg.nms_radius,
                 valid_mask=None,
-                times=all_times, cube=all_cube, time_tag_policy="none"
+                times=all_times, time_tag_policy="none"
             )
             annotated_var = ducc_wcs.annotate_candidates_with_sky_coords(
                 msname=cfg.msname, final_detections=var_nms,
@@ -547,10 +555,10 @@ def finalise_welford_parallel(
             candidates.save_candidates_table(t_var,
                                              csv_path=f"{var_root}_candidates.csv",
                                              vot_path=f"{var_root}_candidates.vot"
-                                             )            
+                                             )
             for i, cand in enumerate(annotated_var):
                 srcname = cand["srcname"]
-                if cfg.save_var_lightcurves:
+                if cfg.save_full_var_lightcurves:
                     candidates.save_candidate_lightcurves(
                         all_times, all_cube, cand,
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
@@ -613,8 +621,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
 
     # Per-chunk Welford aggregates
     Ny, Nx = cfg.npix_y, cfg.npix_x
-    c = np.zeros((Ny, Nx), dtype=np.int64)
-    m = np.zeros((Ny, Nx), dtype=np.float64)
+    c = np.zeros((Ny, Nx), dtype=np.int64) #count for welford
+    m = np.zeros((Ny, Nx), dtype=np.float64) #
     M2 = np.zeros((Ny, Nx), dtype=np.float64)
     kernels.welford_update_cube(c, m, M2, cube, ignore_nan=True)
 
@@ -742,7 +750,10 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
                     )
 
-    return times, cube, c, m, M2
+    if cfg.save_full_var_lightcurves:
+        return times, cube, c, m, M2
+    else:
+        return times, None, c, m, M2
 
 def main_serial(args):
     #args = build_cli()
@@ -789,7 +800,7 @@ def main_serial(args):
 
 
         # Variance/Welford chunk
-        var_ann = process_variance_chunk(cfg, times, cube, wf, start)
+        var_ann = process_variance_cube_chunk(cfg, times, cube, wf, start)
 
         # Boxcar chunk
         box_ann = process_boxcar_chunk(cfg, times, cube, start)
@@ -840,7 +851,7 @@ def main():
         for (start, end) in chunk_bounds:
             print(f"[Serial] Chunk {start}..{end}")
             times, cube, c, m, M2 = process_chunk_task(cfg, ms_base, candidates_dir, start, end)
-            agg_list.append((times, cube, c, m, M2))
+            agg_list.append((times, c, m, M2))
 
     elif args.parallel_mode == 'dask-local':
         from dask.distributed import Client, LocalCluster

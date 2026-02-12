@@ -33,6 +33,7 @@ class Config:
     chunk_prefix_root: Any
     all_prefix_root: str
     save_var_lightcurves: bool
+    save_full_var_lightcurves: bool
     save_var_snippets: bool
     save_box_lightcurves: bool
     save_box_snippets: bool
