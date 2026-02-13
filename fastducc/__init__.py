@@ -19,6 +19,8 @@ Submodules:
 
 __all__ = [
     "fastducc_run",
+    "core",
+    "cli",
     "imaging",
     "detection",
     "kernels",

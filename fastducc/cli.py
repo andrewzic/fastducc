@@ -33,6 +33,13 @@ def _run_aggregate(argv):
     from fastducc import fastducc_run
     return fastducc_run.aggregate_main(list(argv))
 
+def _run_aggregate_obs(argv):
+    """
+    Parse aggregate args and run candidates.aggregate_observation().
+    """
+    from fastducc import fastducc_run
+    return fastducc_run.aggregate_obs_main(list(argv))
+
 def main(argv=None):
     """
     Entry point for the console script "fastducc".
@@ -45,6 +52,8 @@ def main(argv=None):
 
     if len(argv) > 0 and argv[0] == "aggregate":
         return _run_aggregate(argv[1:])
+    elif len(argv) > 0 and argv[0] == "aggregate_obs":
+        return _run_aggregate_obs(argv[1:])
 
     return _run_imaging_search(argv)
 

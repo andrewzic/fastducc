@@ -3,6 +3,7 @@ import argparse
 import glob
 import os
 import shutil
+import itertools
 import sys
 import re
 from typing import Iterable, Tuple, List, Dict, Any, Optional
@@ -33,8 +34,6 @@ try:
     import ducc0
 except Exception as e:
     raise RuntimeError('ducc0 is required') from e
-
-
 
 from fastducc import wcs as ducc_wcs
 from fastducc import filters, kernels, ms_utils, detection
@@ -656,8 +655,6 @@ def save_candidate_lightcurves(
     plt.close(fig)
 
     return {"lc_full": out_full, "lc_boxcar": out_box, "figure": out_fig}
-
-
     
 def save_candidate_snippet_products(snippet_rec: dict,
                                     out_prefix: str,
@@ -976,21 +973,142 @@ def consolidate_chunk_catalogues(
         print(f"[Consolidation] Removed {removed} per-chunk catalogue files.")
 
 
-def _parse_beam_and_chunk_from_filename(path: str) -> tuple[str, str, str, str]:
-    """Extract beam id (e.g. 'beam14') and chunk id (e.g. '20251015072402') from a filename.
+
+def parse_candidate_filename(
+    path: str,
+    *,
+    require: str | None = None,     # None | 'all' | 'super'
+) -> dict:
+    """
+    Parse pipeline candidate/super-summary filenames.
+
+    Supports both styles:
+      (A) Per-beam consolidated "all" tables, e.g.
+          cracoData.<field>.SB77974.beam14.20251015072402.<...>_<kind>_all.(csv|vot)
+      (B) Per-scan super-summary tables, e.g.
+          <field>.<SBID>_<scan_id>_<kind>_super_summary.(vot|csv)
+
+    Returns a dict with keys:
+      {
+        'field': str,
+        'sbid': str,
+        'beam': str,      # '' if absent
+        'scan_id': str,   # '' if absent
+        'kind': str,      # 'boxcar' | 'variance' | ''
+        'is_all': bool,       # True if "*_all.*"
+        'is_super': bool,     # True if "*_super_summary.*"
+      }
+
+    If `require='all'` or `require='super'` is set and the filename does not
+    match that shape, returns an "empty" dict with the same keys (all falsy).
+    """
+    fname = os.path.basename(path)
+
+    # Initialize with empty defaults
+    info = {
+        "field": "",
+        "sbid": "",
+        "beam": "",
+        "scan_id": "",
+        "kind": "",
+        "is_all": False,
+        "is_super": False,
+    }
+
+    # --- Field ---
+    # Try "<field>." prefix (e.g. "LTR_1733-2344.SB..."), else fall back to explicit LTR pattern.
+    m_field_prefix = re.match(r'^(?P<field>[^.]+)\.', fname)
+    if m_field_prefix:
+        info["field"] = m_field_prefix.group("field")
+    else:
+        m_field_alt = re.search(r'(LTR_\d{4}(?:\+/-|[+-])\d{4})', fname)
+        if m_field_alt:
+            info["field"] = m_field_alt.group(1)
+
+    # --- SBID ---
+    m_sbid = re.search(r'(SB\d{5,})', fname)
+    if m_sbid:
+        info["sbid"] = m_sbid.group(1)
+
+    # --- Beam (optional) ---
+    m_beam = re.search(r'(beam\d+)', fname)
+    if m_beam:
+        info["beam"] = m_beam.group(1)
+
+    # --- Scan id (14-digit timestamp) ---
+    m_scan = re.search(r'(\d{14})', fname)
+    if m_scan:
+        info["scan_id"] = m_scan.group(1)
+
+    # --- Kind and shape ("all" vs "super_summary") ---
+    m_kind_super = re.search(r'_(boxcar|variance)_super_summary\.(?:vot|xml|csv)$', fname, re.IGNORECASE)
+    m_kind_all   = re.search(r'_(boxcar|variance)_all\.(?:vot|xml|csv)$', fname, re.IGNORECASE)
+
+    if m_kind_super:
+        info["kind"] = m_kind_super.group(1).lower()
+        info["is_super"] = True
+    elif m_kind_all:
+        info["kind"] = m_kind_all.group(1).lower()
+        info["is_all"] = True
+
+    # --- Optional strictness ---
+    if require == "super" and not info["is_super"]:
+        return {k: (False if isinstance(v, bool) else "") for k, v in info.items()}
+    if require == "all" and not info["is_all"]:
+        return {k: (False if isinstance(v, bool) else "") for k, v in info.items()}
+
+    return info
+
+        
+def _parse_field_sbid_scan_from_obs_super_path(path: str) -> tuple[str, str, str, str]:
+    """
+    Extract (field, SBID, scan_id, kind) from a per-scan super-summary filename:
+      <field>.<SBID>_<scan_id>_<kind>_super_summary.vot
+    Example:
+      LTR_1733-2344.SB77974_20251015091053_variance_super_summary.vot
+    Returns ('', '', '', '') on failure.
+    """
+    fname = os.path.basename(path)
+    field = ''
+    sbid = ''
+    scan = ''
+    kind = ''
+
+    # field: allow e.g. LTR_1733-2344
+    m_field = re.match(r'^(?P<field>[^.]+)\.', fname)
+    if m_field:
+        field = m_field.group('field')
+
+    m_sbid = re.search(r'(SB\d{5})', fname)
+    if m_sbid:
+        sbid = m_sbid.group(1)
+
+    m_scan = re.search(r'(\d{14})', fname)
+    if m_scan:
+        scan = m_scan.group(1)
+
+    m_kind = re.search(r'_(boxcar|variance)_super_summary\.(?:vot|xml|VOT|XML|csv)$', fname)
+    if m_kind:
+        kind = m_kind.group(1)
+
+    return field, sbid, scan, kind
+
+         
+def _parse_beam_and_scan_from_filename(path: str) -> tuple[str, str, str, str]:
+    """Extract beam id (e.g. 'beam14') and scan id (e.g. '20251015072402') from a filename.
 
     Expected filename style (dot-separated tokens plus suffix), for example:
         cracoData.<field>.SB77974.beam14.20251015072402.<...>_boxcar_all.csv
 
     Returns
     -------
-    (beam_id, chunk_id) : tuple[str, str]
+    (beam_id, scan_id) : tuple[str, str]
         Empty strings if not found.
     """
     fname = os.path.basename(path)
     fieldname = ''
     beam = ''
-    chunk = ''
+    scan = ''
     m_field = re.search(r'(LTR_\d{4}(?:\+/-|-)\d{4})', fname)
     if m_field:
         field = m_field.group(1)
@@ -1000,11 +1118,11 @@ def _parse_beam_and_chunk_from_filename(path: str) -> tuple[str, str, str, str]:
     m_beam = re.search(r'(beam\d+)', fname)
     if m_beam:
         beam = m_beam.group(1)
-    m_chunk = re.search(r'(\d{14})', fname)
-    if m_chunk:
-        chunk = m_chunk.group(1)
+    m_scan = re.search(r'(\d{14})', fname)
+    if m_scan:
+        scan = m_scan.group(1)
     
-    return field, sbid, beam, chunk
+    return field, sbid, beam, scan
 
 
 def _connected_components_from_pairs(n: int, i_idx, j_idx) -> List[List[int]]:
@@ -1050,17 +1168,107 @@ def _connected_components_from_pairs(n: int, i_idx, j_idx) -> List[List[int]]:
     return comps
 
 
+def _time_groups(times: np.ndarray, tol_s: float) -> List[Tuple[int, int]]:
+    """Return [(i0,i1), ...] contiguous groups where (times[i]-times[i0]) <= tol_s."""
+    if times.size == 0:
+        return []
+    order = np.argsort(times)
+    times_sorted = times[order]
+    groups = []
+    i0 = 0
+    N = times_sorted.size
+    while i0 < N:
+        t0 = times_sorted[i0]
+        i1 = i0 + 1
+        while i1 < N and (times_sorted[i1] - t0) <= tol_s:
+            i1 += 1
+        # Map group back to original indices
+        idxs = order[i0:i1]
+        # Return as a compact (min..max+1) slice if contiguous after sorting
+        groups.append((int(idxs.min()), int(idxs.max()) + 1))
+        i0 = i1
+    return groups
+
+def _cluster_indices_by_sky(ra_deg: np.ndarray,
+                            dec_deg: np.ndarray,
+                            seplimit_arcsec: float) -> List[List[int]]:
+    """
+    Return list of components (each a list of row indices) by clustering positions
+    within seplimit_arcsec.
+    """
+    coords = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+    i_idx, j_idx, _, _ = coords.search_around_sky(coords, seplimit=seplimit_arcsec * u.arcsec)
+    comps = _connected_components_from_pairs(len(ra_deg), i_idx, j_idx)
+    return comps
+
+def _sexagesimal_from_deg(ra_deg: float, dec_deg: float) -> Tuple[str, str, str]:
+    """(ra_hms, dec_dms, srcname) from degrees using ducc_wcs helpers."""
+    ra_rad = math.radians(float(ra_deg))
+    dec_rad = math.radians(float(dec_deg))
+    ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(ra_rad, dec_rad, dp=1)
+    srcname = ducc_wcs.hmsdms_to_srcname(ra_hms, dec_dms)
+    return ra_hms, dec_dms, srcname
+
+def _ensure_sexagesimal_on_rows(rows: List[Dict[str, Any]],
+                                ra_key: str = "ra_deg",
+                                dec_key: str = "dec_deg",
+                                ra_hms_key: str = "ra_hms",
+                                dec_dms_key: str = "dec_dms",
+                                src_key: str = "srcname") -> None:
+    """
+    Ensure each dict row has ra_hms, dec_dms, and srcname. Fill if missing/blank.
+    """
+    for r in rows:
+        have_ra = r.get(ra_key, None) is not None
+        have_dec = r.get(dec_key, None) is not None
+        if not have_ra or not have_dec:
+            continue
+        ra_hms = str(r.get(ra_hms_key, "") or "")
+        dec_dms = str(r.get(dec_dms_key, "") or "")
+        srcname = str(r.get(src_key, "") or "")
+        if ra_hms and dec_dms and srcname:
+            continue
+        ra_hms_new, dec_dms_new, srcname_new = _sexagesimal_from_deg(float(r[ra_key]), float(r[dec_key]))
+        if not ra_hms:
+            r[ra_hms_key] = ra_hms_new
+        if not dec_dms:
+            r[dec_dms_key] = dec_dms_new
+        if not srcname:
+            r[src_key] = srcname_new
+
+
+def _split_list_str(s: Any) -> List[str]:
+    """Parse comma-separated string -> list[str]."""
+    if s is None:
+        return []
+    s = str(s).strip().strip('"')
+    if not s:
+        return []
+    return [t.strip() for t in s.split(",") if t.strip()]
+
+
+def _split_list_int(s: Any) -> List[int]:
+    """Parse comma-separated string -> list[int] (skip non-ints)."""
+    out = []
+    for tok in _split_list_str(s):
+        try:
+            out.append(int(tok))
+        except Exception:
+            pass
+    return out
+
+
 def aggregate_beam_candidate_tables(
-        vot_files: List[str],
-        *,
-        kind: str,
-        time_tol_s: float = 0.3,
-        sky_tol_arcsec: float = 35.0,
-        out_dir: Optional[str] = None,
-        # out_csv: Optional[str] = None,
-        # out_vot: Optional[str] = None,
+    vot_files: List[str],
+    *,
+    kind: str,
+    time_tol_s: float = 0.3,
+    sky_tol_arcsec: float = 35.0,
+    out_dir: Optional[str] = None,
 ) -> Table:
-    """Crossmatch candidates across beams and build a field-level summary table.
+    """
+    Crossmatch candidates across beams within each scan and build a field-level summary,
+    then produce a per-scan super summary by clustering events by sky (time-marginalised).
 
     This is intentionally lightweight:
       * Time grouping: detections are sorted by time_center and split into groups
@@ -1082,76 +1290,79 @@ def aggregate_beam_candidate_tables(
         Time tolerance (seconds) for grouping.
     sky_tol_arcsec : float
         Spatial tolerance (arcsec) for crossmatch.
-    out_csv, out_vot : str, optional
-        If set, write outputs to these paths.
 
     Returns
     -------
     astropy.table.Table
-        One row per crossmatched event.
+        One row per crossmatched event.    
     """
+    if not vot_files:
+        raise ValueError("No input files provided")
 
     obs_root = os.path.abspath(os.path.dirname(vot_files[0]))
-    
     if out_dir is None:
         out_dir = obs_root
     os.makedirs(out_dir, exist_ok=True)
-    
+
     kind = kind.lower().strip()
-    if kind not in ('boxcar', 'variance'):
+    if kind not in ("boxcar", "variance"):
         raise ValueError("kind must be 'boxcar' or 'variance'")
 
-    rows: List[Dict[str, Any]] = []
-
+    # Determine naming from the first readable file
+    out_csv = None
+    out_vot = None
     for p in vot_files:
-        
-        field_name, sbid, beam_id, chunk_id = _parse_beam_and_chunk_from_filename(p)
-        if field_name != "" and sbid != "" and chunk_id != "":
-            out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{chunk_id}_{kind}_summary.csv")
-            out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{chunk_id}_{kind}_summary.vot")
+        meta = parse_candidate_filename(p, require="all")
+        field_name = meta["field"]
+        sbid = meta["sbid"]
+        scan_id = meta["scan_id"]
+        if field_name and sbid and scan_id:
+            out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.csv")
+            out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.vot")
             break
-        
-    
+
+    # -------- Ingest all per-beam detections into a flat row list ----------
+    rows: List[Dict[str, Any]] = []
     for p in vot_files:
         try:
-            t = Table.read(p, format='votable')
+            t = Table.read(p, format="votable")
         except Exception as e:
             print(f"[Aggregate] Skipping '{p}' (read error: {e})")
             continue
-
-        field_name, sbid, beam_id, chunk_id = _parse_beam_and_chunk_from_filename(p)
-
-        
-        for col in ('time_center', 'ra_deg', 'dec_deg', 'snr'):
+        meta = parse_candidate_filename(p, require="all")
+        field_name = meta["field"]; sbid = meta["sbid"]; beam_id = meta["beam"]; scan_id = meta["scan_id"]
+        for col in ("time_center", "ra_deg", "dec_deg", "snr"):
             if col not in t.colnames:
                 raise ValueError(f"Missing required column '{col}' in {p}")
-
         for r in t:
             d = {name: r[name] for name in t.colnames}
-            d['beam_id'] = beam_id
-            d['chunk_id'] = chunk_id
-            d['field'] = field_name
-            d['sbid'] = sbid
+            d["beam_id"] = beam_id
+            d["scan_id"] = scan_id
+            d["field"]   = field_name
+            d["sbid"]    = sbid
             rows.append(d)
 
+    # Empty case
     if len(rows) == 0:
-        names = ['event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr', 'beam_id', 'field', 'sbid']
+        names = ['event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr', 'beam_ids', 'field', 'sbid']
         if kind == 'boxcar':
             names.append('width_samples')
-        names += ['chunk_ids', 'n_beams', 'n_detections']
+        names += ['scan_ids', 'n_beams', 'n_detections']
         out = Table(names=names)
-        if out_csv:
-            out.write(out_csv, format='csv', overwrite=True)
-        if out_vot:
-            out.write(out_vot, format='votable', overwrite=True)
+        if out_csv: out.write(out_csv, format='csv', overwrite=True)
+        if out_vot: out.write(out_vot, format='votable', overwrite=True)
         return out
 
+    # ------------------- Event-level aggregation -------------------
+    # Group by time first (<= time_tol_s from first in group), then cluster by sky.
     times = np.array([float(r['time_center']) for r in rows], dtype=np.float64)
+    # Use stable order indices for slicing; we will build groups as index lists
     order = np.argsort(times)
     rows = [rows[i] for i in order]
     times = times[order]
 
-    time_groups: List[Tuple[int, int]] = []
+    # Build the (i0,i1) groups over the *sorted* rows
+    groups = []
     i0 = 0
     N = len(rows)
     while i0 < N:
@@ -1159,27 +1370,21 @@ def aggregate_beam_candidate_tables(
         i1 = i0 + 1
         while i1 < N and (times[i1] - t0) <= time_tol_s:
             i1 += 1
-        time_groups.append((i0, i1))
+        groups.append((i0, i1))
         i0 = i1
 
     events: List[Dict[str, Any]] = []
-
-    for (a0, a1) in time_groups:
+    for (a0, a1) in groups:
         k = a1 - a0
+        if k <= 0:
+            continue
         if k == 1:
             det = rows[a0]
             beams = sorted({det.get('beam_id', '')})
-            chunks = sorted({det.get('chunk_id', '')})
-            fields = sorted({det.get('field', '')})
-            sbids = sorted({det.get('sbid', '')})
-            # Convert degrees to radians
-            ra_rad = math.radians(float(det["ra_deg"]))
-            dec_rad = math.radians(float(det["dec_deg"]))
-            ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(ra_rad, dec_rad, dp=1)
-            srcname = ducc_wcs.hmsdms_to_srcname(ra_hms, dec_dms)
-            
+            scans = sorted({det.get('scan_id', '')})
+            ra_hms, dec_dms, srcname = _sexagesimal_from_deg(float(det["ra_deg"]), float(det["dec_deg"]))
             ev = {
-                'srcname': str(srcname),
+                'srcname': srcname,
                 'time_center': float(det['time_center']),
                 'ra_deg': float(det['ra_deg']),
                 'dec_deg': float(det['dec_deg']),
@@ -1187,9 +1392,9 @@ def aggregate_beam_candidate_tables(
                 'dec_dms': str(dec_dms),
                 'max_snr': float(det['snr']),
                 'beam_ids': ','.join([b for b in beams if b]),
-                'chunk_ids': ','.join([c for c in chunks if c]),
-                'fields': ','.join([f for f in fields]),
-                'sbids': ','.join([s for s in sbids]),
+                'scan_ids': ','.join([s for s in scans if s]),
+                'fields': det.get('field', ''),
+                'sbids' : det.get('sbid', ''),
                 'n_beams': len([b for b in beams if b]),
                 'n_detections': 1,
             }
@@ -1199,31 +1404,17 @@ def aggregate_beam_candidate_tables(
             events.append(ev)
             continue
 
+        # Spatial clustering within the time group
         ra = np.array([float(rows[a0+i]['ra_deg']) for i in range(k)], dtype=float)
         dec = np.array([float(rows[a0+i]['dec_deg']) for i in range(k)], dtype=float)
-
-        coords = SkyCoord(ra=ra*u.deg, dec=dec*u.deg, frame='icrs')
-        i_idx, j_idx, sep2d, _ = coords.search_around_sky(coords, seplimit=sky_tol_arcsec*u.arcsec)
-
-        comps = _connected_components_from_pairs(k, i_idx, j_idx)
-
+        comps = _cluster_indices_by_sky(ra, dec, seplimit_arcsec=sky_tol_arcsec)
         for comp in comps:
             inds = [a0 + int(ii) for ii in comp]
             sub = [rows[ii] for ii in inds]
             best = max(sub, key=lambda r: float(r.get('snr', -np.inf)))
-
-            
             beams = sorted({r.get('beam_id', '') for r in sub})
-            chunks = sorted({r.get('chunk_id', '') for r in sub})
-            fields = sorted({r.get('field', '') for r in sub})
-            sbids  = sorted({r.get('sbid', '') for r in sub})
-
-            # Convert degrees to radians
-            ra_rad = math.radians(float(best["ra_deg"]))
-            dec_rad = math.radians(float(best["dec_deg"]))
-            ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(ra_rad, dec_rad, dp=1)
-            srcname = ducc_wcs.hmsdms_to_srcname(ra_hms, dec_dms)
-            
+            scans = sorted({r.get('scan_id', '') for r in sub})
+            ra_hms, dec_dms, srcname = _sexagesimal_from_deg(float(best["ra_deg"]), float(best["dec_deg"]))
             ev = {
                 'srcname': srcname,
                 'time_center': float(best['time_center']),
@@ -1233,268 +1424,115 @@ def aggregate_beam_candidate_tables(
                 'dec_dms': str(dec_dms),
                 'max_snr': float(best['snr']),
                 'beam_ids': ','.join([b for b in beams if b]),
-                'chunk_ids': ','.join([c for c in chunks if c]),
-                'fields': ','.join([f for f in fields]),
-                'sbids': ','.join([s for s in sbids]),                
+                'scan_ids': ','.join([s for s in scans if s]),
+                'fields': ','.join(sorted({r.get('field','') for r in sub})),
+                'sbids' : ','.join(sorted({r.get('sbid','') for r in sub})),
                 'n_beams': len([b for b in beams if b]),
                 'n_detections': len(sub),
             }
-
             if kind == 'boxcar':
-                widths = sorted({int(r.get('width_samples', -1)) for r in sub if r.get('width_samples', None) is not None})
-                widths = [w for w in widths if w >= 0]
+                widths = sorted({int(r.get('width_samples', -1)) for r in sub
+                                 if r.get('width_samples', None) is not None and int(r.get('width_samples', -1)) >= 0})
                 ev['width_samples'] = ','.join([str(w) for w in widths])
-
             events.append(ev)
 
     events.sort(key=lambda r: r['time_center'])
     for i, ev in enumerate(events):
         ev['event_id'] = i
 
-    colnames = ['event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms', 'max_snr', 'beam_ids']
+    # Build event table (columns preserved)
+    colnames = ['event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
+                'max_snr', 'beam_ids']
     if kind == 'boxcar':
         colnames.append('width_samples')
-    colnames += ['chunk_ids', 'n_beams', 'n_detections']
+    colnames += ['scan_ids', 'n_beams', 'n_detections']
+    event_tab = Table(rows=[[ev.get(c) for c in colnames] for ev in events], names=colnames)
+    if out_csv: event_tab.write(out_csv, format='csv', overwrite=True)
+    if out_vot: event_tab.write(out_vot, format='votable', overwrite=True)
 
-    out = Table(rows=[[ev.get(c) for c in colnames] for ev in events], names=colnames)
+    # ------------------- Super-summary within scan -------------------
+    # Reuse sky clustering on the *event* table (time-marginalised).
+    # Ensure sexagesimal/srcname present
+    event_rows = [dict(zip(colnames, row)) for row in event_tab.as_array()]
+    _ensure_sexagesimal_on_rows(event_rows, ra_key="ra_deg", dec_key="dec_deg",
+                                ra_hms_key="ra_hms", dec_dms_key="dec_dms", src_key="srcname")
 
-    if out_csv:
-        out.write(out_csv, format='csv', overwrite=True)
-    if out_vot:
-        out.write(out_vot, format='votable', overwrite=True)
+    ra_all = np.array([float(r["ra_deg"]) for r in event_rows])
+    dec_all = np.array([float(r["dec_deg"]) for r in event_rows])
+    comps = _cluster_indices_by_sky(ra_all, dec_all, seplimit_arcsec=sky_tol_arcsec)
 
-    # -------------------------------------------------------------------------
-    # Super-summary: marginalise over event time by clustering events by sky pos
-    # -------------------------------------------------------------------------
-
-    def _parse_list_str(val):
-        # Parse comma-separated lists like "beam00,beam15" or "4,8,12".
-        # Returns list of stripped tokens; empty list for blank/None.
-        if val is None:
-            return []
-        s = str(val).strip().strip('"')
-        if not s:
-            return []
-        return [p.strip() for p in s.split(",") if p.strip()]
-
-    def _parse_list_int(val):
-        out_set = set()
-        for tok in _parse_list_str(val):
-            try:
-                out_set.add(int(tok))
-            except Exception:
-                pass
-        return out_set
-
-    def _parse_list_set_str(val):
-        return set(_parse_list_str(val))
-
-    def _uf_find(parent, a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def _uf_union(parent, rank, a, b):
-        ra = _uf_find(parent, a)
-        rb = _uf_find(parent, b)
-        if ra == rb:
-            return
-        if rank[ra] < rank[rb]:
-            parent[ra] = rb
-        elif rank[ra] > rank[rb]:
-            parent[rb] = ra
-        else:
-            parent[rb] = ra
-            rank[ra] += 1
-
-    # If the event-level aggregate did not include these columns, we can compute them
-    # from ra_deg/dec_deg using the existing wcs helpers.
-    have_ra_hms = ("ra_hms" in out.colnames)
-    have_dec_dms = ("dec_dms" in out.colnames)
-    have_srcname = ("srcname" in out.colnames)
-
-    if (not have_ra_hms) or (not have_dec_dms) or (not have_srcname):
-        # Compute missing sexagesimal and srcname using fastducc.wcs functions.
-        # wcs.rad_to_hmsdms and wcs.hmsdms_to_srcname exist in wcs.py. [2](blob:https://www.microsoft365.com/30301a87-85d6-4efa-95ee-6407397d0361)
-        if "ra_hms" not in out.colnames:
-            out["ra_hms"] = ["" for _ in range(len(out))]
-        if "dec_dms" not in out.colnames:
-            out["dec_dms"] = ["" for _ in range(len(out))]
-        if "srcname" not in out.colnames:
-            out["srcname"] = ["" for _ in range(len(out))]
-
-        for i in range(len(out)):
-            ra_deg_i = float(out["ra_deg"][i])
-            dec_deg_i = float(out["dec_deg"][i])
-            ra_rad_i = math.radians(ra_deg_i)
-            dec_rad_i = math.radians(dec_deg_i)
-            ra_hms_i, dec_dms_i = ducc_wcs.rad_to_hmsdms(ra_rad_i, dec_rad_i, dp=1)
-            out["ra_hms"][i] = ra_hms_i
-            out["dec_dms"][i] = dec_dms_i
-            out["srcname"][i] = ducc_wcs.hmsdms_to_srcname(ra_hms_i, dec_dms_i)
-
-    # Build SkyCoord for all event rows and cluster by 35 arcsec across all times.
-    super_seplimit = sky_tol_arcsec * u.arcsec
-    coords_all = SkyCoord(
-        ra=np.array(out["ra_deg"], dtype=float) * u.deg,
-        dec=np.array(out["dec_deg"], dtype=float) * u.deg,
-        frame="icrs",
-    )
-
-    idx1, idx2, sep2d, _ = coords_all.search_around_sky(coords_all, seplimit=super_seplimit)
-
-    n_ev = len(out)
-    parent = list(range(n_ev))
-    rank = [0] * n_ev
-
-    for a, b in zip(idx1, idx2):
-        a = int(a)
-        b = int(b)
-        if a == b:
-            continue
-        _uf_union(parent, rank, a, b)
-
-    comp_map = {}
-    for i in range(n_ev):
-        r = _uf_find(parent, i)
-        comp_map.setdefault(r, []).append(i)
-
-    # Build super-summary rows (one per sky-clustered source).
     super_rows = []
-    for comp_inds in comp_map.values():
-        sub = out[comp_inds]
-
-        # Count events and detections
-        n_events = len(sub)
-        if "n_detections" in sub.colnames:
-            n_dets_total = int(np.nansum(np.array(sub["n_detections"], dtype=float)))
-        else:
-            # Fallback: assume 1 detection per event row
-            n_dets_total = int(n_events)
-
-        # Union of beams/widths/chunks across all events
-        beams_all = set()
-        widths_all = set()
-        chunks_all = set()
-
-        if "beam_ids" in sub.colnames:
-            for v in sub["beam_ids"]:
-                beams_all |= _parse_list_set_str(v)
-
-        if kind == "boxcar" and ("width_samples" in sub.colnames):
-            for v in sub["width_samples"]:
-                widths_all |= _parse_list_int(v)
-
-        if "chunk_ids" in sub.colnames:
-            for v in sub["chunk_ids"]:
-                chunks_all |= _parse_list_set_str(v)
-
-        # Find the event row with the maximum max_snr
-        max_snr_vals = np.array(sub["max_snr"], dtype=float) if ("max_snr" in sub.colnames) else np.full(n_events, np.nan)
-        j_best = int(np.nanargmax(max_snr_vals)) if np.any(np.isfinite(max_snr_vals)) else 0
-        best = sub[j_best]
-
-        # Representative position/name from the max-SNR event
-        rep_srcname = str(best["srcname"]) if ("srcname" in sub.colnames) else ""
-        rep_ra_deg = float(best["ra_deg"])
-        rep_dec_deg = float(best["dec_deg"])
-        rep_ra_hms = str(best["ra_hms"]) if ("ra_hms" in sub.colnames) else ""
-        rep_dec_dms = str(best["dec_dms"]) if ("dec_dms" in sub.colnames) else ""
-
-        # Max-SNR event details
-        max_snr = float(best["max_snr"]) if ("max_snr" in sub.colnames) else float("nan")
-        max_time = float(best["time_center"]) if ("time_center" in sub.colnames) else float("nan")
-
-        best_event_beams = _parse_list_str(best["beam_ids"]) if ("beam_ids" in sub.colnames) else []
-        best_event_widths = _parse_list_str(best["width_samples"]) if (kind == "boxcar" and "width_samples" in sub.colnames) else []
-
-        # If the best event has multiple beams/widths listed, it is ambiguous which single beam/width
-        # produced the max_snr within that event cluster. Keep the event-level lists, and only
-        # populate max_snr_beam/max_snr_width when unambiguous.
-        max_snr_beam = best_event_beams[0] if len(best_event_beams) == 1 else ""
-        max_snr_width = int(best_event_widths[0]) if (len(best_event_widths) == 1 and best_event_widths[0].isdigit()) else -1
-
-        super_row = {
-            "source_id": -1,  # filled after sorting
-            "srcname": rep_srcname,
-            "ra_deg": rep_ra_deg,
-            "dec_deg": rep_dec_deg,
-            "ra_hms": rep_ra_hms,
-            "dec_dms": rep_dec_dms,
-            "n_events": int(n_events),
-            "n_detections_total": int(n_dets_total),
-            "beams_all": ",".join(sorted([b for b in beams_all if b])),
-            "chunks_all": ",".join(sorted([c for c in chunks_all if c])),
-            "max_snr": max_snr,
-            "max_snr_time_center": max_time,
-            "max_snr_event_beams": ",".join(best_event_beams),
+    for comp in comps:
+        sub = [event_rows[i] for i in comp]
+        # max-SNR representative
+        best = max(sub, key=lambda r: float(r.get("max_snr", -np.inf)))
+        beams_union = set()
+        scans_union = set()
+        for r in sub:
+            beams_union |= set(_split_list_str(r.get("beam_ids","")))
+            scans_union |= set(_split_list_str(r.get("scan_ids","")))
+        row = {
+            "srcname": best["srcname"],
+            "ra_deg": float(best["ra_deg"]),
+            "dec_deg": float(best["dec_deg"]),
+            "ra_hms": best["ra_hms"],
+            "dec_dms": best["dec_dms"],
+            "n_events": len(sub),
+            "n_detections_total": int(np.nansum([float(r.get("n_detections", 1)) for r in sub])),
+            "beams_all": ",".join(sorted([b for b in beams_union if b])),
+            "scans_all": ",".join(sorted([s for s in scans_union if s])),
+            "max_snr": float(best["max_snr"]),
+            "max_snr_time_center": float(best.get("time_center", np.nan)),
+            "max_snr_event_beams": best.get("beam_ids", ""),
         }
-
         if kind == "boxcar":
-            super_row["width_samples_all"] = ",".join([str(w) for w in sorted(widths_all)])
-            super_row["max_snr_event_widths"] = ",".join(best_event_widths)
-            super_row["max_snr_beam"] = max_snr_beam
-            super_row["max_snr_width"] = max_snr_width
+            w_union = set()
+            for r in sub:
+                w_union |= set(_split_list_int(r.get("width_samples","")))
+            row["width_samples_all"] = ",".join(str(w) for w in sorted(w_union))
+            # Try infer an unambiguous width for max-SNR if possible
+            ws_best = _split_list_int(best.get("width_samples",""))
+            row["max_snr_width"] = (ws_best[0] if len(ws_best) == 1 else -1)
+            # Optional: a single beam if unambiguous
+            beams_best = _split_list_str(best.get("beam_ids",""))
+            row["max_snr_beam"] = (beams_best[0] if len(beams_best) == 1 else "")
+        else:
+            beams_best = _split_list_str(best.get("beam_ids",""))
+            row["max_snr_beam"] = (beams_best[0] if len(beams_best) == 1 else "")
 
-        super_rows.append(super_row)
+        super_rows.append(row)
 
-    # Sort sources by max_snr descending, then assign source_id
-    super_rows.sort(key=lambda r: (float(r.get("max_snr", -np.inf))), reverse=True)
+    super_rows.sort(key=lambda r: float(r.get("max_snr", -np.inf)), reverse=True)
     for i, r in enumerate(super_rows):
         r["source_id"] = i
 
-    # Define output column order
     super_cols = [
-        "source_id",
-        "srcname",
-        "ra_deg",
-        "dec_deg",
-        "ra_hms",
-        "dec_dms",
-        "n_events",
-        "n_detections_total",
-        "beams_all",
-        "chunks_all",
-        "max_snr",
-        "max_snr_time_center",
-        "max_snr_event_beams",
+        "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+        "n_events","n_detections_total","beams_all","scans_all",
+        "max_snr","max_snr_time_center","max_snr_event_beams",
     ]
     if kind == "boxcar":
-        super_cols += [
-            "width_samples_all",
-            "max_snr_event_widths",
-            "max_snr_beam",
-            "max_snr_width",
-        ]
+        super_cols += ["width_samples_all", "max_snr_width", "max_snr_beam"]
+    else:
+        super_cols += ["max_snr_beam"]
 
     super_tab = Table(rows=[[r.get(c) for c in super_cols] for r in super_rows], names=super_cols)
 
-    # Write super-summary alongside the event summary.
-    # Derive name from the event-level out_csv/out_vot if available.
-    super_csv = None
-    super_vot = None
+    # Persist super summary next to event summary
     try:
-        if out_csv:
-            super_csv = str(out_csv).replace("_summary.csv", "_super_summary.csv")
-        if out_vot:
-            super_vot = str(out_vot).replace("_summary.vot", "_super_summary.vot")
+        super_csv = out_csv.replace("_summary.csv", "_super_summary.csv") if out_csv else None
+        super_vot = out_vot.replace("_summary.vot", "_super_summary.vot") if out_vot else None
     except Exception:
-        super_csv = None
-        super_vot = None
-
+        super_csv = None; super_vot = None
     if not super_csv:
         super_csv = os.path.join(out_dir, f"field_{kind}_super_summary.csv")
     if not super_vot:
         super_vot = os.path.join(out_dir, f"field_{kind}_super_summary.vot")
-
     super_tab.write(super_csv, format="csv", overwrite=True)
     super_tab.write(super_vot, format="votable", overwrite=True)
 
+    return event_tab
 
-
-        
-    return out
 
 
 def aggregate_observation(
@@ -1533,3 +1571,223 @@ def aggregate_observation(
         # out_vot=out_vot,
     )
 
+def aggregate_observation_from_super_summaries(
+    obs_root: str,
+    *,
+    kind: str = "variance",
+    sky_tol_arcsec: float = 35.0,
+    out_dir: Optional[str] = None,
+    pattern: Optional[str] = None,
+) -> Table:    
+    """
+    Read *per-scan* cross-beam super summaries (VOT) under obs_root,
+    cluster by sky position across all scans, and write an *observation-level*
+    (SBID-wide) super summary.    
+
+    reuses shared helpers for sky clustering, list parsing, and sexagesimal filling.
+
+    Inputs
+    ------
+    obs_root : str
+        Path to SBID directory, e.g. ".../SB77974".
+        Expects subdirs like "SB77974/<scanid>/candidates/...".
+    kind : {'variance','boxcar'}
+        Which candidate family to ingest. Default: 'variance'.
+    sky_tol_arcsec : float
+        Spatial clustering tolerance across scans. Default: 35 arcsec.
+    out_dir : str or None
+        Where to write the obs-level outputs. Default: "<obs_root>/candidates".
+    pattern : str or None
+        Optional glob override. By default:
+          obs_root/**/candidates/*_<kind>_super_summary.vot
+
+    Outputs
+    -------
+    Writes two files:
+      <out_dir>/<field>.<SBID>_obs_<kind>_super_summary.csv
+      <out_dir>/<field>.<SBID>_obs_<kind>_super_summary.vot
+
+    Returns
+    -------
+    astropy.table.Table
+        The observation-level super summary table.    
+    """
+    kind = kind.lower().strip()
+    if kind not in ("variance", "boxcar"):
+        raise ValueError("kind must be 'variance' or 'boxcar'")
+
+    if pattern is None:
+        pattern = os.path.join(obs_root, "**", "candidates", f"*_{kind}_super_summary.vot")
+    files = sorted(glob.glob(pattern, recursive=True))
+
+    if out_dir is None:
+        out_dir = os.path.join(obs_root, "candidates")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Empty inputs -> write empty outputs
+    if len(files) == 0:
+        empty_cols = [
+            "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+            "max_snr","max_snr_time_center","max_snr_beam","n_scans",
+            "scan_ids","beams_all",
+        ]
+        if kind == "boxcar":
+            empty_cols += ["max_snr_width","width_samples_all"]
+        T = Table(names=empty_cols)
+        field = "field"
+        sbid = os.path.basename(os.path.abspath(obs_root))
+        csv_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.csv")
+        vot_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.vot")
+        T.write(csv_out, format="csv", overwrite=True)
+        T.write(vot_out, format="votable", overwrite=True)
+        print(f"[ObsSuper] No input VOTs found. Wrote empty outputs to {out_dir}")
+        return T
+
+    rows: List[Dict[str, Any]] = []
+    field_for_name = None
+    sbid_for_name = None
+
+    required = {"ra_deg", "dec_deg", "max_snr"}
+    optional_strings = {
+        "srcname","ra_hms","dec_dms",
+        "beams_all","width_samples_all",
+        "max_snr_event_beams","max_snr_event_widths",
+        "max_snr_beam",
+    }
+    optional_numbers = {"max_snr_width", "max_snr_time_center"}
+
+    for p in files:
+        # FIX: require='super' for super-summary files
+        meta = parse_candidate_filename(p, require='super')
+        f_field = meta['field']; f_sbid = meta['sbid']; f_scan = meta['scan_id']; f_kind = meta['kind']
+        if f_kind != kind:
+            continue
+        if field_for_name is None and f_field:
+            field_for_name = f_field
+        if sbid_for_name is None and f_sbid:
+            sbid_for_name = f_sbid
+
+        try:
+            tab = Table.read(p, format="votable")
+        except Exception as e:
+            print(f"[ObsSuper] Skipping '{p}' (read error: {e})")
+            continue
+
+        missing = [c for c in required if c not in tab.colnames]
+        if missing:
+            print(f"[ObsSuper] '{p}' missing required columns {missing}; skipping.")
+            continue
+
+        for r in tab:
+            d = {name: r[name] if name in tab.colnames else None
+                 for name in itertools.chain(required, optional_strings, optional_numbers)}
+            d["scan_id"] = f_scan
+            rows.append(d)
+
+    if len(rows) == 0:
+        print("[ObsSuper] No valid rows after reading inputs; writing empty outputs.")
+        empty_cols = [
+            "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+            "max_snr","max_snr_time_center","max_snr_beam","n_scans",
+            "scan_ids","beams_all",
+        ]
+        if kind == "boxcar":
+            empty_cols += ["max_snr_width","width_samples_all"]
+        T = Table(names=empty_cols)
+        field = field_for_name or "field"
+        sbid = sbid_for_name or os.path.basename(os.path.abspath(obs_root))
+        csv_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.csv")
+        vot_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.vot")
+        T.write(csv_out, format="csv", overwrite=True)
+        T.write(vot_out, format="votable", overwrite=True)
+        return T
+
+    # Sky-only clustering across all scans
+    _ensure_sexagesimal_on_rows(rows)
+    ra = np.array([float(r["ra_deg"]) for r in rows], dtype=float)
+    dec = np.array([float(r["dec_deg"]) for r in rows], dtype=float)
+    comps = _cluster_indices_by_sky(ra, dec, seplimit_arcsec=sky_tol_arcsec)
+
+    obs_rows = []
+    for comp_idxs in comps:
+        sub = [rows[i] for i in comp_idxs]
+
+        # Representative = max SNR
+        best = max(sub, key=lambda d: float(d.get("max_snr", -np.inf)))
+        best_ra = float(best["ra_deg"]); best_dec = float(best["dec_deg"])
+        best_snr = float(best.get("max_snr", np.nan))
+        best_time = float(best.get("max_snr_time_center", np.nan)) if best.get("max_snr_time_center", None) is not None else np.nan
+        best_scan = str(best.get("scan_id", ""))
+
+        # Fill sexagesimal/name if missing
+        ra_hms = str(best.get("ra_hms", "") or "")
+        dec_dms = str(best.get("dec_dms", "") or "")
+        srcname = str(best.get("srcname", "") or "")
+        if not (ra_hms and dec_dms and srcname):
+            ra_hms_, dec_dms_, srcname_ = _sexagesimal_from_deg(best_ra, best_dec)
+            ra_hms = ra_hms or ra_hms_
+            dec_dms = dec_dms or dec_dms_
+            srcname = srcname or srcname_
+
+        scan_ids = sorted({str(r.get("scan_id", "")) for r in sub if r.get("scan_id", "")})
+        beams_union = set()
+        for r in sub:
+            beams_union |= set(_split_list_str(r.get("beams_all", "")))
+
+        row_out = {
+            "srcname": srcname,
+            "ra_deg": best_ra,
+            "dec_deg": best_dec,
+            "ra_hms": ra_hms,
+            "dec_dms": dec_dms,
+            "max_snr": best_snr,
+            "max_snr_time_center": best_time,
+            "max_snr_beam": str(best.get("max_snr_beam", "")) if best.get("max_snr_beam", "") else "",
+            "n_scans": len(scan_ids),
+            "scan_ids": ",".join(scan_ids),
+            "beams_all": ",".join(sorted([b for b in beams_union if b])),
+            "max_snr_scan_id": best_scan,
+        }
+
+        if kind == "boxcar":
+            widths_union = set()
+            for r in sub:
+                widths_union |= set(_split_list_int(r.get("width_samples_all", "")))
+            max_w = -1
+            if best.get("max_snr_width", None) not in (None, ""):
+                try:
+                    max_w = int(best["max_snr_width"])
+                except Exception:
+                    max_w = -1
+            elif best.get("max_snr_event_widths", ""):
+                ws = _split_list_int(best.get("max_snr_event_widths", ""))
+                if len(ws) == 1:
+                    max_w = ws[0]
+            row_out["max_snr_width"] = int(max_w) if max_w is not None else -1
+            row_out["width_samples_all"] = ",".join(str(w) for w in sorted(widths_union))
+
+        obs_rows.append(row_out)
+
+    # Sort, id, and write
+    obs_rows.sort(key=lambda d: float(d.get("max_snr", -np.inf)), reverse=True)
+    for i, d in enumerate(obs_rows):
+        d["source_id"] = i
+
+    cols = [
+        "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+        "max_snr","max_snr_time_center","max_snr_beam",
+        "max_snr_scan_id",
+        "n_scans","scan_ids","beams_all",
+    ]
+    if kind == "boxcar":
+        cols += ["max_snr_width","width_samples_all"]
+    out_tab = Table(rows=[[r.get(c) for c in cols] for r in obs_rows], names=cols)
+
+    field = field_for_name or "field"
+    sbid = sbid_for_name or os.path.basename(os.path.abspath(obs_root))
+    csv_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.csv")
+    vot_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.vot")
+    out_tab.write(csv_out, format="csv", overwrite=True)
+    out_tab.write(vot_out, format="votable", overwrite=True)
+    print(f"[ObsSuper] Wrote {len(out_tab)} sources -> {csv_out}, {vot_out}")
+    return out_tab
