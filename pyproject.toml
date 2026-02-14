@@ -27,4 +27,12 @@ ducc-continuum-img = "fastducc.ducc_continuum_img:main"
 [tool.setuptools]
 packages = ["fastducc"] 
 
+[tool.setuptools.packages.find]
+include = ["fastducc*"]
 
+[tool.setuptools.package-data]
+fastducc = [
+  "catalogues/VERSION",
+  "catalogues/psrcat/*.csv",
+  "catalogues/racs/*.xml"
+]

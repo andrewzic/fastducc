@@ -894,84 +894,89 @@ def _stack_tables_or_empty(tables):
     T = T.filled()
     return T
 
-def consolidate_chunk_catalogues(
-    *,
-    ms_base: str,                         # e.g., "example" from "example.ms"
-    out_dir: str,                         # e.g., "<MS parent>/candidates"
-    var_csv_pattern: str,                 # e.g., "<candidates>/<ms_base>_chunk_*_var_candidates.csv"
-    box_csv_pattern: str,                 # e.g., "<candidates>/<ms_base>_chunk_*_boxcar_candidates.csv"
-    remove_chunk_catalogues: bool = True
-):
+
+def _load_psrcat_csv(psrcat_csv_path: str) -> Table:
     """
-    Consolidate per-chunk catalogues from disk into MS-local `candidates/`,
-    write consolidated CSV+VOT with names like:
-        <out_dir>/<ms_base>_variance_all.csv
-        <out_dir>/<ms_base>_variance_all.vot
-        <out_dir>/<ms_base>_boxcar_all.csv
-        <out_dir>/<ms_base>_boxcar_all.vot
-    Optionally remove per-chunk CSV/VOT files afterwards.
-
-    Parameters
-    ----------
-    ms_base : str
-        Base name of the measurement set (e.g., "example" for "example.ms").
-    out_dir : str
-        Destination directory (the `candidates/` folder next to the MS).
-    var_csv_pattern : str
-        Glob pattern for variance per-chunk CSV files.
-        Example: os.path.join(candidates_dir, f"{ms_base}_chunk_*_var_candidates.csv")
-    box_csv_pattern : str
-        Glob pattern for boxcar per-chunk CSV files.
-        Example: os.path.join(candidates_dir, f"{ms_base}_chunk_*_boxcar_candidates.csv")
-    remove_chunk_catalogues : bool
-        If True, delete per-chunk CSV/VOT files after consolidation.
-
-    Returns
-    -------
-    None
+    Read ATNF PSRCAT exported CSV that is semicolon-separated and contains
+    sexagesimal 'RAJ' (hms) and 'DECJ' (dms). Returns a Table with:
+      ['src_name','ra_deg','dec_deg']
+    Skips rows with missing RA/Dec.
     """
-    os.makedirs(out_dir, exist_ok=True)
+    # Read raw with Astropy (handles custom delimiters well)
+    t = Table.read(psrcat_csv_path, format="ascii.csv", delimiter=";", guess=False, fast_reader=False)
+    # Normalise column names that typically appear in this export
+    # Expected: 'PSRJ','RAJ','DECJ' (sexagesimal strings)
+    col_name = "PSRJ" if "PSRJ" in t.colnames else ("NAME" if "NAME" in t.colnames else None)
+    raj = "RAJ" if "RAJ" in t.colnames else None
+    decj = "DECJ" if "DECJ" in t.colnames else None
+    if not (col_name and raj and decj):
+        raise ValueError("PSRCAT CSV must contain PSRJ, RAJ, DECJ columns")
 
-    # 1) Glob per-chunk CSV files
-    var_csv_files = sorted(glob.glob(var_csv_pattern))
-    box_csv_files = sorted(glob.glob(box_csv_pattern))
+    # Build coords, skipping blanks
+    names, ra_deg, dec_deg = [], [], []
+    for r in t:
+        ra_s = str(r[raj]).strip()
+        dec_s = str(r[decj]).strip()
+        if (not ra_s) or (ra_s in ("*", "nan")) or ((":" not in ra_s) and (" " not in ra_s)):
+            continue
+        if (not dec_s) or (dec_s in ("*", "nan")):
+            continue
+        try:
+            c = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg), frame="icrs")
+            names.append(str(r[col_name]).strip())
+            ra_deg.append(float(c.ra.deg))
+            dec_deg.append(float(c.dec.deg))
+        except Exception:
+            # Skip malformed line
+            continue
 
-    print(f"[Consolidation] Found {len(var_csv_files)} variance CSVs and {len(box_csv_files)} boxcar CSVs.")
+    return Table(
+        {
+            "src_name": names,
+            "ra_deg": ra_deg,
+            "dec_deg": dec_deg,
+        }
+    )
 
-    # 2) Read and stack
-    var_tables = _read_csv_tables(var_csv_files)
-    box_tables = _read_csv_tables(box_csv_files)
+def _load_racs(racs_vot_path: str) -> Table:
+    """
+    Read RACS components VOTable and normalise to ['src_name','ra_deg','dec_deg'].
+    Uses 'Source_ID' if present, else 'Gaussian_ID'. Coordinates from RA/Dec (deg).
+    """
+    t = Table.read(racs_vot_path, format="votable")
+    # Choose ID column
+    id_col = "Name" #  Source_ID" if "Source_ID" in t.colnames else ("Gaussian_ID" if "Gaussian_ID" in t.colnames else None)
+    # if id_col is None:
+    #     id_col = "ID" if "ID" in t.colnames else None
+    # if id_col is None:
+    #     id_col = "name" if "name" in t.colnames else None
+    # if id_col is None:
+    #     raise ValueError("Could not find an identifier column in RACS VOTable (e.g. 'Source_ID' or 'Gaussian_ID').")
 
-    t_var_all = _stack_tables_or_empty(var_tables)
-    t_box_all = _stack_tables_or_empty(box_tables)
+    # Coordinates
+    if not (("RA" in t.colnames) and ("Dec" in t.colnames)):
+        raise ValueError("RACS VOTable must contain 'RA' and 'Dec' columns (degrees).")
 
-    # 3) Write consolidated catalogues (CSV + VOT) into candidates dir with ms_base prefix
-    var_out_csv = os.path.join(out_dir, f"{ms_base}_variance_all.csv")
-    var_out_vot = os.path.join(out_dir, f"{ms_base}_variance_all.vot")
-    t_var_all.write(var_out_csv, format="csv", overwrite=True)
-    t_var_all.write(var_out_vot, format="votable", overwrite=True)
+    return Table(
+        {
+            "src_name": [str(x) for x in t[id_col]],
+            "ra_deg":   [float(x) for x in t["RA"]],
+            "dec_deg":  [float(x) for x in t["Dec"]],
+        }
+    )
 
-    box_out_csv = os.path.join(out_dir, f"{ms_base}_boxcar_all.csv")
-    box_out_vot = os.path.join(out_dir, f"{ms_base}_boxcar_all.vot")
-    t_box_all.write(box_out_csv, format="csv", overwrite=True)
-    t_box_all.write(box_out_vot, format="votable", overwrite=True)
-
-    print(f"[Consolidation] Wrote {len(t_var_all)} variance candidates -> {var_out_csv}, {var_out_vot}")
-    print(f"[Consolidation] Wrote {len(t_box_all)} boxcar candidates   -> {box_out_csv}, {box_out_vot}")
-
-    # 4) Remove per-chunk catalogues (CSV + VOT) if requested
-    if remove_chunk_catalogues:
-        var_vot_files = sorted(glob.glob(var_csv_pattern.replace(".csv", ".vot")))
-        box_vot_files = sorted(glob.glob(box_csv_pattern.replace(".csv", ".vot")))
-        removed = 0
-        for p in (var_csv_files + var_vot_files + box_csv_files + box_vot_files):
-            try:
-                os.remove(p)
-                removed += 1
-            except Exception as e:
-                print(f"[Consolidation] Could not remove '{p}': {e}")
-        print(f"[Consolidation] Removed {removed} per-chunk catalogue files.")
-
+def _nearest_within_radius(target: SkyCoord, cat: SkyCoord, radius: u.Quantity) -> tuple:
+    """
+    Return (index, separation) of the nearest neighbour within radius.
+    If none within radius: return (-1, None).
+    """
+    if len(cat) == 0:
+        return -1, None
+    sep = target.separation(cat)
+    j = int(sep.argmin())
+    if sep[j] <= radius:
+        return j, sep[j]
+    return -1, None
 
 
 def parse_candidate_filename(
@@ -1258,6 +1263,86 @@ def _split_list_int(s: Any) -> List[int]:
     return out
 
 
+
+def consolidate_chunk_catalogues(
+    *,
+    ms_base: str,                         # e.g., "example" from "example.ms"
+    out_dir: str,                         # e.g., "<MS parent>/candidates"
+    var_csv_pattern: str,                 # e.g., "<candidates>/<ms_base>_chunk_*_var_candidates.csv"
+    box_csv_pattern: str,                 # e.g., "<candidates>/<ms_base>_chunk_*_boxcar_candidates.csv"
+    remove_chunk_catalogues: bool = True
+):
+    """
+    Consolidate per-chunk catalogues from disk into MS-local `candidates/`,
+    write consolidated CSV+VOT with names like:
+        <out_dir>/<ms_base>_variance_all.csv
+        <out_dir>/<ms_base>_variance_all.vot
+        <out_dir>/<ms_base>_boxcar_all.csv
+        <out_dir>/<ms_base>_boxcar_all.vot
+    Optionally remove per-chunk CSV/VOT files afterwards.
+
+    Parameters
+    ----------
+    ms_base : str
+        Base name of the measurement set (e.g., "example" for "example.ms").
+    out_dir : str
+        Destination directory (the `candidates/` folder next to the MS).
+    var_csv_pattern : str
+        Glob pattern for variance per-chunk CSV files.
+        Example: os.path.join(candidates_dir, f"{ms_base}_chunk_*_var_candidates.csv")
+    box_csv_pattern : str
+        Glob pattern for boxcar per-chunk CSV files.
+        Example: os.path.join(candidates_dir, f"{ms_base}_chunk_*_boxcar_candidates.csv")
+    remove_chunk_catalogues : bool
+        If True, delete per-chunk CSV/VOT files after consolidation.
+
+    Returns
+    -------
+    None
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1) Glob per-chunk CSV files
+    var_csv_files = sorted(glob.glob(var_csv_pattern))
+    box_csv_files = sorted(glob.glob(box_csv_pattern))
+
+    print(f"[Consolidation] Found {len(var_csv_files)} variance CSVs and {len(box_csv_files)} boxcar CSVs.")
+
+    # 2) Read and stack
+    var_tables = _read_csv_tables(var_csv_files)
+    box_tables = _read_csv_tables(box_csv_files)
+
+    t_var_all = _stack_tables_or_empty(var_tables)
+    t_box_all = _stack_tables_or_empty(box_tables)
+
+    # 3) Write consolidated catalogues (CSV + VOT) into candidates dir with ms_base prefix
+    var_out_csv = os.path.join(out_dir, f"{ms_base}_variance_all.csv")
+    var_out_vot = os.path.join(out_dir, f"{ms_base}_variance_all.vot")
+    t_var_all.write(var_out_csv, format="csv", overwrite=True)
+    t_var_all.write(var_out_vot, format="votable", overwrite=True)
+
+    box_out_csv = os.path.join(out_dir, f"{ms_base}_boxcar_all.csv")
+    box_out_vot = os.path.join(out_dir, f"{ms_base}_boxcar_all.vot")
+    t_box_all.write(box_out_csv, format="csv", overwrite=True)
+    t_box_all.write(box_out_vot, format="votable", overwrite=True)
+
+    print(f"[Consolidation] Wrote {len(t_var_all)} variance candidates -> {var_out_csv}, {var_out_vot}")
+    print(f"[Consolidation] Wrote {len(t_box_all)} boxcar candidates   -> {box_out_csv}, {box_out_vot}")
+
+    # 4) Remove per-chunk catalogues (CSV + VOT) if requested
+    if remove_chunk_catalogues:
+        var_vot_files = sorted(glob.glob(var_csv_pattern.replace(".csv", ".vot")))
+        box_vot_files = sorted(glob.glob(box_csv_pattern.replace(".csv", ".vot")))
+        removed = 0
+        for p in (var_csv_files + var_vot_files + box_csv_files + box_vot_files):
+            try:
+                os.remove(p)
+                removed += 1
+            except Exception as e:
+                print(f"[Consolidation] Could not remove '{p}': {e}")
+        print(f"[Consolidation] Removed {removed} per-chunk catalogue files.")
+
+        
 def aggregate_beam_candidate_tables(
     vot_files: List[str],
     *,
@@ -1571,6 +1656,121 @@ def aggregate_observation(
         # out_vot=out_vot,
     )
 
+
+
+def annotate_observation_with_catalogs(
+    out_tab: Table,
+    *,
+    psrcat_csv_path: str = None,
+    racs_vot_path: str = None,
+    match_radius_arcsec: float = 40.0,
+    simbad_enable: bool = True,
+) -> Table:
+    """
+    Enrich an observation-level candidate table with three new columns:
+      - 'source_name'           (str)    : matched name or 'unknown'
+      - 'source_offset_arcsec'  (float)  : match separation in arcsec (NaN if unknown)
+      - 'source_catalog'        (str)    : 'PSRCAT' | 'RACS' | 'SIMBAD' | ''
+    Priority: PSRCAT -> RACS -> SIMBAD (if still unmatched).
+    """
+    # Guard: the observation table must carry ra/dec in degrees.
+    if not (("ra_deg" in out_tab.colnames) and ("dec_deg" in out_tab.colnames)):
+        raise ValueError("Expected 'ra_deg' and 'dec_deg' columns in observation table")
+
+    # Prepare new columns with defaults
+    source_name = ["unknown"] * len(out_tab)
+    source_offset = [float("nan")] * len(out_tab)
+    source_cat = [""] * len(out_tab)
+
+    # Build candidate coords
+    cand_coord = SkyCoord(out_tab["ra_deg"], out_tab["dec_deg"], unit="deg", frame="icrs")
+    radius = match_radius_arcsec * u.arcsec
+
+    # --- 1) PSRCAT (optional) ---
+    psrcat_coord = None
+    psrcat_tbl = None
+    if psrcat_csv_path:
+        psrcat_tbl = _load_psrcat_csv_semicolon(psrcat_csv_path)
+        psrcat_coord = SkyCoord(psrcat_tbl["ra_deg"], psrcat_tbl["dec_deg"], unit="deg", frame="icrs")
+
+    # --- 2) RACS (optional) ---
+    racs_coord = None
+    racs_tbl = None
+    if racs_vot_path:
+        racs_tbl = _load_racs_votable(racs_vot_path)
+        racs_coord = SkyCoord(racs_tbl["ra_deg"], racs_tbl["dec_deg"], unit="deg", frame="icrs")
+
+    # Iterate candidates (few hundred -> simple loop OK; Astropy uses vectorised internals)
+    for i in range(len(out_tab)):
+        tcoord = cand_coord[i]
+
+        # PSRCAT first
+        if psrcat_coord is not None and len(psrcat_coord) > 0:
+            j, sep = _nearest_within_radius(tcoord, psrcat_coord, radius)
+            if j >= 0:
+                source_name[i] = str(psrcat_tbl["src_name"][j])
+                source_offset[i] = float(sep.to(u.arcsec).value)
+                source_cat[i] = "PSRCAT"
+                continue
+
+        # Then RACS
+        if racs_coord is not None and len(racs_coord) > 0:
+            j, sep = _nearest_within_radius(tcoord, racs_coord, radius)
+            if j >= 0:
+                source_name[i] = str(racs_tbl["src_name"][j])
+                source_offset[i] = float(sep.to(u.arcsec).value)
+                source_cat[i] = "RACS"
+                continue
+
+        # Finally SIMBAD (network; optional)
+        if simbad_enable:
+            try:
+                from astroquery.simbad import Simbad
+                # Smaller radius for SIMBAD is fine
+                # keep it equal to match_radius for now
+                result = Simbad.query_region(tcoord, radius=radius)
+                if result is not None and len(result) > 0:
+                    # Choose nearest among returned rows
+                    # SIMBAD returns RA, DEC as sexagesimal strings by default
+                    # e.g., RA: '12 34 56.7', DEC: '+12 34 56'
+                    # Build coords and take nearest
+                    sc_list = []
+                    for r in result:
+                        try:
+                            sc = SkyCoord(str(r["RA"]), str(r["DEC"]),
+                                          unit=(u.hourangle, u.deg), frame="icrs")
+                            sc_list.append(sc)
+                        except Exception:
+                            continue
+                    if sc_list:
+                        cat = SkyCoord([c.ra.deg for c in sc_list],
+                                       [c.dec.deg for c in sc_list], unit="deg", frame="icrs")
+                        j, sep = _nearest_within_radius(tcoord, cat, radius)
+                        if j >= 0:
+                            # Prefer MAIN_ID if present, else fallback to first column
+                            main_id = str(result["MAIN_ID"][j]) if "MAIN_ID" in result.colnames else str(result[0][j])
+                            source_name[i] = main_id
+                            source_offset[i] = float(sep.to(u.arcsec).value)
+                            source_cat[i] = "SIMBAD"
+                            continue
+            except Exception:
+                # astroquery might be unavailable or offline; in that case, keep 'unknown'
+                pass
+
+    # Inject columns next to the name columns if present, else append at the end
+    # By default, place right after 'srcname' if it exists
+    insert_at = len(out_tab.colnames)
+    if "srcname" in out_tab.colnames:
+        insert_at = out_tab.colnames.index("srcname") + 1
+
+    out_tab.add_column(Table.Column(name="source_name", data=source_name), index=insert_at)
+    out_tab.add_column(Table.Column(name="source_offset_arcsec", data=source_offset), index=insert_at + 1)
+    out_tab.add_column(Table.Column(name="source_catalog", data=source_cat), index=insert_at + 2)
+
+    return out_tab
+
+
+
 def aggregate_observation_from_super_summaries(
     obs_root: str,
     *,
@@ -1578,6 +1778,10 @@ def aggregate_observation_from_super_summaries(
     sky_tol_arcsec: float = 35.0,
     out_dir: Optional[str] = None,
     pattern: Optional[str] = None,
+    psrcat_csv_path: Optional[str] = None,   # e.g. "/path/to/psrcat_south.csv"
+    racs_vot_path: Optional[str] = None,     # e.g. "/path/to/RACS-mid1_components.xml"
+    match_radius_arcsec: float = 40.0,
+    simbad_enable: bool = False,
 ) -> Table:    
     """
     Read *per-scan* cross-beam super summaries (VOT) under obs_root,
@@ -1782,6 +1986,17 @@ def aggregate_observation_from_super_summaries(
     if kind == "boxcar":
         cols += ["max_snr_width","width_samples_all"]
     out_tab = Table(rows=[[r.get(c) for c in cols] for r in obs_rows], names=cols)
+
+    try:
+        out_tab = annotate_observation_with_catalogs(
+            out_tab,
+            psrcat_csv_path=psrcat_csv_path,
+            racs_vot_path=racs_vot_path,
+            match_radius_arcsec=match_radius_arcsec,
+            simbad_enable=simbad_enable,
+        )
+    except Exception as e:
+        print(f"[ObsSuper] WARNING: Crossmatch step failed. Continuing without: {e}")
 
     field = field_for_name or "field"
     sbid = sbid_for_name or os.path.basename(os.path.abspath(obs_root))

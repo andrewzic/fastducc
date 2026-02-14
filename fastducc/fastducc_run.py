@@ -34,6 +34,10 @@ from fastducc import wcs as ducc_wcs
 from fastducc.types import Config, WelfordState
 from fastducc import filters, kernels, candidates, ms_utils, detection, imaging
 from fastducc import core as fd_core
+from fastducc.catalogues import get_psrcat_csv_path, get_racs_vot_path
+
+psrcat_path = get_psrcat_csv_path()
+racs_path   = get_racs_vot_path()
 
 def build_cli():
 
@@ -283,12 +287,16 @@ def aggregate_main(argv=None):
 
 def aggregate_obs_main(argv=None):
     args = build_cli_aggregate_obs(argv)
-    aggregate_observation_from_super_summaries(
+    candidates.aggregate_observation_from_super_summaries(
         obs_root=args.obs_root,
         kind=args.kind,
         sky_tol_arcsec=args.sky_tol_arcsec,
         out_dir=args.outdir,
         pattern=args.pattern,
+        psrcat_csv_path=psrcat_path, #TODO: make these cli enabled
+        racs_vot_path=racs_path,
+        match_radius_arcsec=40.0,
+        simbad_enable=False,
     )
     return 0
 
