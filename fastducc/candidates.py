@@ -1690,7 +1690,7 @@ def annotate_observation_with_catalogs(
     psrcat_coord = None
     psrcat_tbl = None
     if psrcat_csv_path:
-        psrcat_tbl = _load_psrcat_csv_semicolon(psrcat_csv_path)
+        psrcat_tbl = _load_psrcat_csv(psrcat_csv_path)
         psrcat_coord = SkyCoord(psrcat_tbl["ra_deg"], psrcat_tbl["dec_deg"], unit="deg", frame="icrs")
 
     # --- 2) RACS (optional) ---
