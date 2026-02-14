@@ -17,7 +17,7 @@ def get_racs_vot_path() -> str:
     path = os.environ.get(ENV_RACS)
     if path and os.path.exists(path):
         return path
-    return _res("fastducc.data.catalogs.racs", "RACS-mid1_components_gp_point.xml")
+    return _res("fastducc.data.catalogs.racs", "RACS-mid1_sources_gp_point.xml")
 
 def get_catalog_bundle_version(default: str = "0") -> str:
     try:
