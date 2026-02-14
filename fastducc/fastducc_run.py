@@ -66,7 +66,7 @@ def build_cli():
                         default=[1, 2, 4, 8, 16, 32, 64])
     parser.add_argument('--threshold-sigma', type=float, default=8.0, help="S/N threshold to use for boxcar detections (default: 8.0)")
     parser.add_argument('--do-plot', action='store_true')
-    parser.add_argument('--var-threshold-sigma', type=float, default=5.0, help="S/N threshold to use for boxcar detections (default: 5.0)")
+    parser.add_argument('--var-threshold-sigma', type=float, default=8.0, help="S/N threshold to use for boxcar detections (default: 8.0)")
     parser.add_argument('--var-keep-top-k', type=int, default=None)
     parser.add_argument('--rms-clip-sigma', type=float, default=3.0)
     parser.add_argument('--nms-radius', type=int, default=6)
