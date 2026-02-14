@@ -24,9 +24,6 @@ fastducc = "fastducc.cli:main"
 fastducc-run = "fastducc.fastducc_run:main"
 ducc-continuum-img = "fastducc.ducc_continuum_img:main"
 
-[tool.setuptools]
-packages = ["fastducc"] 
-
 [tool.setuptools.packages.find]
 include = ["fastducc*"]
 
