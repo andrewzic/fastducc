@@ -22,7 +22,7 @@ def get_racs_vot_path() -> str:
     if path and os.path.exists(path):
         return path
     # Adjust filename if you ship a default; otherwise rely on env var
-    return _res_from_root("catalogues", "racs", "RACS-mid1_sources_point_gp.xml")
+    return _res_from_root("catalogues", "racs", "RACS-mid1_sources_gp_point.xml")
 
 def get_catalog_bundle_version(default: str = "0") -> str:
     """Return text from fastducc/catalogues/VERSION if present."""
