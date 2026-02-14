@@ -938,7 +938,7 @@ def _load_psrcat_csv(psrcat_csv_path: str) -> Table:
         }
     )
 
-def _load_racs(racs_vot_path: str) -> Table:
+def _load_racs_votable(racs_vot_path: str) -> Table:
     """
     Read RACS components VOTable and normalise to ['src_name','ra_deg','dec_deg'].
     Uses 'Source_ID' if present, else 'Gaussian_ID'. Coordinates from RA/Dec (deg).
