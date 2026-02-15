@@ -847,7 +847,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
 def _stack_tables_or_empty(tables):
     """Vstack a list of tables (outer join), return a filled table or empty schema."""
     if len(tables) == 0:
-        # Create a minimal empty table with common columns used in your pipeline
+        # Create a minimal empty table with common columns used in pipeline
         return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
                             "ra_hms","dec_dms","snr","std","width_samples",
                             "time_start","time_end","time_center","t0_idx","t1_idx_excl",
@@ -878,7 +878,7 @@ def _read_csv_tables(paths):
 def _stack_tables_or_empty(tables):
     """Vstack a list of tables (outer join), return a filled table or empty schema."""
     if len(tables) == 0:
-        # Create a minimal empty table with common columns used in your pipeline
+        # Create a minimal empty table with common columns used in pipeline
         return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
                             "ra_hms","dec_dms","snr","std","width_samples",
                             "time_start","time_end","time_center","t0_idx","t1_idx_excl",
@@ -1063,72 +1063,6 @@ def parse_candidate_filename(
         return {k: (False if isinstance(v, bool) else "") for k, v in info.items()}
 
     return info
-
-        
-def _parse_field_sbid_scan_from_obs_super_path(path: str) -> tuple[str, str, str, str]:
-    """
-    Extract (field, SBID, scan_id, kind) from a per-scan super-summary filename:
-      <field>.<SBID>_<scan_id>_<kind>_super_summary.vot
-    Example:
-      LTR_1733-2344.SB77974_20251015091053_variance_super_summary.vot
-    Returns ('', '', '', '') on failure.
-    """
-    fname = os.path.basename(path)
-    field = ''
-    sbid = ''
-    scan = ''
-    kind = ''
-
-    # field: allow e.g. LTR_1733-2344
-    m_field = re.match(r'^(?P<field>[^.]+)\.', fname)
-    if m_field:
-        field = m_field.group('field')
-
-    m_sbid = re.search(r'(SB\d{5})', fname)
-    if m_sbid:
-        sbid = m_sbid.group(1)
-
-    m_scan = re.search(r'(\d{14})', fname)
-    if m_scan:
-        scan = m_scan.group(1)
-
-    m_kind = re.search(r'_(boxcar|variance)_super_summary\.(?:vot|xml|VOT|XML|csv)$', fname)
-    if m_kind:
-        kind = m_kind.group(1)
-
-    return field, sbid, scan, kind
-
-         
-def _parse_beam_and_scan_from_filename(path: str) -> tuple[str, str, str, str]:
-    """Extract beam id (e.g. 'beam14') and scan id (e.g. '20251015072402') from a filename.
-
-    Expected filename style (dot-separated tokens plus suffix), for example:
-        cracoData.<field>.SB77974.beam14.20251015072402.<...>_boxcar_all.csv
-
-    Returns
-    -------
-    (beam_id, scan_id) : tuple[str, str]
-        Empty strings if not found.
-    """
-    fname = os.path.basename(path)
-    fieldname = ''
-    beam = ''
-    scan = ''
-    m_field = re.search(r'(LTR_\d{4}(?:\+/-|-)\d{4})', fname)
-    if m_field:
-        field = m_field.group(1)
-    m_sbid = re.search(r'(SB\d{5})', fname)
-    if m_sbid:
-        sbid = m_sbid.group(1)
-    m_beam = re.search(r'(beam\d+)', fname)
-    if m_beam:
-        beam = m_beam.group(1)
-    m_scan = re.search(r'(\d{14})', fname)
-    if m_scan:
-        scan = m_scan.group(1)
-    
-    return field, sbid, beam, scan
-
 
 def _connected_components_from_pairs(n: int, i_idx, j_idx) -> List[List[int]]:
     """Compute connected components from undirected edge lists.
@@ -1658,6 +1592,120 @@ def aggregate_observation(
 
 
 
+def write_obs_region_files(
+    out_tab: Table,
+    *,
+    field: str,
+    sbid: str,
+    kind: str,
+    out_dir: str,
+    ds9_radius_arcsec: float = 28.0,
+    kvis_radius_arcsec: float = 28.0,
+    ds9_color: str = "green",
+    kvis_color: str = "GREEN",
+    label_mode: str = "srcname+snr+match"  # 'srcname' | 'srcname+snr' | 'srcname+snr+match'
+) -> dict:
+    """
+    Create a SAOImage DS9 .reg and Karma kvis .ann file for all unique candidates
+    contained in the observation-level table (out_tab). Files are written next to
+    the summary tables with consistent names:
+      <field>.<SBID>_obs_<kind>_super_summary.reg
+      <field>.<SBID>_obs_<kind>_super_summary.ann
+
+    Returns
+    -------
+    dict with keys: {'ds9_reg', 'kvis_ann'}
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Build filenames alongside the CSV/VOT outputs
+    base = f"{field}.{sbid}_obs_{kind}_super_summary"
+    reg_path = os.path.join(out_dir, f"{base}.reg")
+    ann_path = os.path.join(out_dir, f"{base}.ann")
+
+    # Column guards
+    if not (("ra_deg" in out_tab.colnames) and ("dec_deg" in out_tab.colnames)):
+        raise ValueError("Expected 'ra_deg' and 'dec_deg' columns in observation table")
+
+    # Optional columns that enrich labels
+    has_srcname = "srcname" in out_tab.colnames
+    has_snr = "max_snr" in out_tab.colnames
+    has_match = "source_name" in out_tab.colnames
+
+    # --- Build labels function
+    def _label(row):
+        parts = []
+        if has_srcname and ("srcname" in label_mode):
+            parts.append(str(row["srcname"]))
+        if has_snr and ("snr" in label_mode):
+            try:
+                parts.append(f"S/N={float(row['max_snr']):.1f}")
+            except Exception:
+                pass
+        if has_match and ("match" in label_mode):
+            name = str(row.get("source_name", "")).strip()
+            if name:
+                parts.append(name.replace("unknown", "??"))
+        # ds9 likes braces; also sanitize curly braces inside text
+        txt = " ".join(p for p in parts if p)
+        return txt.replace("{", "(").replace("}", ")")
+
+    # ----------------- DS9 .reg -----------------
+    # DS9 file header + fk5 coordinate system (celestial).  [1](http://ds9.si.edu/doc/ref/region.html)[2](https://planet4589.org/sci/sds/ds9/doc/web/regions.html)
+    ds9_lines = []
+    ds9_lines.append("# Region file format: DS9 version 4.1")
+    ds9_lines.append(f"global color={ds9_color} width=2")
+    ds9_lines.append("fk5")  # positions are celestial; we will write decimal degrees
+
+    r_arcsec = float(ds9_radius_arcsec)
+    for row in out_tab:
+        try:
+            ra = float(row["ra_deg"])
+            dec = float(row["dec_deg"])
+        except Exception:
+            continue
+        label = _label(row)
+        # DS9: circle(ra,dec,radius") # text={...}  (radius in arcsec)  [1](http://ds9.si.edu/doc/ref/region.html)
+        if label:
+            ds9_lines.append(f"circle({ra:.6f},{dec:.6f},{r_arcsec:.2f}\") # text={{{label}}}")
+        else:
+            ds9_lines.append(f"circle({ra:.6f},{dec:.6f},{r_arcsec:.2f}\")")
+
+    with open(reg_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(ds9_lines) + "\n")
+
+    # ----------------- Karma kvis .ann -----------------
+    # Use world coordinates (degrees) and draw a circle + text per source.  [3](https://www.atnf.csiro.au/computing/software/karma/user-manual/node17.html)
+    ann_lines = []
+    ann_lines.append("# Karma kvis annotation file (auto-generated)")
+    ann_lines.append("# COORD=W means world coordinates; units are degrees per the image WCS.")
+    ann_lines.append("COORD W")
+    ann_lines.append(f"COLOR {kvis_color}")
+
+    r_deg = float(kvis_radius_arcsec) / 3600.0  # KVIS CIRCLE radius is in degrees  [3](https://www.atnf.csiro.au/computing/software/karma/user-manual/node17.html)
+    for row in out_tab:
+        try:
+            ra = float(row["ra_deg"])
+            dec = float(row["dec_deg"])
+        except Exception:
+            continue
+        label = _label(row)
+        # CIRCLE <x_cent> <y_cent> <radius>  (in degrees for world coords)  [3](https://www.atnf.csiro.au/computing/software/karma/user-manual/node17.html)
+        ann_lines.append(f"CIRCLE {ra:.6f} {dec:.6f} {r_deg:.6f}")
+        if label:
+            # TEXT <x_left> <y_left> <string> ; keep label near the marker  [3](https://www.atnf.csiro.au/computing/software/karma/user-manual/node17.html)
+            # Slight RA offset so the text does not overlap the circle
+            x_left = ra + (r_deg * 1.2)
+            y_left = dec
+            ann_lines.append(f"TEXT {x_left:.6f} {y_left:.6f} {label}")
+
+    with open(ann_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(ann_lines) + "\n")
+
+    return {"ds9_reg": reg_path, "kvis_ann": ann_path}
+
+
+
 def annotate_observation_with_catalogs(
     out_tab: Table,
     *,
@@ -2005,4 +2053,19 @@ def aggregate_observation_from_super_summaries(
     out_tab.write(csv_out, format="csv", overwrite=True)
     out_tab.write(vot_out, format="votable", overwrite=True)
     print(f"[ObsSuper] Wrote {len(out_tab)} sources -> {csv_out}, {vot_out}")
+
+    write_obs_region_files(
+        out_tab,
+        field=field,
+        sbid=sbid,
+        kind=kind,
+        out_dir=out_dir,
+        ds9_radius_arcsec=28.0,
+        kvis_radius_arcsec=28.0,
+        ds9_color="green",
+        kvis_color="GREEN",
+        label_mode="srcname+snr+match",
+    )
+
+    
     return out_tab
