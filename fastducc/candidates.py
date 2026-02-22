@@ -1398,7 +1398,7 @@ def aggregate_beam_candidate_tables(
         if k <= 0:
             continue
         if k == 1:
-            det = rows[a0]
+            det = rows[a0]        
             beams = sorted({det.get('beam_id', '')})
             scans = sorted({det.get('scan_id', '')})
             ra_hms, dec_dms, srcname = _sexagesimal_from_deg(float(det["ra_deg"]), float(det["dec_deg"]))
@@ -1416,10 +1416,13 @@ def aggregate_beam_candidate_tables(
                 'sbids' : det.get('sbid', ''),
                 'n_beams': len([b for b in beams if b]),
                 'n_detections': 1,
+                'max_snr_beam': str(det.get('beam_id', '')),
+                'max_snr_time_center': float(det['time_center']),
             }
             if kind == 'boxcar':
                 w = det.get('width_samples', None)
                 ev['width_samples'] = str(int(w)) if w is not None else ''
+                ev['max_snr_width'] = int(w) if w is not None else -1
             events.append(ev)
             continue
 
@@ -1448,11 +1451,17 @@ def aggregate_beam_candidate_tables(
                 'sbids' : ','.join(sorted({r.get('sbid','') for r in sub})),
                 'n_beams': len([b for b in beams if b]),
                 'n_detections': len(sub),
+                'max_snr_beam': str(best.get('beam_id', '')),
+                'max_snr_time_center': float(best['time_center']),
             }
             if kind == 'boxcar':
                 widths = sorted({int(r.get('width_samples', -1)) for r in sub
                                  if r.get('width_samples', None) is not None and int(r.get('width_samples', -1)) >= 0})
                 ev['width_samples'] = ','.join([str(w) for w in widths])
+                try:
+                    ev['max_snr_width'] = int(best.get('width_samples', -1))
+                except Exception:
+                    ev['max_snr_width'] = -1                
             events.append(ev)
 
     events.sort(key=lambda r: r['time_center'])
@@ -1501,8 +1510,9 @@ def aggregate_beam_candidate_tables(
             "beams_all": ",".join(sorted([b for b in beams_union if b])),
             "scans_all": ",".join(sorted([s for s in scans_union if s])),
             "max_snr": float(best["max_snr"]),
-            "max_snr_time_center": float(best.get("time_center", np.nan)),
+            "max_snr_time_center": float(best.get("max_snr_time_center", best.get("time_center", np.nan))),
             "max_snr_event_beams": best.get("beam_ids", ""),
+            "max_snr_beam": str(best.get("max_snr_beam", "")),            
         }
         if kind == "boxcar":
             w_union = set()
@@ -1510,14 +1520,16 @@ def aggregate_beam_candidate_tables(
                 w_union |= set(_split_list_int(r.get("width_samples","")))
             row["width_samples_all"] = ",".join(str(w) for w in sorted(w_union))
             # Try infer an unambiguous width for max-SNR if possible
-            ws_best = _split_list_int(best.get("width_samples",""))
-            row["max_snr_width"] = (ws_best[0] if len(ws_best) == 1 else -1)
-            # Optional: a single beam if unambiguous
-            beams_best = _split_list_str(best.get("beam_ids",""))
-            row["max_snr_beam"] = (beams_best[0] if len(beams_best) == 1 else "")
+            # NEW: exact width of the best raw detection if present
+            if "max_snr_width" in best and best["max_snr_width"] not in (None, ""):
+                row["max_snr_width"] = int(best["max_snr_width"])
+            else:
+                ws_best = _split_list_int(best.get("width_samples",""))
+                row["max_snr_width"] = (ws_best[0] if len(ws_best) == 1 else -1)            
         else:
-            beams_best = _split_list_str(best.get("beam_ids",""))
-            row["max_snr_beam"] = (beams_best[0] if len(beams_best) == 1 else "")
+            #beams_best = _split_list_str(best.get("beam_ids",""))
+            #row["max_snr_beam"] = (beams_best[0] if len(beams_best) == 1 else "")
+            pass
 
         super_rows.append(row)
 
@@ -1530,6 +1542,7 @@ def aggregate_beam_candidate_tables(
         "n_events","n_detections_total","beams_all","scans_all",
         "max_snr","max_snr_time_center","max_snr_event_beams",
     ]
+    # always carry the exact beam; add width only for boxcar
     if kind == "boxcar":
         super_cols += ["width_samples_all", "max_snr_width", "max_snr_beam"]
     else:
