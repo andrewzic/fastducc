@@ -100,7 +100,7 @@ def extract_candidate_snippets(
     center_policy: str = "right",    # 'right' uses w//2, 'left' uses (w-1)//2 for center time
 ) -> List[Dict[str, Any]]:
     """
-    Extract candidate snippets from a *boxcar-smoothed* version of the cube,
+    Extract candidate snippets from [boxcar-smoothed] cube,
     using the candidate width as the temporal averaging window.
 
     Parameters
@@ -448,42 +448,82 @@ def save_candidates_table(table: Table, csv_path: str, vot_path: str) -> None:
     table.write(vot_path, format="votable", overwrite=True)
 
 
+def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> Table:
+    """
+    Convert annotated periodicity candidates into an Astropy Table.
+
+    Expected keys:
+      x,y,l,m,ra_rad,dec_rad,ra_hms,dec_dms,srcname,
+      snr,f_hz,period_s,nharm_used,algo,phase_center_field
+    """
+    if len(annotated) == 0:
+        return Table(names=[
+            "srcname","x","y","l","m",
+            "ra_rad","dec_rad","ra_deg","dec_deg","ra_hms","dec_dms",
+            "snr","f_hz","period_s","nharm_used","algo","phase_center_field"
+        ])
+
+    def col(key, default=np.nan):
+        return [c.get(key, default) for c in annotated]
+
+    xs = np.array(col("x", -1), dtype=np.int64)
+    ys = np.array(col("y", -1), dtype=np.int64)
+    ls = np.array(col("l"), dtype=float)
+    ms = np.array(col("m"), dtype=float)
+    ra_rad = np.array(col("ra_rad"), dtype=float)
+    dec_rad = np.array(col("dec_rad"), dtype=float)
+    ra_deg = np.degrees(ra_rad)
+    dec_deg = np.degrees(dec_rad)
+    ra_hms = np.array(col("ra_hms", ""), dtype=str)
+    dec_dms = np.array(col("dec_dms", ""), dtype=str)
+    srcname = np.array(col("srcname", ""), dtype=str)
+    field_name = np.array(col("phase_center_field", ""), dtype=str)
+
+    snr = np.array(col("snr"), dtype=float)
+    f_hz = np.array(col("f_hz"), dtype=float)
+    period_s = np.array(col("period_s"), dtype=float)
+    nharm_used = np.array(col("nharm_used", 1), dtype=np.int64)
+    algo = np.array(col("algo", "periodicity"), dtype=str)
+
+    t = Table()
+    t["srcname"] = srcname
+    t["x"] = xs
+    t["y"] = ys
+    t["l"] = ls * u.dimensionless_unscaled
+    t["m"] = ms * u.dimensionless_unscaled
+    t["ra_rad"] = ra_rad * u.rad
+    t["dec_rad"] = dec_rad * u.rad
+    t["ra_deg"] = ra_deg * u.deg
+    t["dec_deg"] = dec_deg * u.deg
+    t["ra_hms"] = ra_hms
+    t["dec_dms"] = dec_dms
+    t["snr"] = snr
+    t["f_hz"] = f_hz * u.Hz
+    t["period_s"] = period_s * u.s
+    t["nharm_used"] = nharm_used
+    t["algo"] = algo
+    t["phase_center_field"] = field_name
+    return t
+
+def save_periodicity_candidates_table(table: Table, csv_path: str, vot_path: str) -> None:
+    table.write(csv_path, format="csv", overwrite=True)
+    table.write(vot_path, format="votable", overwrite=True)
+
+
+    
+
 def save_candidate_lightcurves(
     times: np.ndarray,
     cube: np.ndarray,
     candidate: Dict[str, Any],
     out_prefix: str,
-    std_map: Optional[np.ndarray] = None,
-    use_std_images: bool = False,
     *,
-    spatial_size: int = 50,
     save_format: str = "npz",        # "npz" or "ascii"
-    center_policy: str = "right",    # "right" uses w//2; "left" uses (w-1)//2
-    cmap: str = "gray",
-    dpi: int = 200,
-    # WCS parameters:
-    npix_x: int = None, npix_y: int = None,  # full image size (defaults from cube if None)
-    ra0_rad: float = None, dec0_rad: float = None,  # phase center (radians)
-    pix_rad: float = None,                  # pixel scale (radians/pixel) from CLI
-    ra_sign: int = -1,                      # -1 => RA increases left; +1 => RA increases right
-    dec_sign: int = 1,
-    radesys: str = "ICRS", equinox: float = None
 ) -> Dict[str, str]:
-
-
     """
-    Extract and save full-resolution and boxcar-smoothed light curves for a candidate,
-    and produce a WCS-labelled figure:
-      - Top-left: full frame at detection time (WCS RA/Dec)
-      - Top-right: cutout/snippet around candidate (WCS RA/Dec)
-      - Middle: full-res LC
-      - Bottom: boxcar-smoothed LC
-
-    Called before snippet products are produced.
-
+    Extract and save full-resolution and boxcar-smoothed light curves for a candidate.
     Returns dict of file paths.
     """
-
     
     # --- Validate inputs ---
     if cube.ndim != 3:
@@ -491,34 +531,11 @@ def save_candidate_lightcurves(
     T, Ny, Nx = cube.shape
     if times.shape[0] != T:
         raise ValueError("times length must match cube time axis")
-    if spatial_size < 1:
-        raise ValueError("spatial_size must be >= 1")
-    if save_format not in ("npz", "ascii"):
-        raise ValueError("save_format must be 'npz' or 'ascii'")
-    if pix_rad is None or ra0_rad is None or dec0_rad is None:
-        raise ValueError("You must pass ra0_rad/dec0_rad (phase center) and pix_rad (CLI pixel scale).")
 
-    # Default full image dims from cube if not provided
-    if npix_x is None: npix_x = Nx
-    if npix_y is None: npix_y = Ny
-
-    # --- Candidate fields ---
+    # get candidate info
     y = int(candidate["y"])
     x = int(candidate["x"])
     w = max(1, int(candidate.get("width_samples", 1)))
-
-    # Preferred smoothed start index, else derive from center_idx
-    if "t0_idx" in candidate:
-        
-        t0_idx = int(candidate["t0_idx"])
-        
-    else:
-        cidx = int(candidate.get("center_idx", 0))
-        t0_idx = cidx - (w // 2) if (center_policy == "right") else cidx - ((w - 1) // 2)
-        t0_idx = max(0, min(t0_idx, T - w))
-
-    offset = (w // 2) if (center_policy == "right") else ((w - 1) // 2)
-    t_full_center = max(0, min(t0_idx + offset, T - 1))
 
     # --- Full-res light curve at the candidate pixel ---
     lc_full = cube[:, y, x].astype(np.float64, copy=False)
@@ -531,46 +548,6 @@ def save_candidate_lightcurves(
     else:
         times_sm = np.empty((0,), dtype=times.dtype)
         k_center = 0
-
-    # --- Images to display ---
-
-    if use_std_images and (std_map is not None):
-        # Use std_map for both full frame and cutout
-        frame_for_display = std_map
-    else:
-        frame_for_display = cube[t_full_center]
-        
-    vmin = np.nanpercentile(frame_for_display, 5.0)
-    vmax = np.nanpercentile(frame_for_display, 99.5)
-    
-    # Full-frame WCS:
-    wcs_full = ducc_wcs._build_fullframe_wcs(npix_x=npix_x, npix_y=npix_y,
-                                    ra0_rad=ra0_rad, dec0_rad=dec0_rad,
-                                    pixscale_rad=pix_rad,
-                                    ra_sign=ra_sign, radesys=radesys, equinox=equinox)
-
-
-    if "ra_rad" in candidate and "dec_rad" in candidate:
-        ra_c = float(candidate["ra_rad"])
-        dec_c = float(candidate["dec_rad"])
-    else:
-
-        ra_c = ra0_rad
-        dec_c = dec0_rad
-    
-    # Snippet/cutout for the chosen frame
-    half_sp = spatial_size // 2
-    y0 = max(0, y - half_sp); y1 = min(Ny, y0 + spatial_size)
-    x0 = max(0, x - half_sp); x1 = min(Nx, x0 + spatial_size)
-    snippet = frame_for_display[y0:y1, x0:x1]
-    
-    # Snippet WCS centered on candidate world coords
-    wcs_cut = ducc_wcs._build_tan_wcs_for_snippet(spatial_size=snippet.shape[0],
-                                         ra_rad=ra_c, dec_rad=dec_c,
-                                         pixscale_rad=pix_rad,
-                                         ra_sign=ra_sign, radesys=radesys, equinox=equinox)
-
-
 
     # --- Save light curves ---
     out_full = f"{out_prefix}_lc_full.{ 'npz' if save_format=='npz' else 'txt' }"
@@ -590,71 +567,355 @@ def save_candidate_lightcurves(
             for t, v in zip(times_sm, lc_sm):
                 f.write(f"{t:.9f} {v:.9e}\n")
 
-    
-    
-    # --- Build the figure ---
-    out_fig = f"{out_prefix}_lightcurves.png"
-    fig = plt.figure(figsize=(10, 10), dpi=dpi)
+    return out_full
 
-    gs = GridSpec(
-        nrows=3, ncols=2, figure=fig,
-        height_ratios=[1.1, 1.0, 1.0],   # give images slightly more height
-        width_ratios=[1, 1],
+ 
+def save_candidate_summary(
+    times: np.ndarray,
+    cube: np.ndarray,
+    candidate: Dict[str, Any],
+    out_prefix: str,
+    *,
+    continuum_dir: Optional[str] = None,
+    std_map: Optional[np.ndarray] = None,
+    use_std_images: bool = False,
+    spatial_size: int = 50,
+    center_policy: str = "right",
+    cmap: str = "inferno",
+    dpi: int = 200,
+    # WCS parameters for the fastducc imaging grid:
+    npix_x: Optional[int] = None, npix_y: Optional[int] = None,
+    ra0_rad: Optional[float] = None, dec0_rad: Optional[float] = None,
+    pix_rad: Optional[float] = None,
+    ra_sign: int = -1, dec_sign: int = 1,  # dec_sign reserved; not all WCS builders need it
+    radesys: str = "ICRS", equinox: float = None,
+    # Labelling:
+    method: str = "boxcar",
+) -> Dict[str, str]:
+    """
+    Build a prepfold-like *single* candidate page:
+      - top-left: deep continuum cutout (per-beam FITS from --continuum-dir)
+      - top-middle: full field at detection time (or std-map for variance)
+      - top-right: detection-time cutout (TAN WCS centered on source)
+      - bottom: raw + boxcar-smoothed light curves (overlaid)
+      - rightmost text box with metadata & stats
+
+    Returns
+    -------
+    dict : {"figure": "<out_prefix>_summary.png", "}
+    """
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.offsetbox import AnchoredText
+    from astropy.nddata import Cutout2D
+
+    # --- sanity & shapes ---
+    if cube.ndim != 3:
+        raise ValueError("cube must be (T, Ny, Nx)")
+    T, Ny, Nx = cube.shape
+    if times.shape[0] != T:
+        raise ValueError("times length must match cube time axis")
+    if any(v is None for v in (npix_x, npix_y, ra0_rad, dec0_rad, pix_rad)):
+        raise ValueError("Provide npix_x/npix_y and ra0_rad/dec0_rad/pix_rad for WCS.")
+
+    y = int(candidate["y"])
+    x = int(candidate["x"])
+    w = max(1, int(candidate.get("width_samples", 1)))
+
+    # Determine window start t0_idx (for smoothed index) similar to save_candidate_lightcurves
+    if "t0_idx" in candidate:
+        t0_idx = int(candidate["t0_idx"])
+    else:
+        cidx = int(candidate.get("center_idx", 0))
+        t0_idx = cidx - (w // 2) if (center_policy == "right") else cidx - ((w - 1) // 2)
+        t0_idx = max(0, min(t0_idx, T - w))
+    offset = (w // 2) if (center_policy == "right") else ((w - 1) // 2)
+    t_full_center = max(0, min(t0_idx + offset, T - 1))
+
+    # --- light curves (raw + smoothed) ---
+    lc_full = cube[:, y, x].astype(np.float64, copy=False)
+    lc_sm, T_eff = kernels._compute_boxcar_1d(lc_full, w)
+    times_sm = times[offset:offset + T_eff] if T_eff > 0 else np.empty((0,), dtype=times.dtype)
+
+    # --- image plane for top panels ---
+    if use_std_images and (std_map is not None):
+        frame_for_display = std_map
+    else:
+        frame_for_display = cube[t_full_center]
+    vmin = np.nanpercentile(frame_for_display, 5.0)
+    vmax = np.nanpercentile(frame_for_display, 99.5)
+
+    # WCS for the full frame
+    wcs_full = ducc_wcs._build_fullframe_wcs(
+        npix_x=npix_x, npix_y=npix_y,
+        ra0_rad=ra0_rad, dec0_rad=dec0_rad,
+        pixscale_rad=pix_rad, ra_sign=ra_sign, radesys=radesys, equinox=equinox
     )
 
-    
-    
-    # Top-left: WCS full frame
-    ax_full = fig.add_subplot(gs[0,0], projection=wcs_full)
-    im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="red")
-    ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
-    ax_full.set_xlabel("Right Ascension (J2000)")
-    ax_full.set_ylabel("Declination (J2000)")
-    ax_full.set_title(f"Full image @ t={times[t_full_center]:.3f}s (idx {t_full_center})")
-    cbar1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
-    cbar1.set_label("Flux Density (mJy/beam)")
-    
-    # Top-right: WCS cutout
-    ax_cut = fig.add_subplot(gs[0,1], projection=wcs_cut)
-    im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="red")
-    ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
-    ax_cut.set_xlabel("Right Ascension (J2000)")
-    ax_cut.set_ylabel("Declination (J2000)")
-    ax_cut.set_title(f"Cutout")
-
-
-    cbar2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
-    cbar2.set_label("Flux density (mJy/beam)")    
-
-
-    # Middle: full-res light curve
-    ax_lc_full = fig.add_subplot(gs[1, :])  # spans full width below
-    ax_lc_full.plot(times, lc_full, color="tab:blue", lw=1.6)
-    ax_lc_full.axvline(times[t_full_center], color="red", ls="--", lw=1.0, label="Detection time")
-    ax_lc_full.set_ylabel("Flux density (mJy/beam)")
-    ax_lc_full.grid(True, alpha=0.3)
-    ax_lc_full.legend(loc="best")
-
-    # Bottom: boxcar-smoothed light curve
-    ax_lc_box = fig.add_subplot(gs[2, :])
-    if T_eff > 0:
-        ax_lc_box.plot(times_sm, lc_sm, color="tab:green", lw=1.6)
-        ax_lc_box.axvline(times_sm[k_center], color="red", ls="--", lw=1.0, label=f"Smoothed center (w={w})")
-        ax_lc_box.legend(loc="best")
+    # WCS for the cutout centered on candidate sky coords (if present)
+    if "ra_rad" in candidate and "dec_rad" in candidate:
+        ra_c = float(candidate["ra_rad"])
+        dec_c = float(candidate["dec_rad"])
     else:
-        ax_lc_box.text(0.5, 0.5, f"Width {w} > T; no smoothed LC",
-                       transform=ax_lc_box.transAxes, ha="center", va="center", color="red")
-    ax_lc_box.set_xlabel("Time (s)")
-    ax_lc_box.set_ylabel(f"Flux density - boxcar mean, w={w} (mJy/beam)")
-    ax_lc_box.grid(True, alpha=0.3)
+        ra_c = ra0_rad
+        dec_c = dec0_rad
 
-    #fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.08, wspace=0.22, hspace=0.35)
+    half_sp = spatial_size // 2
+    y0 = max(0, y - half_sp); y1 = min(Ny, y0 + spatial_size)
+    x0 = max(0, x - half_sp); x1 = min(Nx, x0 + spatial_size)
+    cutout_det = frame_for_display[y0:y1, x0:x1]
+    wcs_cut = ducc_wcs._build_tan_wcs_for_snippet(
+        spatial_size=cutout_det.shape[0],
+        ra_rad=ra_c, dec_rad=dec_c,
+        pixscale_rad=pix_rad, ra_sign=ra_sign, radesys=radesys, equinox=equinox
+    )
+
+    # --- locate deep continuum FITS (optional) and make a WCS cutout ---
+    cont_im, cont_wcs, cont_vmin, cont_vmax = None, None, None, None
+    if continuum_dir:
+        meta_guess = parse_candidate_filename(out_prefix)  # use filename parser shipped in this module
+        beam_lbl = meta_guess.get("beam", "") if isinstance(meta_guess, dict) else ""
+        try:
+            fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits*")))
+            if beam_lbl:
+                fits_cands = [p for p in fits_cands if beam_lbl in os.path.basename(p)]
+            if len(fits_cands) == 0:
+                fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits*")))  # fallback: first available
+            if len(fits_cands) > 0:
+                with fits.open(fits_cands[0], memmap=False) as hdul:
+                    data = hdul[0].data
+                    hdr  = hdul[0].header
+                if data.ndim > 2:
+                    data = np.squeeze(data)
+                cont_w = WCS(hdr)
+                # angular cutout size corresponding to 'spatial_size' of the transient cube
+                size_rad = spatial_size * float(pix_rad)  # radians
+                pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
+                c2d = Cutout2D(data, pos, (size_rad * u.rad, size_rad * u.rad), wcs=cont_w, mode="partial")
+                cont_im = c2d.data
+                cont_wcs = c2d.wcs
+                cont_vmin = np.nanpercentile(cont_im, 5.0)
+                cont_vmax = np.nanpercentile(cont_im, 99.5)
+        except Exception:
+            cont_im, cont_wcs = None, None
+
+    # --- figure layout ---
+    out_fig = f"{out_prefix}_summary.pdf"
+    fig = plt.figure(figsize=(12, 9), dpi=dpi)
+    gs = GridSpec(
+        nrows=2, ncols=4, figure=fig,
+        height_ratios=[1.0, 1.0], width_ratios=[1.0, 1.0, 1.0, 1.0],
+        #wspace=0.22, hspace=0.24
+    )
+
+    # Top-left: continuum cutout (if available)
+    ax_cont = fig.add_subplot(gs[0, 2])
+    if cont_wcs is not None:
+        ax_cont.remove()
+        ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
+        im_cont = ax_cont.imshow(cont_im, origin="lower", cmap=cmap, vmin=cont_vmin, vmax=cont_vmax)
+        ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
+        ax_cont.set_xlabel("RA (J2000)")
+        ax_cont.set_ylabel("Dec (J2000)")
+        # Mark source in world coordinates
+        ax_cont.plot([np.degrees(ra_c)], [np.degrees(dec_c)],
+                     marker=reticle(which='rt'), ms=28, color="red",
+                     transform=ax_cont.get_transform('world'))
+        cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
+        cb3.set_label("Flux density (mJy/beam)")
+        ax_cont.set_title("Cont.")
+    else:
+        ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
+        im_cont = ax_cont.imshow(np.mean(cube, axis=0), origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
+        ax_cont.set_xlabel("RA (J2000)")
+        ax_cont.set_ylabel("Dec (J2000)")
+        ax_cont.plot([x], [y], marker=reticle(which='rt'), ms=28, color="red")  # pixel coords
+        cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
+        cb3.set_label("Flux density (mJy/beam)")
+        ax_cont.set_title("Mean cube (no cont.)")
+
+    # Top-middle: full field (WCS)
+    ax_full = fig.add_subplot(gs[0, 1], projection=wcs_full)
+    im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
+    ax_full.set_xlabel("RA (J2000)")
+    ax_full.set_ylabel("Dec (J2000)")
+    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=28, color="red")  # pixel coords
+    cb1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
+    cb1.set_label("Flux density (mJy/beam)")
+    t_str = f"{times[t_full_center]:.3f}s" if np.isfinite(times[t_full_center]) else "—"
+    ax_full.set_title(f"Full image @ t={t_str}")
+
+    # Top-right: detection-time cutout (WCS TAN centered at candidate)
+    ax_cut = fig.add_subplot(gs[0, 2], projection=wcs_cut)
+    im_cut = ax_cut.imshow(cutout_det, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
+    ax_cut.set_xlabel("RA (J2000)")
+    ax_cut.set_ylabel("Dec (J2000)")
+    ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)],
+                marker=reticle(which='rt'), ms=28, color="red")
+    cb2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
+    cb2.set_label("Flux density (mJy/beam)")
+    ax_cut.set_title("Detection cutout")
+
+    # Top-rightmost cell (gs[0, 3]): metadata text box
+    ax_txt = fig.add_subplot(gs[0, 3])
+    ax_txt.set_axis_off()
+    # RA/Dec strings
+    ra_hms = candidate.get("ra_hms", None)
+    dec_dms = candidate.get("dec_dms", None)
+    if (not ra_hms) or (not dec_dms):
+        ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(ra_c, dec_c, dp=1)
+
+    # filename-derived observation tags
+    meta = parse_candidate_filename(out_prefix)
+    field = meta.get("field", "") if isinstance(meta, dict) else ""
+    sbid  = meta.get("sbid", "") if isinstance(meta, dict) else ""
+    scan  = meta.get("scan_id", "") if isinstance(meta, dict) else ""
+    beam  = meta.get("beam", "") if isinstance(meta, dict) else ""
+
+    det_time = candidate.get("time_center", np.nan)
+    det_time_str = f"{det_time:.3f} s" if np.isfinite(det_time) else "—"
+    snr_val = candidate.get("snr", np.nan)
+    snr_str = f"{float(snr_val):.2f}" if np.isfinite(snr_val) else "—"
+    width_str = f"{w:d}" if (method.lower() == "boxcar") else "—"
+
+    txt = (
+        f"Field: {field}\n"
+        f"SBID: {sbid}\n"
+        f"Beam: {beam}\n"        
+        f"Scan: {scan}\n"
+        f"Coord (J2000): {ra_hms} {dec_dms}\n"
+        f"Coord (x,y): ({x:d}, {y:d})\n"
+        f"S/N: {snr_str}\n"
+        f"Det. time: {det_time_str}\n"
+        f"Method: {method}\n"
+        f"Width: {width_str}"
+    )
+
+    box = AnchoredText(txt, loc="upper left", frameon=True, pad=0.4, prop={"size": 10})
+    ax_txt.add_artist(box)
+    ax_txt.set_title("Candidate summary", pad=8)
+
+    # Bottom row (span all 4 columns): raw + smoothed LC
+    ax_lc = fig.add_subplot(gs[1, :])
+    ax_lc.plot(times, lc_full, color="tab:blue",  lw=1.4, label="Raw")
+    if T_eff > 0:
+        ax_lc.plot(times_sm, lc_sm, color="tab:green", lw=1.6, label=f"Boxcar mean (w={w})")
+        k_center = max(0, min(t0_idx, T_eff - 1))
+        ax_lc.axvline(times_sm[k_center], color="crimson", ls="--", lw=1.0)
+    else:
+        ax_lc.text(0.02, 0.92, f"w={w} > T; smoothed LC unavailable",
+                   transform=ax_lc.transAxes, ha="left", va="top", color="crimson")
+    ax_lc.set_xlabel("Time (s)")
+    ax_lc.set_ylabel("Flux density (mJy/beam)")
+    ax_lc.grid(True, alpha=0.3)
+    ax_lc.legend(loc="best")
+
     fig.savefig(out_fig, bbox_inches="tight")
     plt.close(fig)
 
-    return {"lc_full": out_full, "lc_boxcar": out_box, "figure": out_fig}
+    # --- Save the cutout as a FITS file with WCS ---
+    out_fits = f"{out_prefix}_cutout.fits"
+    hdr = wcs_cut.to_header()
+    
+    # Optional helpful metadata:
+    hdr["BUNIT"] = "JY/BEAM"
+    hdr["COMMENT"] = "Detection frame from transient snippet"
+    if ra_hms and dec_dms:
+        hdr["OBJRA"] = ra_hms
+        hdr["OBJDEC"] = dec_dms
+        
+    # Ensure CDELT/PC are present (to_header() should already include them,
+    # but we can set explicitly to be safe):
+    # NOTE: when using CDELT+PC we DO NOT set CD.
+    # CDELT1/2 in degrees per pixel
+    hdr["CDELT1"] = wcs_cut.wcs.cdelt[0]
+    hdr["CDELT2"] = wcs_cut.wcs.cdelt[1]
+    
+    # Identity PC
+    hdr["PC1_1"] = 1.0; hdr["PC1_2"] = 0.0
+    hdr["PC2_1"] = 0.0; hdr["PC2_2"] = 1.0
+    
+    # Frame metadata if present
+    if getattr(wcs_cut.wcs, "radesys", None):
+        hdr["RADESYS"] = wcs_cut.wcs.radesys
+    #if getattr(wcs2d.wcs, "equinox", None) is not None:
+    #    hdr["EQUINOX"] = wcs2d.wcs.equinox
+        
+
+    # CTYPE/CUNIT/CRPIX/CRVAL are already provided by to_header(), so no need to duplicate.
+    
+    hdu = fits.PrimaryHDU(data=cutout_det.astype(np.float32), header=hdr)
+    hdu.writeto(out_fits, overwrite=True)
+
+
+    return {"figure": out_fig, "fits_cutout": out_fits}
+
+    
+    # # --- Build the figure ---
+    # out_fig = f"{out_prefix}_lightcurves.png"
+    # fig = plt.figure(figsize=(10, 10), dpi=dpi)
+
+    # gs = GridSpec(
+    #     nrows=3, ncols=2, figure=fig,
+    #     height_ratios=[1.1, 1.0, 1.0],   # give images slightly more height
+    #     width_ratios=[1, 1],
+    # )
+
+    
+    
+    # # Top-left: WCS full frame
+    # ax_full = fig.add_subplot(gs[0,0], projection=wcs_full)
+    # im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    # ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="red")
+    # ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
+    # ax_full.set_xlabel("Right Ascension (J2000)")
+    # ax_full.set_ylabel("Declination (J2000)")
+    # ax_full.set_title(f"Full image @ t={times[t_full_center]:.3f}s (idx {t_full_center})")
+    # cbar1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
+    # cbar1.set_label("Flux Density (mJy/beam)")
+    
+    # # Top-right: WCS cutout
+    # ax_cut = fig.add_subplot(gs[0,1], projection=wcs_cut)
+    # im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    # ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="red")
+    # ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
+    # ax_cut.set_xlabel("Right Ascension (J2000)")
+    # ax_cut.set_ylabel("Declination (J2000)")
+    # ax_cut.set_title(f"Cutout")
+
+
+    # cbar2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
+    # cbar2.set_label("Flux density (mJy/beam)")    
+
+
+    # # Middle: full-res light curve
+    # ax_lc_full = fig.add_subplot(gs[1, :])  # spans full width below
+    # ax_lc_full.plot(times, lc_full, color="tab:blue", lw=1.6)
+    # ax_lc_full.axvline(times[t_full_center], color="red", ls="--", lw=1.0, label="Detection time")
+    # ax_lc_full.set_ylabel("Flux density (mJy/beam)")
+    # ax_lc_full.grid(True, alpha=0.3)
+    # ax_lc_full.legend(loc="best")
+
+    # # Bottom: boxcar-smoothed light curve
+    # ax_lc_box = fig.add_subplot(gs[2, :])
+    # if T_eff > 0:
+    #     ax_lc_box.plot(times_sm, lc_sm, color="tab:green", lw=1.6)
+    #     ax_lc_box.axvline(times_sm[k_center], color="red", ls="--", lw=1.0, label=f"Smoothed center (w={w})")
+    #     ax_lc_box.legend(loc="best")
+    # else:
+    #     ax_lc_box.text(0.5, 0.5, f"Width {w} > T; no smoothed LC",
+    #                    transform=ax_lc_box.transAxes, ha="center", va="center", color="red")
+    # ax_lc_box.set_xlabel("Time (s)")
+    # ax_lc_box.set_ylabel(f"Flux density - boxcar mean, w={w} (mJy/beam)")
+    # ax_lc_box.grid(True, alpha=0.3)
+
+    # #fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.08, wspace=0.22, hspace=0.35)
+    # fig.savefig(out_fig, bbox_inches="tight")
+    # plt.close(fig)
+
+    # return {"lc_full": out_full, "lc_boxcar": out_box, "figure": out_fig}
     
 def save_candidate_snippet_products(snippet_rec: dict,
                                     out_prefix: str,
@@ -670,8 +931,8 @@ def save_candidate_snippet_products(snippet_rec: dict,
     """
     Save three products for a transient candidate snippet:
       1) animated GIF across time with RA/Dec labels (WCSAxes)
-      2) static PNG at the detection frame + light curve of detection pixel
-      3) FITS image of the detection frame with TAN WCS
+      2) DEPRECATED: static PNG at the detection frame + light curve of detection pixel
+      3) DEPRECATED: FITS image of the detection frame with TAN WCS
 
     Parameters
     ----------
@@ -697,7 +958,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     Returns
     -------
     dict with paths:
-        { "gif": ..., "png": ..., "fits": ... }
+        { "gif": ...}
     """
     cube = snippet_rec["snippet_cube"]  # (T, N, N)
     times = snippet_rec["snippet_times"]  # (T,)
@@ -755,93 +1016,60 @@ def save_candidate_snippet_products(snippet_rec: dict,
     anim.save(out_gif, writer=PillowWriter(fps=gif_fps))
     plt.close(fig)
 
-    # 2) Static PNG at detection frame + light curve
-    fig2 = plt.figure(figsize=(10, 10), dpi=dpi)
-    gs = GridSpec(
-        nrows=3, ncols=2, figure=fig,
-        height_ratios=[1.0, 1.0, 1.0],   # give images slightly more height
-        width_ratios=[1, 1],
-    )
+    # # 2) Static PNG at detection frame + light curve
+    # fig2 = plt.figure(figsize=(10, 10), dpi=dpi)
+    # gs = GridSpec(
+    #     nrows=3, ncols=2, figure=fig,
+    #     height_ratios=[1.0, 1.0, 1.0],   # give images slightly more height
+    #     width_ratios=[1, 1],
+    # )
     
-    # Top: WCSAxes image
-    ax_img = fig2.add_subplot(gs[0:2, :], projection=wcs2d)
-    im2 = ax_img.imshow(det_frame, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
-    ax_img.set_xlabel("Right Ascension (J2000)")
-    ax_img.set_ylabel("Declination (J2000)")
-    ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
-    cb = fig2.colorbar(im2, ax=ax_img, fraction=0.046, pad=0.04)
-    cb.set_label("Intensity (arb. units)")
-    # Title with RA/Dec, SNR if available
-    ra_hms = cand.get("ra_hms", None)
-    dec_dms = cand.get("dec_dms", None)
-    title_txt = "Candidate frame"
-    if ra_hms and dec_dms:
-        title_txt += f"  |  RA={ra_hms}  Dec={dec_dms}"
-    ax_img.set_title(title_txt)
+    # # Top: WCSAxes image
+    # ax_img = fig2.add_subplot(gs[0:2, :], projection=wcs2d)
+    # im2 = ax_img.imshow(det_frame, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    # ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
+    # ax_img.set_xlabel("Right Ascension (J2000)")
+    # ax_img.set_ylabel("Declination (J2000)")
+    # ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
+    # cb = fig2.colorbar(im2, ax=ax_img, fraction=0.046, pad=0.04)
+    # cb.set_label("Intensity (arb. units)")
+    # # Title with RA/Dec, SNR if available
+    # ra_hms = cand.get("ra_hms", None)
+    # dec_dms = cand.get("dec_dms", None)
+    # title_txt = "Candidate frame"
+    # if ra_hms and dec_dms:
+    #     title_txt += f"  |  RA={ra_hms}  Dec={dec_dms}"
+    # ax_img.set_title(title_txt)
 
-    # Bottom: light curve of detection pixel
-    ax_lc = fig2.add_subplot(gs[2, :])
-    lc = cube[:, y_center, x_center]
-    # Mask NaNs from pad zones
-    good = np.isfinite(times) & np.isfinite(lc)
-    ax_lc.plot(times[good], lc[good], color="tab:blue", lw=1.5)
-    # Mark the detection center time
-    t0 = times[t_center] if np.isfinite(times[t_center]) else np.nan
+    # # Bottom: light curve of detection pixel
+    # ax_lc = fig2.add_subplot(gs[2, :])
+    # lc = cube[:, y_center, x_center]
+    # # Mask NaNs from pad zones
+    # good = np.isfinite(times) & np.isfinite(lc)
+    # ax_lc.plot(times[good], lc[good], color="tab:blue", lw=1.5)
+    # # Mark the detection center time
+    # t0 = times[t_center] if np.isfinite(times[t_center]) else np.nan
 
-    print(cand)
-    try:
-        tline = cand.get("time_center_peak", cand["time_center"])
-        ax_lc.axvline(tline, color="red", ls="--", lw=1.0, label="Candidate peak")
+    # print(cand)
+    # try:
+    #     tline = cand.get("time_center_peak", cand["time_center"])
+    #     ax_lc.axvline(tline, color="red", ls="--", lw=1.0, label="Candidate peak")
 
-    except KeyError:
-        print("time_center not found")
+    # except KeyError:
+    #     print("time_center not found")
         
-    # if np.isfinite(t0):
-    #     ax_lc.axvline(t0, color="red", ls="--", lw=1.0, label="Detection time")
-    #     ax_lc.legend(loc="best")
-    ax_lc.set_xlabel("Time (s)")
-    ax_lc.set_ylabel("Peak flux density (mJy/beam)")
-    ax_lc.grid(True, alpha=0.3)
+    # # if np.isfinite(t0):
+    # #     ax_lc.axvline(t0, color="red", ls="--", lw=1.0, label="Detection time")
+    # #     ax_lc.legend(loc="best")
+    # ax_lc.set_xlabel("Time (s)")
+    # ax_lc.set_ylabel("Peak flux density (mJy/beam)")
+    # ax_lc.grid(True, alpha=0.3)
 
-    fig2.savefig(out_png, bbox_inches="tight")
-    plt.close(fig2)
+    # fig2.savefig(out_png, bbox_inches="tight")
+    # plt.close(fig2)
+    #, "png": out_png}
 
-    # 3) FITS image of detection frame with WCS header
-
-    hdr = wcs2d.to_header()
-    
-    # Optional helpful metadata:
-    hdr["BUNIT"] = "arb. unit"
-    hdr["COMMENT"] = "Detection frame from transient snippet"
-    if ra_hms and dec_dms:
-        hdr["OBJRA"] = ra_hms
-        hdr["OBJDEC"] = dec_dms
-        
-    # Ensure CDELT/PC are present (to_header() should already include them,
-    # but we can set explicitly to be safe):
-    # NOTE: when using CDELT+PC we DO NOT set CD.
-    # CDELT1/2 in degrees per pixel
-    hdr["CDELT1"] = wcs2d.wcs.cdelt[0]
-    hdr["CDELT2"] = wcs2d.wcs.cdelt[1]
-    
-    # Identity PC
-    hdr["PC1_1"] = 1.0; hdr["PC1_2"] = 0.0
-    hdr["PC2_1"] = 0.0; hdr["PC2_2"] = 1.0
-    
-    # Frame metadata if present
-    if getattr(wcs2d.wcs, "radesys", None):
-        hdr["RADESYS"] = wcs2d.wcs.radesys
-    #if getattr(wcs2d.wcs, "equinox", None) is not None:
-    #    hdr["EQUINOX"] = wcs2d.wcs.equinox
-        
-
-    # CTYPE/CUNIT/CRPIX/CRVAL are already provided by to_header(), so no need to duplicate.
-    
-    hdu = fits.PrimaryHDU(data=det_frame.astype(np.float32), header=hdr)
-    hdu.writeto(out_fits, overwrite=True)
-
-    return {"gif": out_gif, "png": out_png, "fits": out_fits}
+    return {"gif": out_gif}
 
 
 def _stack_tables_or_empty(tables):
@@ -979,37 +1207,16 @@ def _nearest_within_radius(target: SkyCoord, cat: SkyCoord, radius: u.Quantity) 
     return -1, None
 
 
-def parse_candidate_filename(
-    path: str,
-    *,
-    require: str | None = None,     # None | 'all' | 'super'
-) -> dict:
+
+def parse_candidate_filename(path: str, *, require: str | None = None) -> dict:
     """
     Parse pipeline candidate/super-summary filenames.
 
-    Supports both styles:
-      (A) Per-beam consolidated "all" tables, e.g.
-          cracoData.<field>.SB77974.beam14.20251015072402.<...>_<kind>_all.(csv|vot)
-      (B) Per-scan super-summary tables, e.g.
-          <field>.<SBID>_<scan_id>_<kind>_super_summary.(vot|csv)
-
-    Returns a dict with keys:
-      {
-        'field': str,
-        'sbid': str,
-        'beam': str,      # '' if absent
-        'scan_id': str,   # '' if absent
-        'kind': str,      # 'boxcar' | 'variance' | ''
-        'is_all': bool,       # True if "*_all.*"
-        'is_super': bool,     # True if "*_super_summary.*"
-      }
-
-    If `require='all'` or `require='super'` is set and the filename does not
-    match that shape, returns an "empty" dict with the same keys (all falsy).
+    Extended to support periodicity:
+      *_periodicity_all.(csv|vot)
+      *_periodicity_super_summary.(csv|vot)
     """
     fname = os.path.basename(path)
-
-    # Initialize with empty defaults
     info = {
         "field": "",
         "sbid": "",
@@ -1020,34 +1227,25 @@ def parse_candidate_filename(
         "is_super": False,
     }
 
-    # --- Field ---
-    # Try "<field>." prefix (e.g. "LTR_1733-2344.SB..."), else fall back to explicit LTR pattern.
     m_field_prefix = re.match(r'^(?P<field>[^.]+)\.', fname)
     if m_field_prefix:
         info["field"] = m_field_prefix.group("field")
-    else:
-        m_field_alt = re.search(r'(LTR_\d{4}(?:\+/-|[+-])\d{4})', fname)
-        if m_field_alt:
-            info["field"] = m_field_alt.group(1)
 
-    # --- SBID ---
     m_sbid = re.search(r'(SB\d{5,})', fname)
     if m_sbid:
         info["sbid"] = m_sbid.group(1)
 
-    # --- Beam (optional) ---
     m_beam = re.search(r'(beam\d+)', fname)
     if m_beam:
         info["beam"] = m_beam.group(1)
 
-    # --- Scan id (14-digit timestamp) ---
     m_scan = re.search(r'(\d{14})', fname)
     if m_scan:
         info["scan_id"] = m_scan.group(1)
 
-    # --- Kind and shape ("all" vs "super_summary") ---
-    m_kind_super = re.search(r'_(boxcar|variance)_super_summary\.(?:vot|xml|csv)$', fname, re.IGNORECASE)
-    m_kind_all   = re.search(r'_(boxcar|variance)_all\.(?:vot|xml|csv)$', fname, re.IGNORECASE)
+    # NOTE: now includes periodicity
+    m_kind_super = re.search(r'_(boxcar|variance|periodicity)_super_summary\.(?:vot|xml|csv)$', fname, re.IGNORECASE)
+    m_kind_all = re.search(r'_(boxcar|variance|periodicity)_all\.(?:vot|xml|csv)$', fname, re.IGNORECASE)
 
     if m_kind_super:
         info["kind"] = m_kind_super.group(1).lower()
@@ -1056,12 +1254,10 @@ def parse_candidate_filename(
         info["kind"] = m_kind_all.group(1).lower()
         info["is_all"] = True
 
-    # --- Optional strictness ---
     if require == "super" and not info["is_super"]:
         return {k: (False if isinstance(v, bool) else "") for k, v in info.items()}
     if require == "all" and not info["is_all"]:
         return {k: (False if isinstance(v, bool) else "") for k, v in info.items()}
-
     return info
 
 def _connected_components_from_pairs(n: int, i_idx, j_idx) -> List[List[int]]:

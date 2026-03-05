@@ -36,6 +36,9 @@ from fastducc import ms_utils
 # ============================
 
 
+def arcsec_to_rad(x: float) -> float:
+    return x * math.pi / (180.0 * 3600.0)
+
 def lm_from_xy(x: int, y: int,
                npix_x: int, npix_y: int,
                pixsize_x: float, pixsize_y: float,

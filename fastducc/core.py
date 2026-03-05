@@ -100,7 +100,12 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
-                spatial_size=50, save_format="npz",
+                save_format="npz",
+            ))
+            _ = candidates.save_candidate_summary(
+                times=times, cube=cube, candidate=cand,
+                out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_summary",
+                spatial_size=50,
                 center_policy="right", cmap="gray", dpi=180,
                 # WCS / scale
                 npix_x=cfg.npix_x, npix_y=cfg.npix_y,
@@ -108,7 +113,9 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
                 pix_rad=cfg.pix_rad,
                 ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
                 # Draw std-map images on the top panels:
-                std_map=std_map_partial, use_std_images=True
+                std_map=std_map_partial, use_std_images=True,
+                continuum_dir=getattr(cfg, "continuum_dir", None),
+                method="variance",
             )
 
         # Snippet products from std-map (time length = 1)
@@ -161,7 +168,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
         flip_u=True, flip_v=True, field_name=None
     )
 
-    # Save per-chunk BOXCAR catalogue
+    # Save per-chunk boxcar catalogue
     box_root = cfg.chunk_prefix_root(start_idx) + "_boxcar"
     t_box = candidates.candidates_to_astropy_table(annotated)
     candidates.save_candidates_table(t_box,
@@ -174,23 +181,28 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
     for i, cand in enumerate(annotated):
         srcname = cand["srcname"]
         w = max(1, int(cand.get("width_samples", 1)))
-        # Lightcurves figure (top panels show the full-res frame)
+        # Lightcurves figure
         if cfg.save_box_lightcurves:
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
-                spatial_size=50, save_format="npz",
-                center_policy="right", cmap="gray", dpi=180,
-                # WCS / scale:
+                save_format="npz",
+            )
+            _ = candidates.save_candidate_summary(
+                times=times, cube=cube, candidate=cand,
+                out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}",
+                spatial_size=50,
+                center_policy="right", cmap="gray", dpi=300,
                 npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                 ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
                 pix_rad=cfg.pix_rad,
                 ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                # Use full-res images on top panels (std_map=None)
-                std_map=None, use_std_images=False
+                std_map=None, use_std_images=False,
+                continuum_dir=getattr(cfg, "continuum_dir", None),
+                method="boxcar",
             )
 
-        # Extract smoothed snippet (your updated function that uses boxcar smoothing per width)
+        # Extract smoothed snippet
         if cfg.save_box_snippets:
             snippets = candidates.extract_candidate_snippets(
                 times, cube, [cand],   # pass single cand to get one snippet
@@ -404,15 +416,22 @@ def finalise_welford_parallel(
             for i, cand in enumerate(annotated_var):
                 srcname = cand["srcname"]
                 if cfg.save_full_var_lightcurves:
-                    candidates.save_candidate_lightcurves(
-                        all_times, all_cube, cand,
+                    _ = candidates.save_candidate_lightcurves(
+                        times=times, cube=cube, candidate=cand,
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
-                        spatial_size=50, save_format="npz",
+                        save_format="npz",
+                    ))
+                    candidates.save_candidate_summary(
+                        all_times, all_cube, cand,
+                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}",
+                        spatial_size=50,
                         center_policy="right", cmap="gray", dpi=180,
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
                         pix_rad=cfg.pix_rad, ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                        std_map=std_map_full, use_std_images=True
+                        std_map=std_map_full, use_std_images=True,
+                        continuum_dir=getattr(cfg, "continuum_dir", None),
+                        method="variance",
                     )
                 if cfg.save_var_snippets:
                     std_snip = candidates.make_stdmap_snippet(std_map_full, cand, spatial_size=50)
@@ -512,12 +531,22 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     candidates.save_candidate_lightcurves(
                         times, cube, cand,
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
-                        spatial_size=50, save_format="npz",
-                        center_policy="right", cmap="gray", dpi=180,
+                        save_format="npz",
+                    )
+                    _ = candidates.save_candidate_summary(
+                        times=times, cube=cube, candidate=cand,
+                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_summary",
+                        spatial_size=50,
+                        center_policy="right", cmap="gray", dpi=300,
+                        # WCS / scale
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
-                        pix_rad=cfg.pix_rad, ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                        std_map=std_map_partial, use_std_images=True
+                        pix_rad=cfg.pix_rad,
+                        ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
+                        # Draw std-map images on the top panels:
+                        std_map=std_map_partial, use_std_images=True,
+                        continuum_dir=getattr(cfg, "continuum_dir", None),
+                        method="variance",
                     )
                 if cfg.save_var_snippets:
                     std_snip = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
@@ -572,12 +601,22 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     candidates.save_candidate_lightcurves(
                         times, cube, cand,
                         out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
-                        spatial_size=50, save_format="npz",
+                        save_format="npz",
+                    )
+                    _ = candidates.save_candidate_summary(
+                        times=times, cube=cube, candidate=cand,
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}{i:03d}_summary",
+                        spatial_size=50,
                         center_policy="right", cmap="gray", dpi=180,
+                        # WCS / scale
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
-                        pix_rad=cfg.pix_rad, ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                        std_map=None, use_std_images=False
+                        pix_rad=cfg.pix_rad,
+                        ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
+                        # Draw std-map images on the top panels:
+                        std_map=None, use_std_images=False,
+                        continuum_dir=getattr(cfg, "continuum_dir", None),
+                        method="boxcar",
                     )
                 if cfg.save_box_snippets:
                     snippets = candidates.extract_candidate_snippets(

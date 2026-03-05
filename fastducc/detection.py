@@ -30,7 +30,7 @@ except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
 from fastducc import wcs as ducc_wcs
-from fastducc import filters, kernels, candidates, ms_utils, detection
+from fastducc import filters, kernels, candidates, ms_utils
 
 def boxcar_search_time(
     times: np.ndarray,
@@ -451,3 +451,127 @@ def variance_search_welford(
 
     snr_out = snr.astype(np.float32, copy=False) if return_snr_image else None
     return detections, snr_out
+
+
+
+def _ensure_cube_order(cube: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """
+    Ensure (Ny,Nx,Nf) order. If input is (Nf,Ny,Nx), transpose to (Ny,Nx,Nf).
+    Returns (cube_ynxnf, transposed_flag).
+    """
+    if cube.ndim != 3:
+        raise ValueError("periodicity cube must be 3-D")
+    if cube.shape[0] < 8 and cube.shape[1] >= 8 and cube.shape[2] >= 8:
+        return np.transpose(cube, (1, 2, 0)), True
+    return cube, False
+
+def _harmonic_sum_cube(pow_cube_ynxnf: np.ndarray, nharm: int) -> List[np.ndarray]:
+    """
+    Stretch-and-add harmonic summing:
+      S_h(y,x,k) = sum_{m=1..h} P(y,x, m*k)
+    Returns list [S_1, ..., S_nharm], each shaped (Ny,Nx,Nk_h).
+    """
+    Ny, Nx, Nf = pow_cube_ynxnf.shape
+    out = []
+    P = pow_cube_ynxnf.astype(np.float64, copy=False)   # keep numeric stability
+
+    for h in range(1, nharm + 1):
+        Nk = Nf // h
+        if Nk <= 1:
+            out.append(np.zeros((Ny, Nx, 0), dtype=np.float64))
+            continue
+        accum = np.zeros((Ny, Nx, Nk), dtype=np.float64)
+        idx_base = np.arange(Nk, dtype=np.int64)
+        for m in range(1, h + 1):
+            accum += P[:, :, m * idx_base]
+        out.append(accum)
+    return out
+
+
+def detect_periodicity_spatial_snr(
+    cube_pow: np.ndarray,         # (Ny,Nx,Nf) or (Nf,Ny,Nx)
+    f_hz: np.ndarray,             # (Nf,)
+    *,
+    threshold_sigma: float = 7.0,
+    nharm: int = 8,
+    spatial_estimator: str = "clipped_rms",   # "mad" | "clipped_rms"
+    clip_sigma: float = 3.0,
+    valid_mask: Optional[np.ndarray] = None,  # (Ny,Nx) True=valid
+    keep_top_k: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, np.ndarray]]:
+    """
+    Spatial S/N peak finding on (l,m,f) spin-frequency cubes with harmonic summing.
+
+    Output rows include:
+      y,x,snr,f_hz,period_s,nharm_used,algo='periodicity'
+    """
+    if nharm < 1:
+        nharm = 1
+
+    # 1) Ensure order (Ny,Nx,Nf)
+    cube_yx, _ = _ensure_cube_order(cube_pow)
+    Ny, Nx, Nf = cube_yx.shape
+    if f_hz.shape[0] != Nf:
+        raise ValueError("f_hz length must match cube frequency axis")
+
+    # 2) Valid mask
+    if valid_mask is None:
+        valid_mask = np.ones((Ny, Nx), dtype=bool)
+    elif valid_mask.shape != (Ny, Nx):
+        raise ValueError("valid_mask must be shape (Ny, Nx)")
+
+    # 3) Harmonic-summed stacks
+    Hcubes = _harmonic_sum_cube(cube_yx, nharm)
+
+    rows: List[Dict[str, Any]] = []
+
+    # 4) For each harmonic and fundamental bin, compute spatial σ via existing kernels
+    for h, H in enumerate(Hcubes, start=1):
+        if H.size == 0:
+            continue
+        Nk = H.shape[2]
+        for k in range(Nk):
+            img = H[:, :, k].astype(np.float64, copy=False)
+            mask = valid_mask.astype(np.bool_, copy=False)
+
+            if spatial_estimator == "mad":
+                sigma = kernels._mad_sigma_2d(img, mask)
+            elif spatial_estimator == "clipped_rms":
+                sigma = kernels._clipped_rms_sigma_2d(img, mask, clip_sigma=float(clip_sigma))
+            else:
+                raise ValueError(f"Unknown spatial_estimator='{spatial_estimator}'")
+
+            if not np.isfinite(sigma) or sigma <= 0.0:
+                sigma = 1.0
+
+            snr_map = img / sigma
+            ys, xs = np.where((snr_map >= threshold_sigma) & mask)
+            if ys.size == 0:
+                continue
+
+            f0 = float(f_hz[k])
+            if not (np.isfinite(f0) and f0 > 0.0):
+                continue
+            P0 = 1.0 / f0
+
+            snr_vals = snr_map[ys, xs]
+            for y, x, s in zip(ys, xs, snr_vals):
+                rows.append({
+                    "y": int(y),
+                    "x": int(x),
+                    "snr": float(s),
+                    "f_hz": f0,
+                    "period_s": float(P0),
+                    "nharm_used": int(h),
+                    "algo": "periodicity",
+                })
+
+    # 5) Optional Top-K
+    if keep_top_k is not None and len(rows) > keep_top_k:
+        order = np.argsort([r["snr"] for r in rows])[::-1]
+        rows = [rows[i] for i in order[:keep_top_k]]
+
+    return rows, {}
+
+
+

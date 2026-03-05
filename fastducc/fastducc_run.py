@@ -106,13 +106,15 @@ def build_cli():
     parser.set_defaults(save_full_var_lightcurves=False)    
     parser.add_argument('--save-var-snippets',     dest='save_var_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for variance candidates')
     parser.add_argument('--no-save-var-snippets',  dest='save_var_snippets',     action='store_false')
-    parser.set_defaults(save_var_snippets=True)
+    parser.set_defaults(save_var_snippets=False)
     parser.add_argument('--save-box-lightcurves',  dest='save_box_lightcurves',  action='store_true', help='Save lightcurves for boxcar candidates')
     parser.add_argument('--no-save-box-lightcurves',  dest='save_box_lightcurves',  action='store_false')
     parser.set_defaults(save_box_lightcurves=True)
     parser.add_argument('--save-box-snippets',     dest='save_box_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for boxcar candidates')
     parser.add_argument('--no-save-box-snippets',  dest='save_box_snippets',     action='store_false')
-    parser.set_defaults(save_box_snippets=True)
+    parser.set_defaults(save_box_snippets=False)
+    parser.add_argument('--continuum-dir', default=None, help='Path to directory containing deep per-beam continuum FITS images.
+                        'Filenames must include the beam label (e.g., beam03).')
 
     # --- Parallel execution flags ---
     parser.add_argument(
@@ -187,6 +189,61 @@ def build_cli_aggregate_obs(argv=None):
     return p.parse_args(argv)
 
 
+
+def build_cli_periodicity(argv=None):
+    p = argparse.ArgumentParser(
+        prog="fastducc periodicity",
+        description="3-D DUCC NUFFT (u,v,t)->(l,m,f) periodicity search with S/N detection, catalogues and FITS products"
+    )
+    p.add_argument("--msname", required=True, help="Path to Measurement Set")
+    p.add_argument("--spw", type=int, default=0, help="SPW index (default: 0)")
+    p.add_argument("--pol", type=int, default=0, help="Pol index in DATA (default: 0)")
+    p.add_argument("--data-col", default="DATA", help="MS data column (default: DATA)")
+    p.add_argument("--chan-start", type=int, default=None)
+    p.add_argument("--chan-end", type=int, default=None)
+
+    p.add_argument("--npix", type=int, default=384)
+    p.add_argument("--pixscale-arcsec", type=float, default=22.0)
+    p.add_argument("--fmin", type=float, default=0.5, help="Minimum spin frequency to keep (Hz)")
+    p.add_argument("--dm", type=float, default=0.0, help="Dispersion Measure (pc cm^-3)")
+    p.add_argument("--eps", type=float, default=1e-7, help="DUCC NUFFT tolerance")
+    p.add_argument("--nfft-t", type=int, default=None, help="Length of frequency axis (power of 2)")
+    p.add_argument("--block-rows", type=int, default=20000)
+    p.add_argument("--partials-dir", default="partials_periodicity")
+    p.add_argument("--sum-memmap", default="periodicity_sum_complex.dat")
+    p.add_argument("--nthreads", type=int, default=0)
+
+    # outputs
+    p.add_argument("--out-cube-fits", default="periodicity_cube_pow.fits")
+    p.add_argument("--write-products", action="store_true", help="Write additional 2D products (maxpow, bestfreq, PNG)")
+    p.add_argument("--no-write-products", dest="write_products", action="store_false")
+    p.set_defaults(write_products=True)
+
+    # detection flags
+    p.add_argument("--detect", action="store_true", help="Run spatial S/N detection on the spin-frequency cube")
+    p.add_argument("--no-detect", dest="detect", action="store_false")
+    p.set_defaults(detect=True)
+
+    p.add_argument("--threshold-sigma", type=float, default=7.0)
+    p.add_argument("--nharm", type=int, default=8)
+    p.add_argument("--keep-top-k", type=int, default=None)
+    p.add_argument("--spatial-estimator", choices=["clipped_rms", "mad"], default="clipped_rms")
+    p.add_argument("--clip-sigma", type=float, default=3.0)
+
+    # catalogue outputs
+    p.add_argument("--out-csv", default=None, help="Override candidate CSV output path")
+    p.add_argument("--out-vot", default=None, help="Override candidate VOT output path")
+
+    # parallel execution
+    p.add_argument("--parallel-mode", choices=["serial", "dask-local"], default="serial")
+    p.add_argument("--dask-workers", type=int, default=0)
+    p.add_argument("--threads-per-worker", type=int, default=1)
+    p.add_argument("--dask-scheduler", choices=["processes", "threads"], default="processes")
+    p.add_argument("--scheduler-address", default=None, help="Existing Dask scheduler address")
+
+    return p.parse_args(argv)
+
+
 def make_config(args, paths) -> Config:
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = paths
     ra0_rad, dec0_rad, _ = ms_utils.get_phase_center(args.msname, field_name=None)
@@ -212,6 +269,7 @@ def make_config(args, paths) -> Config:
         do_plot=args.do_plot,
         ms_base=ms_base, candidates_dir=candidates_dir,
         chunk_prefix_root=chunk_prefix_root, all_prefix_root=all_prefix_root
+        continuum_dir=args.continuum_dir
     )
 
 def main_serial(args):

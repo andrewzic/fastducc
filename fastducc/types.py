@@ -37,6 +37,7 @@ class Config:
     save_var_snippets: bool
     save_box_lightcurves: bool
     save_box_snippets: bool
+    continuum_dir: Optional[str] | None
 
 @dataclass
 class WelfordState:
