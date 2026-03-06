@@ -113,8 +113,7 @@ def build_cli():
     parser.add_argument('--save-box-snippets',     dest='save_box_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for boxcar candidates')
     parser.add_argument('--no-save-box-snippets',  dest='save_box_snippets',     action='store_false')
     parser.set_defaults(save_box_snippets=False)
-    parser.add_argument('--continuum-dir', default=None, help='Path to directory containing deep per-beam continuum FITS images.
-                        'Filenames must include the beam label (e.g., beam03).')
+    parser.add_argument('--continuum-dir', default=None, help='Path to directory containing deep per-beam continuum FITS images. Filenames must include the beam label (e.g., beam03).')
 
     # --- Parallel execution flags ---
     parser.add_argument(
