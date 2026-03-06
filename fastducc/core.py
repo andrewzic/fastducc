@@ -101,7 +101,7 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
                 save_format="npz",
-            ))
+            )
             _ = candidates.save_candidate_summary(
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_summary",
