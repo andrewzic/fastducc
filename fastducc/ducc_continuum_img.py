@@ -1,28 +1,5 @@
-import ducc_fast_imager_numba as ducc
 import argparse
-import glob
-import os
-import shutil
-import sys
-from typing import Iterable, Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
-
-from numba import njit, prange
-import numpy as np
-import math
-from tqdm import tqdm
-
-import astropy.constants as const
-import astropy.units as u
-from astropy.visualization.wcsaxes import WCSAxes
-from astropy.wcs import WCS
 from astropy.io import fits
-from astropy.table import Table
-
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-
-from scipy.ndimage import maximum_filter
 
 from casacore.tables import table
 try:
@@ -57,8 +34,6 @@ def main():
 
     # Discover total number of time chunks via iter
     t_main = table(args.msname, readonly=True)
-    colnames = set(t_main.colnames())    
-
 
     cont_img = ducc.continuum_image(msname=args.msname,
                                     t_main=t_main,

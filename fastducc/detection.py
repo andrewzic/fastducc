@@ -1,36 +1,12 @@
-import argparse
-import glob
-import os
-import shutil
-import sys
 from typing import Iterable, Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
-
-from numba import njit, prange
 import numpy as np
-import math
-from tqdm import tqdm
 
-import astropy.constants as const
-import astropy.units as u
-from astropy.visualization.wcsaxes import WCSAxes
-from astropy.wcs import WCS
-from astropy.io import fits
-from astropy.table import Table, vstack
-
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-
-from scipy.ndimage import maximum_filter
-
-from casacore.tables import table
 try:
     import ducc0
 except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
-from fastducc import wcs as ducc_wcs
-from fastducc import filters, kernels, candidates, ms_utils
+from fastducc import kernels
 
 def boxcar_search_time(
     times: np.ndarray,

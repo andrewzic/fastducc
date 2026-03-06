@@ -267,8 +267,13 @@ def finalise_welford(cfg: Config, wf: WelfordState, times, cube):
         pixscale_rad=cfg.pix_rad, ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None
     )
     hdr = wcs_full.to_header()
-    hdr["BUNIT"] = "std"; hdr["CDELT1"] = wcs_full.wcs.cdelt[0]; hdr["CDELT2"] = wcs_full.wcs.cdelt[1]
-    hdr["PC1_1"] = 1.0; hdr["PC1_2"] = 0.0; hdr["PC2_1"] = 0.0; hdr["PC2_2"] = 1.0
+    hdr["BUNIT"] = "std" 
+    hdr["CDELT1"] = wcs_full.wcs.cdelt[0] 
+    hdr["CDELT2"] = wcs_full.wcs.cdelt[1]
+    hdr["PC1_1"] = 1.0 
+    hdr["PC1_2"] = 0.0 
+    hdr["PC2_1"] = 0.0 
+    hdr["PC2_2"] = 1.0
     full_std_fits = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_std_map_full.fits")
     fits.writeto(full_std_fits, data=std_map_full.astype(np.float32), header=hdr, overwrite=True)
 
@@ -373,8 +378,10 @@ def finalise_welford_parallel(
     hdr["BUNIT"]  = "std"
     hdr["CDELT1"] = wcs_full.wcs.cdelt[0]
     hdr["CDELT2"] = wcs_full.wcs.cdelt[1]
-    hdr["PC1_1"]  = 1.0; hdr["PC1_2"] = 0.0
-    hdr["PC2_1"]  = 0.0; hdr["PC2_2"] = 1.0
+    hdr["PC1_1"]  = 1.0 
+    hdr["PC1_2"] = 0.0
+    hdr["PC2_1"]  = 0.0 
+    hdr["PC2_2"] = 1.0
 
     full_std_fits = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_std_map_full.fits")
     fits.writeto(full_std_fits, data=std_map_full.astype(np.float32), header=hdr, overwrite=True)
@@ -420,7 +427,7 @@ def finalise_welford_parallel(
                         times=times, cube=cube, candidate=cand,
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
                         save_format="npz",
-                    ))
+                    )
                     candidates.save_candidate_summary(
                         all_times, all_cube, cand,
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}",

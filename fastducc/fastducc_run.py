@@ -1,27 +1,6 @@
 import argparse
-import glob
 import os
-import shutil
 import sys
-from typing import Iterable, Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
-
-from numba import njit, prange
-import numpy as np
-import math
-from tqdm import tqdm
-
-import astropy.constants as const
-import astropy.units as u
-from astropy.visualization.wcsaxes import WCSAxes
-from astropy.wcs import WCS
-from astropy.io import fits
-from astropy.table import Table, vstack
-
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-
-from scipy.ndimage import maximum_filter
 
 from casacore.tables import table
 try:
@@ -29,10 +8,8 @@ try:
 except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
-
-from fastducc import wcs as ducc_wcs
-from fastducc.types import Config, WelfordState
-from fastducc import filters, kernels, candidates, ms_utils, detection, imaging
+from fastducc.types import Config
+from fastducc import candidates, ms_utils, imaging
 from fastducc import core as fd_core
 from fastducc.catalogues import get_psrcat_csv_path, get_racs_vot_path
 
@@ -267,7 +244,7 @@ def make_config(args, paths) -> Config:
         boxcar_widths=args.boxcar_widths, boxcar_threshold=args.threshold_sigma,
         do_plot=args.do_plot,
         ms_base=ms_base, candidates_dir=candidates_dir,
-        chunk_prefix_root=chunk_prefix_root, all_prefix_root=all_prefix_root
+        chunk_prefix_root=chunk_prefix_root, all_prefix_root=all_prefix_root,
         continuum_dir=args.continuum_dir
     )
 
@@ -321,6 +298,7 @@ def main_serial(args):
         # Boxcar chunk
         box_ann = fd_core.process_boxcar_chunk(cfg, times, cube, start)
 
+        #should this do something else with the annotations? maybe save per-chunk candidates if enabled?
         start = end + 1
         chunk_id += 1
 

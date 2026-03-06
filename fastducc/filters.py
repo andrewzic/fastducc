@@ -1,36 +1,12 @@
-import argparse
-import glob
-import os
-import shutil
-import sys
-from typing import Iterable, Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
-
-from numba import njit, prange
+from typing import Tuple, List, Dict, Any, Optional
 import numpy as np
-import math
-from tqdm import tqdm
-
-import astropy.constants as const
-import astropy.units as u
-from astropy.visualization.wcsaxes import WCSAxes
-from astropy.wcs import WCS
-from astropy.io import fits
-from astropy.table import Table, vstack
-
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
 
 from scipy.ndimage import maximum_filter
 
-from casacore.tables import table
 try:
     import ducc0
 except Exception as e:
     raise RuntimeError('ducc0 is required') from e
-
-from fastducc import kernels
-
 
 def nms_snr_map_2d(
     snr_2d: np.ndarray,                      # (Ny, Nx) SNR map
@@ -266,8 +242,10 @@ def group_filter_across_widths(
         max_x = -1
         for dets in by_time.values():
             for d in dets:
-                if d["y"] > max_y: max_y = d["y"]
-                if d["x"] > max_x: max_x = d["x"]
+                if d["y"] > max_y: 
+                    max_y = d["y"]
+                if d["x"] > max_x: 
+                    max_x = d["x"]
         Ny = max_y + 1 if max_y >= 0 else 1
         Nx = max_x + 1 if max_x >= 0 else 1
     else:
@@ -300,7 +278,8 @@ def group_filter_across_widths(
 
         kept = 0
         for d in dets_sorted:
-            y = int(d["y"]); x = int(d["x"])
+            y = int(d["y"]); 
+            x = int(d["x"])
             # If spatial spot already suppressed for this center, skip
             if not occ_by_center[center_idx][y, x]:
                 continue

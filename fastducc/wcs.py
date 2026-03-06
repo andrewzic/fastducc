@@ -1,29 +1,9 @@
-import argparse
-import glob
-import os
-import shutil
-import sys
-from typing import Iterable, Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
-
-from numba import njit, prange
+from typing import Tuple, List, Dict, Any
 import numpy as np
 import math
-from tqdm import tqdm
 
-import astropy.constants as const
-import astropy.units as u
-from astropy.visualization.wcsaxes import WCSAxes
 from astropy.wcs import WCS
-from astropy.io import fits
-from astropy.table import Table, vstack
 
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-
-from scipy.ndimage import maximum_filter
-
-from casacore.tables import table
 try:
     import ducc0
 except Exception as e:
@@ -178,7 +158,8 @@ def annotate_candidates_with_sky_coords(
     ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(msname, field_name) 
     out = []
     for det in final_detections:
-        x = int(det["x"]); y = int(det["y"])
+        x = int(det["x"])
+        y = int(det["y"])
         l, m = lm_from_xy(x, y, npix_x, npix_y, pixsize_x, pixsize_y, flip_u, flip_v)
         ra, dec = radec_from_lm(l, m, ra0_rad, dec0_rad)
         ra_hms, dec_dms = rad_to_hmsdms(ra, dec)

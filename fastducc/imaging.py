@@ -1,27 +1,8 @@
-import argparse
-import glob
-import os
-import shutil
 import sys
-from typing import Iterable, Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import Any
 
-from numba import njit, prange
 import numpy as np
-import math
 from tqdm import tqdm
-
-import astropy.constants as const
-import astropy.units as u
-from astropy.visualization.wcsaxes import WCSAxes
-from astropy.wcs import WCS
-from astropy.io import fits
-from astropy.table import Table, vstack
-
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-
-from scipy.ndimage import maximum_filter
 
 from casacore.tables import table
 try:
@@ -83,8 +64,6 @@ def continuum_image(
         print("reading table from msname {msname}")
         t_main = table(msname, readonly=True)
         
-    colnames = set(t_main.colnames())
-
     # Frequencies
     t_spw = table(f"{msname}/SPECTRAL_WINDOW", readonly=True)
     n_spw = t_spw.nrows()

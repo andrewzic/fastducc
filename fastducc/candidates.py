@@ -1,42 +1,31 @@
 # -*- coding: utf-8 -*-
-import argparse
 import glob
 import os
-import shutil
 import itertools
-import sys
 import re
-from typing import Iterable, Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import Tuple, List, Dict, Any, Optional
 
-from numba import njit, prange
 import numpy as np
 import math
-from tqdm import tqdm
 
-import astropy.constants as const
 import astropy.units as u
 from astropy.coordinates import SkyCoord
-from astropy.visualization.wcsaxes import WCSAxes
 from astropy.wcs import WCS
 from astropy.io import fits
 from astropy.table import Table, vstack
 
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 from matplotlib.animation import FuncAnimation, PillowWriter
 from ligo.skymap.plot.marker import reticle
 
-from scipy.ndimage import maximum_filter
 
-from casacore.tables import table
 try:
     import ducc0
 except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
 from fastducc import wcs as ducc_wcs
-from fastducc import filters, kernels, ms_utils, detection
+from fastducc import kernels
 
 def make_stdmap_snippet(
     std_map: np.ndarray,                # (Ny, Nx)
@@ -660,8 +649,10 @@ def save_candidate_summary(
         dec_c = dec0_rad
 
     half_sp = spatial_size // 2
-    y0 = max(0, y - half_sp); y1 = min(Ny, y0 + spatial_size)
-    x0 = max(0, x - half_sp); x1 = min(Nx, x0 + spatial_size)
+    y0 = max(0, y - half_sp)
+    y1 = min(Ny, y0 + spatial_size)
+    x0 = max(0, x - half_sp)
+    x1 = min(Nx, x0 + spatial_size)
     cutout_det = frame_for_display[y0:y1, x0:x1]
     wcs_cut = ducc_wcs._build_tan_wcs_for_snippet(
         spatial_size=cutout_det.shape[0],
@@ -834,8 +825,10 @@ def save_candidate_summary(
     hdr["CDELT2"] = wcs_cut.wcs.cdelt[1]
     
     # Identity PC
-    hdr["PC1_1"] = 1.0; hdr["PC1_2"] = 0.0
-    hdr["PC2_1"] = 0.0; hdr["PC2_2"] = 1.0
+    hdr["PC1_1"] = 1.0
+    hdr["PC1_2"] = 0.0
+    hdr["PC2_1"] = 0.0
+    hdr["PC2_2"] = 1.0
     
     # Frame metadata if present
     if getattr(wcs_cut.wcs, "radesys", None):
@@ -990,8 +983,6 @@ def save_candidate_snippet_products(snippet_rec: dict,
     vmax = np.nanpercentile(det_frame, 99.5)
 
     out_gif  = f"{out_prefix}_snippet.gif"
-    out_png  = f"{out_prefix}_det.png"
-    out_fits = f"{out_prefix}_det.fits"
 
     # 1) Animated GIF with WCSAxes
     fig = plt.figure(figsize=(10, 10), dpi=dpi)
@@ -1545,7 +1536,10 @@ def aggregate_beam_candidate_tables(
             print(f"[Aggregate] Skipping '{p}' (read error: {e})")
             continue
         meta = parse_candidate_filename(p, require="all")
-        field_name = meta["field"]; sbid = meta["sbid"]; beam_id = meta["beam"]; scan_id = meta["scan_id"]
+        field_name = meta["field"]
+        sbid = meta["sbid"]
+        beam_id = meta["beam"]
+        scan_id = meta["scan_id"]
         for col in ("time_center", "ra_deg", "dec_deg", "snr"):
             if col not in t.colnames:
                 raise ValueError(f"Missing required column '{col}' in {p}")
@@ -1564,8 +1558,10 @@ def aggregate_beam_candidate_tables(
             names.append('width_samples')
         names += ['scan_ids', 'n_beams', 'n_detections']
         out = Table(names=names)
-        if out_csv: out.write(out_csv, format='csv', overwrite=True)
-        if out_vot: out.write(out_vot, format='votable', overwrite=True)
+        if out_csv: 
+            out.write(out_csv, format='csv', overwrite=True)
+        if out_vot: 
+            out.write(out_vot, format='votable', overwrite=True)
         return out
 
     # ------------------- Event-level aggregation -------------------
@@ -1671,8 +1667,10 @@ def aggregate_beam_candidate_tables(
         colnames.append('width_samples')
     colnames += ['scan_ids', 'n_beams', 'n_detections']
     event_tab = Table(rows=[[ev.get(c) for c in colnames] for ev in events], names=colnames)
-    if out_csv: event_tab.write(out_csv, format='csv', overwrite=True)
-    if out_vot: event_tab.write(out_vot, format='votable', overwrite=True)
+    if out_csv: 
+        event_tab.write(out_csv, format='csv', overwrite=True)
+    if out_vot: 
+        event_tab.write(out_vot, format='votable', overwrite=True)
 
     # ------------------- Super-summary within scan -------------------
     # Reuse sky clustering on the *event* table (time-marginalised).
@@ -1751,7 +1749,8 @@ def aggregate_beam_candidate_tables(
         super_csv = out_csv.replace("_summary.csv", "_super_summary.csv") if out_csv else None
         super_vot = out_vot.replace("_summary.vot", "_super_summary.vot") if out_vot else None
     except Exception:
-        super_csv = None; super_vot = None
+        super_csv = None 
+        super_vot = None
     if not super_csv:
         super_csv = os.path.join(out_dir, f"field_{kind}_super_summary.csv")
     if not super_vot:
@@ -2120,7 +2119,10 @@ def aggregate_observation_from_super_summaries(
     for p in files:
         # FIX: require='super' for super-summary files
         meta = parse_candidate_filename(p, require='super')
-        f_field = meta['field']; f_sbid = meta['sbid']; f_scan = meta['scan_id']; f_kind = meta['kind']
+        f_field = meta['field'] 
+        f_sbid = meta['sbid']
+        f_scan = meta['scan_id']
+        f_kind = meta['kind']
         if f_kind != kind:
             continue
         if field_for_name is None and f_field:
