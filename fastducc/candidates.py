@@ -526,6 +526,19 @@ def save_candidate_lightcurves(
     x = int(candidate["x"])
     w = max(1, int(candidate.get("width_samples", 1)))
 
+    # Preferred smoothed start index, else derive from center_idx
+    if "t0_idx" in candidate:
+        
+        t0_idx = int(candidate["t0_idx"])
+        
+    else:
+        cidx = int(candidate.get("center_idx", 0))
+        t0_idx = cidx - (w // 2) if (center_policy == "right") else cidx - ((w - 1) // 2)
+        t0_idx = max(0, min(t0_idx, T - w))
+
+    offset = (w // 2) if (center_policy == "right") else ((w - 1) // 2)
+    t_full_center = max(0, min(t0_idx + offset, T - 1))
+
     # --- Full-res light curve at the candidate pixel ---
     lc_full = cube[:, y, x].astype(np.float64, copy=False)
 
