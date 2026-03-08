@@ -62,6 +62,15 @@ def build_cli():
     )
     parser.set_defaults(enable_boxcar=True)
     parser.add_argument(
+        '--do-boxcar-search', dest='do_boxcar_search', action='store_true',
+        help='Perform boxcar transient search (default: enabled)'
+    )
+    parser.add_argument(
+        '--no-boxcar-search', dest='do_boxcar_search', action='store_false',
+        help='Disable boxcar transient search'
+    )
+    parser.set_defaults(do_boxcar_search=True)
+    parser.add_argument(
         '--enable-var', dest='enable_var', action='store_true',
         help='Enable variance (std-map/Welford) variability search (default: enabled)'
     )
@@ -71,6 +80,15 @@ def build_cli():
     )
     parser.set_defaults(enable_var=True)
     parser.add_argument(
+        '--do-var-search', dest='do_var_search', action='store_true',
+        help='Perform variance (std-map/Welford) variability search (default: enabled)'
+    )
+    parser.add_argument(
+        '--no-var-search', dest='do_var_search', action='store_false', 
+        help='Disable variance (std-map/Welford) variability search'
+    )
+    parser.set_defaults(do_var_search=True)
+    parser.add_argument(
         '--enable-var-chunk', dest='enable_var_chunk', action='store_true',
         help='Enable variance (std-map/Welford) variability search per chunk (default: disabled)'
     )
@@ -79,6 +97,7 @@ def build_cli():
         help='Disable variance (std-map/Welford) variability search per chunk'
     )
     parser.set_defaults(enable_var_chunk=False)
+    parser.add_argument('--plot-cands-only', dest='plot_cands_only', action='store_true', help='When plotting is enabled, only read and plot candidates instead of searching for them')
     parser.add_argument('--save-var-lightcurves',  dest='save_var_lightcurves',  action='store_true', help='Save lightcurves for variance candidates')
     parser.add_argument('--no-save-var-lightcurves',  dest='save_var_lightcurves',  action='store_false')
     parser.set_defaults(save_var_lightcurves=True)
@@ -237,6 +256,8 @@ def make_config(args, paths) -> Config:
         corr_mode=args.corr_mode, basis=args.basis, single_pol=args.single_pol,
         data_column=args.data_column,
         enable_var=args.enable_var, enable_boxcar=args.enable_boxcar,
+        do_var_search=args.do_var_search, do_boxcar_search=args.do_boxcar_search,
+        plot_cands_only=args.plot_cands_only,
         enable_var_chunk=args.enable_var_chunk,
         save_var_lightcurves=args.save_var_lightcurves,
         save_full_var_lightcurves=args.save_full_var_lightcurves,

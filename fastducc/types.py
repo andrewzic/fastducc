@@ -19,8 +19,10 @@ class Config:
     single_pol: str
     data_column: str
     enable_var: bool
+    do_var_search: bool
     enable_var_chunk: bool
     enable_boxcar: bool
+    do_boxcar_search: bool
     var_threshold: float
     var_keep_k: Optional[int]
     rms_clip_sigma: float
@@ -28,6 +30,7 @@ class Config:
     boxcar_widths: List[int]
     boxcar_threshold: float
     do_plot: bool
+    plot_cands_only: bool
     ms_base: str
     candidates_dir: str
     chunk_prefix_root: Any

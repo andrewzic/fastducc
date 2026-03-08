@@ -479,36 +479,49 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     # Optional per-chunk variance search
     if cfg.enable_var and cfg.enable_var_chunk:
         std_map_partial = kernels.welford_finalise_std(c, M2, ddof=1)
-        var_dets, snr_img = detection.variance_search_welford(
-            std_map_partial,
-            threshold_sigma=cfg.var_threshold,
-            return_snr_image=True,
-            keep_top_k=cfg.var_keep_k,
-            valid_mask=None,
-            spatial_estimator="clipped_rms",
-            clip_sigma=cfg.rms_clip_sigma,
-            subtract_mean_of_std_map=True
-        )
-        if len(var_dets) > 0:
-            var_nms = filters.nms_snr_map_2d(
-                snr_2d=snr_img, base_detections=var_dets,
+        if cfg.do_var_search:
+            var_dets, snr_img = detection.variance_search_welford(
+                std_map_partial,
                 threshold_sigma=cfg.var_threshold,
-                spatial_radius=cfg.nms_radius,
+                return_snr_image=True,
+                keep_top_k=cfg.var_keep_k,
                 valid_mask=None,
-                times=times, cube=cube, time_tag_policy="peak_absdev"
+                spatial_estimator="clipped_rms",
+                clip_sigma=cfg.rms_clip_sigma,
+                subtract_mean_of_std_map=True
             )
-            annotated_var = ducc_wcs.annotate_candidates_with_sky_coords(
-                msname=cfg.msname, final_detections=var_nms,
-                npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
-                flip_u=True, flip_v=True, field_name=None
-            )
-            var_root = chunk_root + "_var"
-            t_var = candidates.candidates_to_astropy_table(annotated_var)
-            candidates.save_candidates_table(t_var,
-                                             csv_path=f"{var_root}_candidates.csv",
-                                             vot_path=f"{var_root}_candidates.vot"
-                                             )
+            if len(var_dets) > 0:
+                var_nms = filters.nms_snr_map_2d(
+                    snr_2d=snr_img, base_detections=var_dets,
+                    threshold_sigma=cfg.var_threshold,
+                    spatial_radius=cfg.nms_radius,
+                    valid_mask=None,
+                    times=times, cube=cube, time_tag_policy="peak_absdev"
+                )
+                annotated_var = ducc_wcs.annotate_candidates_with_sky_coords(
+                    msname=cfg.msname, final_detections=var_nms,
+                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                    pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
+                    flip_u=True, flip_v=True, field_name=None
+                )
+                var_root = chunk_root + "_var"
+                t_var = candidates.candidates_to_astropy_table(annotated_var)
+                candidates.save_candidates_table(t_var,
+                                                csv_path=f"{var_root}_candidates.csv",
+                                                vot_path=f"{var_root}_candidates.vot"
+                                                )
+            elif cfg.plot_cands_only:
+                vot_path = f"{var_root}_candidates.vot"
+                if os.path.exists(vot_path):
+                    annotated_var = candidates.astropy_table_to_candidates(vot_path)
+                else:
+                    vot_path = os.path.join(candidates_dir, f"{ms_base}_variance_all.vot")
+                    if os.path.exists(vot_path):
+                        annotated_var = candidates.astropy_table_to_candidates(vot_path)
+                    else:
+                        annotated_var = []
+                        print("[Warning] No candidates found for plotting: no vot files at {var_root}_candidates.vot or {ms_base}_variance_all.vot")
+                        #raise FileNotFoundError(f"No vot files found at {var_root}_candidates.vot or {ms_base}_variance_all.vot")
             for i, cand in enumerate(annotated_var):
                 srcname = cand["srcname"]
                 if cfg.save_var_lightcurves:
@@ -544,79 +557,93 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
 
     # Optional boxcar search
     if cfg.enable_boxcar:
-        dets, snr_cubes = detection.boxcar_search_time(
-            times, cube,
-            widths=cfg.boxcar_widths,
-            widths_in_seconds=False,
-            threshold_sigma=cfg.boxcar_threshold,
-            return_snr_cubes=True,
-            keep_top_k=50,
-            std_mode="spatial_per_window",
-            subtract_mean_per_pixel=True
-        )
-        dets_by_w = filters.nms_snr_maps_per_width(
-            snr_cubes, times,
-            threshold_sigma=cfg.boxcar_threshold,
-            spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None
-        )
-        final_dets = filters.group_filter_across_widths(
-            dets_by_w, times,
-            spatial_radius=cfg.nms_radius, time_radius=0,
-            policy="max_snr", max_per_time_group=1,
-            ny_nx=(cube.shape[1], cube.shape[2])
-        )
-        if len(final_dets) > 0:
-            annotated = ducc_wcs.annotate_candidates_with_sky_coords(
-                msname=cfg.msname, final_detections=final_dets,
-                npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
-                flip_u=True, flip_v=True, field_name=None
+        if cfg.do_boxcar_search:
+            dets, snr_cubes = detection.boxcar_search_time(
+                times, cube,
+                widths=cfg.boxcar_widths,
+                widths_in_seconds=False,
+                threshold_sigma=cfg.boxcar_threshold,
+                return_snr_cubes=True,
+                keep_top_k=50,
+                std_mode="spatial_per_window",
+                subtract_mean_per_pixel=True
             )
-            box_root = chunk_root + "_boxcar"
-            t_box = candidates.candidates_to_astropy_table(annotated)
-            candidates.save_candidates_table(t_box,
-                csv_path=f"{box_root}_candidates.csv",
-                vot_path=f"{box_root}_candidates.vot"
+            dets_by_w = filters.nms_snr_maps_per_width(
+                snr_cubes, times,
+                threshold_sigma=cfg.boxcar_threshold,
+                spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None
             )
-            for i, cand in enumerate(annotated):
-                w = max(1, int(cand.get("width_samples", 1)))
-                if cfg.save_box_lightcurves:
-                    srcname = cand["srcname"]
-                    candidates.save_candidate_lightcurves(
-                        times, cube, cand,
-                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
-                        save_format="npz",
-                    )
-                    _ = candidates.save_candidate_summary(
-                        times=times, cube=cube, candidate=cand,
-                        out_prefix=f"{box_root}_cand_{srcname}_w{w}{i:03d}_summary",
-                        spatial_size=50,
-                        center_policy="right", cmap="gray", dpi=180,
-                        # WCS / scale
-                        npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                        ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
-                        pix_rad=cfg.pix_rad,
-                        ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                        # Draw std-map images on the top panels:
-                        std_map=None, use_std_images=False,
-                        continuum_dir=getattr(cfg, "continuum_dir", None),
-                        method="boxcar",
-                    )
-                if cfg.save_box_snippets:
-                    snippets = candidates.extract_candidate_snippets(
-                        times, cube, [cand],
-                        spatial_size=50, time_factor=50,
-                        pad_mode="constant", pad_value=0.0,
-                        return_indices=True, center_policy="right"
-                    )
-                    snip = snippets[0]
-                    candidates.save_candidate_snippet_products(
-                        snippet_rec=snip,
-                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
-                        pixscale_rad=cfg.pix_rad,
-                        ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                        ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
-                    )
+            final_dets = filters.group_filter_across_widths(
+                dets_by_w, times,
+                spatial_radius=cfg.nms_radius, time_radius=0,
+                policy="max_snr", max_per_time_group=1,
+                ny_nx=(cube.shape[1], cube.shape[2])
+            )
+            if len(final_dets) > 0:
+                annotated = ducc_wcs.annotate_candidates_with_sky_coords(
+                    msname=cfg.msname, final_detections=final_dets,
+                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                    pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
+                    flip_u=True, flip_v=True, field_name=None
+                )
+                box_root = chunk_root + "_boxcar"
+                t_box = candidates.candidates_to_astropy_table(annotated)
+                candidates.save_candidates_table(t_box,
+                    csv_path=f"{box_root}_candidates.csv",
+                    vot_path=f"{box_root}_candidates.vot"
+                )
+            else:
+                annotated = []
+        elif cfg.plot_cands_only:
+                vot_path = f"{box_root}_candidates.vot"
+                if os.path.exists(box_path):
+                    annotated = candidates.astropy_table_to_candidates(box_path)
+                else:
+                    vot_path = os.path.join(candidates_dir, f"{ms_base}_boxcar_all.vot")
+                    if os.path.exists(box_path):
+                        annotated = candidates.astropy_table_to_candidates(box_path)
+                    else:
+                        annotated = []
+                        print("[Warning] No candidates found for plotting: no vot files at {box_root}_candidates.vot or {ms_base}_boxcar_all.vot")            
+        for i, cand in enumerate(annotated):
+            w = max(1, int(cand.get("width_samples", 1)))
+            if cfg.save_box_lightcurves:
+                srcname = cand["srcname"]
+                candidates.save_candidate_lightcurves(
+                    times, cube, cand,
+                    out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
+                    save_format="npz",
+                )
+                _ = candidates.save_candidate_summary(
+                    times=times, cube=cube, candidate=cand,
+                    out_prefix=f"{box_root}_cand_{srcname}_w{w}{i:03d}_summary",
+                    spatial_size=50,
+                    center_policy="right", cmap="gray", dpi=180,
+                    # WCS / scale
+                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                    ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
+                    pix_rad=cfg.pix_rad,
+                    ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
+                    # Draw std-map images on the top panels:
+                    std_map=None, use_std_images=False,
+                    continuum_dir=getattr(cfg, "continuum_dir", None),
+                    method="boxcar",
+                )
+            if cfg.save_box_snippets:
+                snippets = candidates.extract_candidate_snippets(
+                    times, cube, [cand],
+                    spatial_size=50, time_factor=50,
+                    pad_mode="constant", pad_value=0.0,
+                    return_indices=True, center_policy="right"
+                )
+                snip = snippets[0]
+                candidates.save_candidate_snippet_products(
+                    snippet_rec=snip,
+                    out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
+                    pixscale_rad=cfg.pix_rad,
+                    ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
+                    ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
+                )
 
     if cfg.save_full_var_lightcurves:
         return times, cube, c, m, M2
