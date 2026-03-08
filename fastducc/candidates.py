@@ -3,7 +3,8 @@ import glob
 import os
 import itertools
 import re
-from typing import Tuple, List, Dict, Any, Optional
+from typing import IO, Iterable, Tuple, List, Dict, Any, Optional, Union
+from zipfile import Path
 
 import numpy as np
 import math
@@ -415,6 +416,95 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
 
     return t
 
+
+def _row_value_to_python(val: Any) -> Any:
+    """
+    Convert an Astropy Table row cell to a plain Python type.
+    - Quantities -> numeric values in their current units
+    - numpy scalars -> Python scalars
+    - masked -> None
+    """
+    # Handle numpy masked scalars/constants
+    try:
+        import numpy.ma as ma
+        if isinstance(val, ma.MaskedConstant):
+            return None
+        if hasattr(val, "mask") and getattr(val, "mask", False) is True:
+            return None
+    except Exception:
+        pass
+
+    # Handle astropy Quantity-like values (Row returns scalar Quantity for unit columns)
+    # Using a duck-typed check: Quantity has .unit and .value
+    if hasattr(val, "unit") and hasattr(val, "value"):
+        scalar = val.value
+        # Convert numpy scalar to Python scalar if needed
+        if isinstance(scalar, np.generic):
+            return scalar.item()
+        return scalar
+
+    # Convert numpy scalars to Python scalars
+    if isinstance(val, np.generic):
+        return val.item()
+
+    # Convert bytes to str (VOTable text can occasionally round-trip as bytes)
+    if isinstance(val, (bytes, bytearray)):
+        return val.decode("utf-8", errors="replace")
+
+    return val
+
+
+def astropy_table_to_candidates(source: Union[str, Path, IO[bytes], IO[str], Table], 
+                                *, 
+                                drop_derived: bool = False, 
+                                subset_keys: Optional[Iterable[str]] = None,
+                                ) -> List[Dict[str, Any]]:
+    """
+    Convert an Astropy Table back into a list of candidate dicts.
+    This is the inverse of candidates_to_astropy_table, but may be lossy if the table was modified.
+
+    Parameters
+    ----------
+    table : astropy.table.Table
+        Input table with columns corresponding to candidate fields.
+
+    Returns
+    -------
+    candidates : list of dict
+        List of candidate dictionaries with keys matching the original schema.
+    """
+
+    # Load table
+    if isinstance(source, Table):
+        t = source
+    else:
+        t = Table.read(source, format="votable")
+
+    if len(t) == 0:
+        return []
+
+    colnames = list(t.colnames)
+
+    # Optionally drop derived columns
+    if drop_derived:
+        for k in ("ra_deg", "dec_deg"):
+            if k in colnames:
+                colnames.remove(k)
+
+    # Optionally restrict to a subset of keys
+    if subset_keys is not None:
+        subset = set(subset_keys)
+        colnames = [c for c in colnames if c in subset]
+
+    candidates: List[Dict[str, Any]] = []
+    for row in t:
+        d: Dict[str, Any] = {}
+        for c in colnames:
+            d[c] = _row_value_to_python(row[c])
+        candidates.append(d)
+    return candidates
+
+
 def save_candidates_table(table: Table, csv_path: str, vot_path: str) -> None:
     """
     Save the Astropy Table to CSV and VOTable.
@@ -715,11 +805,11 @@ def save_candidate_summary(
 
     # --- figure layout ---
     out_fig = f"{out_prefix}_summary.pdf"
-    fig = plt.figure(figsize=(12, 9), dpi=dpi)
+    fig = plt.figure(figsize=(12, 9), dpi=dpi, constrained_layout=True)
     gs = GridSpec(
         nrows=2, ncols=3, figure=fig,
         height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0],
-        #wspace=0.22, hspace=0.24
+        #wspace=0.3, hspace=0.26
     )
 
     # Top-left: continuum cutout (if available)
