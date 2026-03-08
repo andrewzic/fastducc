@@ -1,0 +1,9 @@
+*.diff
+*.patch
+*.*~
+*.log
+*.err
+*.out
+*.tmp
+*.bkp
+bkp*
