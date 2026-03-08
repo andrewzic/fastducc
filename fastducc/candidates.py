@@ -508,6 +508,7 @@ def save_candidate_lightcurves(
     out_prefix: str,
     *,
     save_format: str = "npz",        # "npz" or "ascii"
+    center_policy: str = "right",    # "right" uses w//2; "left" uses (w-1)//2
 ) -> Dict[str, str]:
     """
     Extract and save full-resolution and boxcar-smoothed light curves for a candidate.
