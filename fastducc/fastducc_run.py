@@ -422,24 +422,18 @@ def main():
 
         # Connect the client and run
         with Client(cluster) as client:
-            try:
-                # (optional) wait for workers before submitting
-                # client.wait_for_workers( min(1, (args.dask_workers or 1)) )
+            # (optional) wait for workers before submitting
+            # client.wait_for_workers(min(1, args.dask_workers or 1))
+            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e)
+                       for (s, e) in chunk_bounds]
+            agg_list = client.gather(futures)
 
-                futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e)
-                        for (s, e) in chunk_bounds]
-                agg_list = client.gather(futures)
-            finally:
-                # Graceful stop to avoid CommClosedError spam during shutdown
-                try:
-                    cluster.scale(0)  # ask workers to exit first
-                    # wait until workers are gone
-                    while client.scheduler_info().get("workers"):
-                        time.sleep(0.25)
-                except Exception:
-                    pass
-                client.close()
-                cluster.close()
+        # Graceful stop after the client context exits
+        try:
+            cluster.scale(0)  # retire workers first
+        finally:
+            cluster.close()
+
     else:
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
 
