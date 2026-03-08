@@ -639,6 +639,16 @@ def save_candidate_summary(
     lc_sm, T_eff = kernels._compute_boxcar_1d(lc_full, w)
     times_sm = times[offset:offset + T_eff] if T_eff > 0 else np.empty((0,), dtype=times.dtype)
 
+    imjd = int(times[0] / 86400.0)  # integer MJD of the first time sample
+    mjd = times / 86400.0  # MJD times
+    rel_times_mjd = times - float(imjd)*86400.0  # relative times in day (modulo 1 day)
+    rel_times_start = times - times[0]  # relative times in seconds from start
+    rel_times_start_sm = times_sm - times[0]  # relative times for smoothed curve
+    t_mjd_str = f"{mjd[t_full_center]:.7f} MJD" if np.isfinite(mjd[t_full_center]) else "—"
+    det_time = candidate.get("time_center", np.nan)
+    det_time_mjd = det_time / 86400.0 if np.isfinite(det_time) else np.nan
+    det_time_str = f"{det_time_mjd:.7f} MJD" if np.isfinite(det_time_mjd) else "—"
+
     # --- image plane for top panels ---
     if use_std_images and (std_map is not None):
         frame_for_display = std_map
@@ -707,34 +717,31 @@ def save_candidate_summary(
     out_fig = f"{out_prefix}_summary.pdf"
     fig = plt.figure(figsize=(12, 9), dpi=dpi)
     gs = GridSpec(
-        nrows=2, ncols=4, figure=fig,
-        height_ratios=[1.0, 1.0], width_ratios=[1.0, 1.0, 1.0, 1.0],
+        nrows=2, ncols=3, figure=fig,
+        height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0],
         #wspace=0.22, hspace=0.24
     )
 
     # Top-left: continuum cutout (if available)
-    ax_cont = fig.add_subplot(gs[0, 2])
+    ax_cont = fig.add_subplot(gs[0, 0])
     if cont_wcs is not None:
-        ax_cont.remove()
-        ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
         im_cont = ax_cont.imshow(cont_im, origin="lower", cmap=cmap, vmin=cont_vmin, vmax=cont_vmax)
         ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
         ax_cont.set_xlabel("RA (J2000)")
         ax_cont.set_ylabel("Dec (J2000)")
         # Mark source in world coordinates
         ax_cont.plot([np.degrees(ra_c)], [np.degrees(dec_c)],
-                     marker=reticle(which='rt'), ms=28, color="red",
+                     marker=reticle(which='rt'), ms=36, color="red",
                      transform=ax_cont.get_transform('world'))
         cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
         cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Cont.")
     else:
-        ax_cont = fig.add_subplot(gs[0, 0], projection=wcs_full)
         im_cont = ax_cont.imshow(np.mean(cube, axis=0), origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
         ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
         ax_cont.set_xlabel("RA (J2000)")
         ax_cont.set_ylabel("Dec (J2000)")
-        ax_cont.plot([x], [y], marker=reticle(which='rt'), ms=28, color="red")  # pixel coords
+        ax_cont.plot([x], [y], marker=reticle(which='rt'), ms=36, color="red")  # pixel coords
         cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
         cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Mean cube (no cont.)")
@@ -742,29 +749,28 @@ def save_candidate_summary(
     # Top-middle: full field (WCS)
     ax_full = fig.add_subplot(gs[0, 1], projection=wcs_full)
     im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
+    # ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_full.set_xlabel("RA (J2000)")
     ax_full.set_ylabel("Dec (J2000)")
-    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=28, color="red")  # pixel coords
+    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=36, color="red")  # pixel coords
     cb1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
     cb1.set_label("Flux density (mJy/beam)")
-    t_str = f"{times[t_full_center]:.3f}s" if np.isfinite(times[t_full_center]) else "—"
-    ax_full.set_title(f"Full image @ t={t_str}")
+    ax_full.set_title(f"Field @ MJD={t_mjd_str}")
 
     # Top-right: detection-time cutout (WCS TAN centered at candidate)
     ax_cut = fig.add_subplot(gs[0, 2], projection=wcs_cut)
     im_cut = ax_cut.imshow(cutout_det, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
+    # ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_cut.set_xlabel("RA (J2000)")
     ax_cut.set_ylabel("Dec (J2000)")
     ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)],
-                marker=reticle(which='rt'), ms=28, color="red")
+                marker=reticle(which='rt'), ms=36, color="red")
     cb2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
     cb2.set_label("Flux density (mJy/beam)")
-    ax_cut.set_title("Detection cutout")
+    ax_cut.set_title(f"Cutout @ MJD={t_mjd_str}")
 
-    # Top-rightmost cell (gs[0, 3]): metadata text box
-    ax_txt = fig.add_subplot(gs[0, 3])
+    # metadata text box
+    ax_txt = fig.add_subplot(gs[1, 2])
     ax_txt.set_axis_off()
     # RA/Dec strings
     ra_hms = candidate.get("ra_hms", None)
@@ -779,8 +785,6 @@ def save_candidate_summary(
     scan  = meta.get("scan_id", "") if isinstance(meta, dict) else ""
     beam  = meta.get("beam", "") if isinstance(meta, dict) else ""
 
-    det_time = candidate.get("time_center", np.nan)
-    det_time_str = f"{det_time:.3f} s" if np.isfinite(det_time) else "—"
     snr_val = candidate.get("snr", np.nan)
     snr_str = f"{float(snr_val):.2f}" if np.isfinite(snr_val) else "—"
     width_str = f"{w:d}" if (method.lower() == "boxcar") else "—"
@@ -793,26 +797,30 @@ def save_candidate_summary(
         f"Coord (J2000): {ra_hms} {dec_dms}\n"
         f"Coord (x,y): ({x:d}, {y:d})\n"
         f"S/N: {snr_str}\n"
+        f"iMJD: {imjd}\n"
+        f"Obs time (start): {mjd[0]:.7f} MJD\n"
+        f"Rel. time (start): {rel_times_start[t_full_center]:.4f} s\n"
         f"Det. time: {det_time_str}\n"
+        f"Det. MJD: {t_mjd_str}\n"
         f"Method: {method}\n"
         f"Width: {width_str}"
     )
 
-    box = AnchoredText(txt, loc="upper left", frameon=True, pad=0.4, prop={"size": 10})
+    box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
     ax_txt.add_artist(box)
-    ax_txt.set_title("Candidate summary", pad=8)
+    ax_txt.set_title("Summary", pad=12)
 
-    # Bottom row (span all 4 columns): raw + smoothed LC
-    ax_lc = fig.add_subplot(gs[1, :])
-    ax_lc.plot(times, lc_full, color="tab:blue",  lw=1.4, label="Raw")
+    # Bottom row (span 2 columns): raw + smoothed LC
+    ax_lc = fig.add_subplot(gs[1, 0:2])
+    ax_lc.plot(rel_times_start, lc_full, color="tab:blue",  lw=1.4, label="Raw")
     if T_eff > 0:
-        ax_lc.plot(times_sm, lc_sm, color="tab:green", lw=1.6, label=f"Boxcar mean (w={w})")
+        ax_lc.plot(rel_times_start_sm, lc_sm, color="tab:green", lw=1.6, label=f"Boxcar (w={w})")
         k_center = max(0, min(t0_idx, T_eff - 1))
-        ax_lc.axvline(times_sm[k_center], color="crimson", ls="--", lw=1.0)
+        ax_lc.axvline(rel_times_start_sm[k_center], color="crimson", ls="--", lw=1.0)
     else:
-        ax_lc.text(0.02, 0.92, f"w={w} > T; smoothed LC unavailable",
+        ax_lc.text(0.02, 0.92, f"w={w} > T; smoothed LC N/A",
                    transform=ax_lc.transAxes, ha="left", va="top", color="crimson")
-    ax_lc.set_xlabel("Time (s)")
+    ax_lc.set_xlabel(f"Time from MJD {mjd[0]:.7f} (s)")
     ax_lc.set_ylabel("Flux density (mJy/beam)")
     ax_lc.grid(True, alpha=0.3)
     ax_lc.legend(loc="best")
@@ -932,7 +940,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
                                     dec_rad: float,
                                     ra_sign: int = -1,
                                     dec_sign: int = 1,
-                                    cmap: str = "gray",
+                                    cmap: str = "inferno",
                                     gif_fps: int = 5,
                                     dpi: int = 300) -> dict:
     """
