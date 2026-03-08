@@ -1,6 +1,10 @@
 import argparse
 import os
 import sys
+import time
+
+from dask.distributed import Client, LocalCluster
+from dask_jobqueue import SLURMCluster
 
 from casacore.tables import table
 try:
@@ -381,7 +385,6 @@ def main():
             agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2))
 
     elif args.parallel_mode == 'dask-local':
-        from dask.distributed import Client, LocalCluster
         n_workers = args.dask_workers if args.dask_workers > 0 else None
         cluster = LocalCluster(
             n_workers=n_workers,
@@ -396,7 +399,9 @@ def main():
 
     elif args.parallel_mode == 'dask-slurm':
         # SLURMCluster (requires dask_jobqueue)
-        from dask_jobqueue import SLURMCluster
+
+        scheduler_opts = {"dashboard_address": ":0"}
+
         cluster = SLURMCluster(
             queue=args.slurm_partition,
             account=args.slurm_account,
@@ -404,7 +409,8 @@ def main():
             memory=args.slurm_mem,
             walltime=args.slurm_walltime,
             job_extra_directives=args.slurm_job_extra,
-            interface=args.slurm_interface
+            interface=args.slurm_interface,
+            scheduler_options=scheduler_opts, #avoid dashboard port conflicts
         )
         # scale to number of workers (or adapt if dask_workers==0)
         if args.dask_workers and args.dask_workers > 0:
@@ -412,8 +418,30 @@ def main():
         else:
             # adaptively allocate between 1 and len(chunk_bounds) workers
             cluster.adapt(minimum=1, maximum=max(1, len(chunk_bounds)))
-        from dask.distributed import Client
+
+
+        # Connect the client and run
         with Client(cluster) as client:
+            try:
+                # (optional) wait for workers before submitting
+                # client.wait_for_workers( min(1, (args.dask_workers or 1)) )
+
+                futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e)
+                        for (s, e) in chunk_bounds]
+                agg_list = client.gather(futures)
+            finally:
+                # Graceful stop to avoid CommClosedError spam during shutdown
+                try:
+                    cluster.scale(0)  # ask workers to exit first
+                    # wait until workers are gone
+                    while client.scheduler_info().get("workers"):
+                        time.sleep(0.25)
+                except Exception:
+                    pass
+                client.close()
+                cluster.close()
+
+
             futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e)
                        for (s, e) in chunk_bounds]
             agg_list = client.gather(futures)
