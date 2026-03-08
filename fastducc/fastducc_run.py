@@ -440,13 +440,6 @@ def main():
                     pass
                 client.close()
                 cluster.close()
-
-
-            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e)
-                       for (s, e) in chunk_bounds]
-            agg_list = client.gather(futures)
-        cluster.close()
-
     else:
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
 
