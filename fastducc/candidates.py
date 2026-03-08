@@ -729,7 +729,7 @@ def save_candidate_summary(
         cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Cont.")
     else:
-        ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
+        ax_cont = fig.add_subplot(gs[0, 0], projection=wcs_full)
         im_cont = ax_cont.imshow(np.mean(cube, axis=0), origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
         ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
         ax_cont.set_xlabel("RA (J2000)")
