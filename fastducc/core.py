@@ -478,6 +478,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
 
     # Optional per-chunk variance search
     if cfg.enable_var and cfg.enable_var_chunk:
+        var_root = chunk_root + "_var"
         std_map_partial = kernels.welford_finalise_std(c, M2, ddof=1)
         if cfg.do_var_search:
             var_dets, snr_img = detection.variance_search_welford(
@@ -504,7 +505,6 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
                     flip_u=True, flip_v=True, field_name=None
                 )
-                var_root = chunk_root + "_var"
                 t_var = candidates.candidates_to_astropy_table(annotated_var)
                 candidates.save_candidates_table(t_var,
                                                 csv_path=f"{var_root}_candidates.csv",
@@ -557,6 +557,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
 
     # Optional boxcar search
     if cfg.enable_boxcar:
+        box_root = chunk_root + "_boxcar"
         if cfg.do_boxcar_search:
             dets, snr_cubes = detection.boxcar_search_time(
                 times, cube,
@@ -586,7 +587,6 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
                     flip_u=True, flip_v=True, field_name=None
                 )
-                box_root = chunk_root + "_boxcar"
                 t_box = candidates.candidates_to_astropy_table(annotated)
                 candidates.save_candidates_table(t_box,
                     csv_path=f"{box_root}_candidates.csv",
