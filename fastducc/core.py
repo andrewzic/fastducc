@@ -510,21 +510,22 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                                                 csv_path=f"{var_root}_candidates.csv",
                                                 vot_path=f"{var_root}_candidates.vot"
                                                 )
-            elif cfg.plot_cands_only:
-                vot_path = f"{var_root}_candidates.vot"
+        elif cfg.plot_cands_only:
+            vot_path = f"{var_root}_candidates.vot"
+            if os.path.exists(vot_path):
+                annotated_var = candidates.astropy_table_to_candidates(vot_path)
+            else:
+                vot_path = os.path.join(candidates_dir, f"{ms_base}_variance_all.vot")
                 if os.path.exists(vot_path):
                     annotated_var = candidates.astropy_table_to_candidates(vot_path)
                 else:
-                    vot_path = os.path.join(candidates_dir, f"{ms_base}_variance_all.vot")
-                    if os.path.exists(vot_path):
-                        annotated_var = candidates.astropy_table_to_candidates(vot_path)
-                    else:
-                        annotated_var = []
-                        print("[Warning] No candidates found for plotting: no vot files at {var_root}_candidates.vot or {ms_base}_variance_all.vot")
-                        #raise FileNotFoundError(f"No vot files found at {var_root}_candidates.vot or {ms_base}_variance_all.vot")
-            for i, cand in enumerate(annotated_var):
-                srcname = cand["srcname"]
-                if cfg.save_var_lightcurves:
+                    annotated_var = []
+                    print("[Warning] No candidates found for plotting: no vot files at {var_root}_candidates.vot or {ms_base}_variance_all.vot")
+                    #raise FileNotFoundError(f"No vot files found at {var_root}_candidates.vot or {ms_base}_variance_all.vot")
+        for i, cand in enumerate(annotated_var):
+            srcname = cand["srcname"]
+            if cfg.save_var_lightcurves:
+                if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
                     candidates.save_candidate_lightcurves(
                         times, cube, cand,
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
@@ -554,6 +555,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
                         ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=1, dpi=180
                     )
+                else:
+                    print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
 
     # Optional boxcar search
     if cfg.enable_boxcar:
@@ -607,43 +610,46 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         print("[Warning] No candidates found for plotting: no vot files at {box_root}_candidates.vot or {ms_base}_boxcar_all.vot")            
         for i, cand in enumerate(annotated):
             w = max(1, int(cand.get("width_samples", 1)))
-            if cfg.save_box_lightcurves:
-                srcname = cand["srcname"]
-                candidates.save_candidate_lightcurves(
-                    times, cube, cand,
-                    out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
-                    save_format="npz",
-                )
-                _ = candidates.save_candidate_summary(
-                    times=times, cube=cube, candidate=cand,
-                    out_prefix=f"{box_root}_cand_{srcname}_w{w}{i:03d}_summary",
-                    spatial_size=50,
-                    center_policy="right", cmap="gray", dpi=180,
-                    # WCS / scale
-                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                    ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
-                    pix_rad=cfg.pix_rad,
-                    ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                    # Draw std-map images on the top panels:
-                    std_map=None, use_std_images=False,
-                    continuum_dir=getattr(cfg, "continuum_dir", None),
-                    method="boxcar",
-                )
-            if cfg.save_box_snippets:
-                snippets = candidates.extract_candidate_snippets(
-                    times, cube, [cand],
-                    spatial_size=50, time_factor=50,
-                    pad_mode="constant", pad_value=0.0,
-                    return_indices=True, center_policy="right"
-                )
-                snip = snippets[0]
-                candidates.save_candidate_snippet_products(
-                    snippet_rec=snip,
-                    out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
-                    pixscale_rad=cfg.pix_rad,
-                    ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                    ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
-                )
+            if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
+                if cfg.save_box_lightcurves:
+                    srcname = cand["srcname"]
+                    candidates.save_candidate_lightcurves(
+                        times, cube, cand,
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
+                        save_format="npz",
+                    )
+                    _ = candidates.save_candidate_summary(
+                        times=times, cube=cube, candidate=cand,
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}{i:03d}_summary",
+                        spatial_size=50,
+                        center_policy="right", cmap="gray", dpi=180,
+                        # WCS / scale
+                        npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                        ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
+                        pix_rad=cfg.pix_rad,
+                        ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
+                        # Draw std-map images on the top panels:
+                        std_map=None, use_std_images=False,
+                        continuum_dir=getattr(cfg, "continuum_dir", None),
+                        method="boxcar",
+                    )
+                if cfg.save_box_snippets:
+                    snippets = candidates.extract_candidate_snippets(
+                        times, cube, [cand],
+                        spatial_size=50, time_factor=50,
+                        pad_mode="constant", pad_value=0.0,
+                        return_indices=True, center_policy="right"
+                    )
+                    snip = snippets[0]
+                    candidates.save_candidate_snippet_products(
+                        snippet_rec=snip,
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
+                        pixscale_rad=cfg.pix_rad,
+                        ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
+                        ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
+                    )
+            else:
+                print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
 
     if cfg.save_full_var_lightcurves:
         return times, cube, c, m, M2
