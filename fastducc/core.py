@@ -596,12 +596,12 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 annotated = []
         elif cfg.plot_cands_only:
                 vot_path = f"{box_root}_candidates.vot"
-                if os.path.exists(box_path):
-                    annotated = candidates.astropy_table_to_candidates(box_path)
+                if os.path.exists(vot_path):
+                    annotated = candidates.astropy_table_to_candidates(vot_path)
                 else:
                     vot_path = os.path.join(candidates_dir, f"{ms_base}_boxcar_all.vot")
-                    if os.path.exists(box_path):
-                        annotated = candidates.astropy_table_to_candidates(box_path)
+                    if os.path.exists(vot_path):
+                        annotated = candidates.astropy_table_to_candidates(vot_path)
                     else:
                         annotated = []
                         print("[Warning] No candidates found for plotting: no vot files at {box_root}_candidates.vot or {ms_base}_boxcar_all.vot")            
