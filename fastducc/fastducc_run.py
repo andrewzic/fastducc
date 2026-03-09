@@ -1,7 +1,6 @@
 import argparse
 import os
 import sys
-import time
 
 from dask.distributed import Client, LocalCluster
 from dask_jobqueue import SLURMCluster

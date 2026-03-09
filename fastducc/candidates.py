@@ -2290,7 +2290,8 @@ def aggregate_observation_from_super_summaries(
 
         # Representative = max SNR
         best = max(sub, key=lambda d: float(d.get("max_snr", -np.inf)))
-        best_ra = float(best["ra_deg"]); best_dec = float(best["dec_deg"])
+        best_ra = float(best["ra_deg"])
+        best_dec = float(best["dec_deg"])
         best_snr = float(best.get("max_snr", np.nan))
         best_time = float(best.get("max_snr_time_center", np.nan)) if best.get("max_snr_time_center", None) is not None else np.nan
         best_scan = str(best.get("scan_id", ""))

@@ -609,6 +609,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         annotated = []
                         print("[Warning] No candidates found for plotting: no vot files at {box_root}_candidates.vot or {ms_base}_boxcar_all.vot")            
         for i, cand in enumerate(annotated):
+            srcname = cand["srcname"]
             w = max(1, int(cand.get("width_samples", 1)))
             if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
                 if cfg.save_box_lightcurves:
