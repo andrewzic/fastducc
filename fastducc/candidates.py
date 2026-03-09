@@ -805,7 +805,7 @@ def save_candidate_summary(
 
     # --- figure layout ---
     out_fig = f"{out_prefix}_summary.pdf"
-    fig = plt.figure(figsize=(12, 9), dpi=dpi, constrained_layout=True)
+    fig = plt.figure(figsize=(16, 9), dpi=dpi)#, constrained_layout=True)
     gs = GridSpec(
         nrows=2, ncols=3, figure=fig,
         height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0],
@@ -824,7 +824,7 @@ def save_candidate_summary(
                      marker=reticle(which='rt'), ms=36, color="red",
                      transform=ax_cont.get_transform('world'))
         cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
-        cb3.set_label("Flux density (mJy/beam)")
+        #cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Cont.")
     else:
         ax_cont = fig.add_subplot(gs[0, 0], projection=wcs_full)
@@ -834,7 +834,7 @@ def save_candidate_summary(
         ax_cont.set_ylabel("Dec (J2000)")
         ax_cont.plot([x], [y], marker=reticle(which='rt'), ms=36, color="red")  # pixel coords
         cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
-        cb3.set_label("Flux density (mJy/beam)")
+        #cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Mean cube (no cont.)")
 
     # Top-middle: full field (WCS)
@@ -845,7 +845,7 @@ def save_candidate_summary(
     ax_full.set_ylabel("Dec (J2000)")
     ax_full.plot([x], [y], marker=reticle(which='rt'), ms=36, color="red")  # pixel coords
     cb1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
-    cb1.set_label("Flux density (mJy/beam)")
+    #cb1.set_label("Flux density (mJy/beam)")
     ax_full.set_title(f"Field @ MJD={t_mjd_str}")
 
     # Top-right: detection-time cutout (WCS TAN centered at candidate)
