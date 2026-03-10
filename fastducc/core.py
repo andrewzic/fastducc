@@ -76,14 +76,14 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
         if cfg.save_var_lightcurves:
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
-                out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
+                out_prefix=f"{var_root}_cand_{srcname}_lc",
                 save_format="npz",
             )
             _ = candidates.save_candidate_summary(
                 times=times, cube=cube, candidate=cand,
-                out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_summary",
+                out_prefix=f"{var_root}_cand_{srcname}",
                 spatial_size=50,
-                center_policy="right", cmap="gray", dpi=180,
+                center_policy="right", cmap="inferno", dpi=180,
                 # WCS / scale
                 npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                 ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
@@ -103,7 +103,7 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
                 out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                 pixscale_rad=cfg.pix_rad,
                 ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=1, dpi=180
+                ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=1, dpi=180
             )
     return annotated_var
 
@@ -162,14 +162,14 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
         if cfg.save_box_lightcurves:
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
-                out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
+                out_prefix=f"{box_root}_cand_{srcname}_w{w}_lc",
                 save_format="npz",
             )
             _ = candidates.save_candidate_summary(
                 times=times, cube=cube, candidate=cand,
-                out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}",
+                out_prefix=f"{box_root}_cand_{srcname}_w{w}",
                 spatial_size=50,
-                center_policy="right", cmap="gray", dpi=300,
+                center_policy="right", cmap="inferno", dpi=300,
                 npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                 ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
                 pix_rad=cfg.pix_rad,
@@ -196,7 +196,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
                 out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
                 pixscale_rad=cfg.pix_rad,
                 ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
+                ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=6, dpi=180
             )
     return annotated
 
@@ -402,14 +402,14 @@ def finalise_welford_parallel(
                 if cfg.save_full_var_lightcurves:
                     _ = candidates.save_candidate_lightcurves(
                         times=times, cube=cube, candidate=cand,
-                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
+                        out_prefix=f"{var_root}_cand_{srcname}_lc",
                         save_format="npz",
                     )
                     candidates.save_candidate_summary(
                         all_times, all_cube, cand,
-                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}",
+                        out_prefix=f"{var_root}_cand_{srcname}",
                         spatial_size=50,
-                        center_policy="right", cmap="gray", dpi=180,
+                        center_policy="right", cmap="inferno", dpi=180,
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
                         pix_rad=cfg.pix_rad, ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
@@ -424,7 +424,7 @@ def finalise_welford_parallel(
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                        ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=1, dpi=180
+                        ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=1, dpi=180
                     )
 
     return std_map_full
@@ -528,14 +528,14 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
                     candidates.save_candidate_lightcurves(
                         times, cube, cand,
-                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_lc",
+                        out_prefix=f"{var_root}_cand_{srcname}_lc",
                         save_format="npz",
                     )
                     _ = candidates.save_candidate_summary(
                         times=times, cube=cube, candidate=cand,
-                        out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_summary",
+                        out_prefix=f"{var_root}_cand_{srcname}",
                         spatial_size=50,
-                        center_policy="right", cmap="gray", dpi=300,
+                        center_policy="right", cmap="inferno", dpi=300,
                         # WCS / scale
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
@@ -553,7 +553,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                        ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=1, dpi=180
+                        ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=1, dpi=180
                     )
                 else:
                     print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
@@ -616,14 +616,14 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     srcname = cand["srcname"]
                     candidates.save_candidate_lightcurves(
                         times, cube, cand,
-                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_lc",
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}_lc",
                         save_format="npz",
                     )
                     _ = candidates.save_candidate_summary(
                         times=times, cube=cube, candidate=cand,
-                        out_prefix=f"{box_root}_cand_{srcname}_w{w}{i:03d}_summary",
+                        out_prefix=f"{box_root}_cand_{srcname}_w{w}",
                         spatial_size=50,
-                        center_policy="right", cmap="gray", dpi=180,
+                        center_policy="right", cmap="inferno", dpi=180,
                         # WCS / scale
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
@@ -647,7 +647,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                        ra_sign=-1, dec_sign=-1, cmap="gray", gif_fps=6, dpi=180
+                        ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=6, dpi=180
                     )
             else:
                 print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
