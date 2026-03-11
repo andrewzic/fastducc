@@ -793,10 +793,19 @@ def save_candidate_summary(
             if data.ndim > 2:
                 data = np.squeeze(data)
             cont_w = WCS(hdr)
+
+            # Make sure we use only the celestial part of the WCS
+            cont_w_2d = cont_w.celestial
             # angular cutout size corresponding to 'spatial_size' of the transient cube
             size_rad = spatial_size * float(pix_rad)  # radians
             pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
-            c2d = Cutout2D(data, pos, (size_rad * u.rad, size_rad * u.rad), wcs=cont_w, mode="partial")
+            c2d = Cutout2D(
+                data=cont_im,
+                position=pos,
+                size=(size_rad * u.rad, size_rad * u.rad),
+                wcs=cont_w_2d,
+                mode="partial"
+            )
             cont_im = c2d.data
             cont_wcs = c2d.wcs
             cont_vmin = np.nanpercentile(cont_im, 5.0)
