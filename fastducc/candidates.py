@@ -831,9 +831,14 @@ def save_candidate_summary(
         ax_cont.set_ylabel("Dec (J2000)")
         # Mark source in world coordinates
         ax_cont.plot([np.degrees(ra_c)], [np.degrees(dec_c)],
-                     marker=reticle(which='rt'), ms=36, color="red",
+                     marker=reticle(which='rt'), ms=36, color="white",
                      transform=ax_cont.get_transform('world'))
-        cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
+
+        cb3 = fig.colorbar(
+            im_cont, ax=ax_cont,
+            orientation="horizontal", fraction=0.046, pad=0.10
+        )
+        cb3.set_label("Flux density (mJy/beam)")
         #cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Cont.")
     else:
@@ -842,8 +847,13 @@ def save_candidate_summary(
         ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
         ax_cont.set_xlabel("RA (J2000)")
         ax_cont.set_ylabel("Dec (J2000)")
-        ax_cont.plot([x], [y], marker=reticle(which='rt'), ms=36, color="red")  # pixel coords
-        cb3 = fig.colorbar(im_cont, ax=ax_cont, fraction=0.046, pad=0.02)
+        ax_cont.plot([x], [y], marker=reticle(which='rt'), ms=36, color="white")  # pixel coords
+
+        cb3 = fig.colorbar(
+            im_cont, ax=ax_cont,
+            orientation="horizontal", fraction=0.046, pad=0.10
+        )
+        cb3.set_label("Flux density (mJy/beam)")
         #cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Mean cube (no cont.)")
 
@@ -853,9 +863,13 @@ def save_candidate_summary(
     # ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
     ax_full.set_xlabel("RA (J2000)")
     ax_full.set_ylabel("Dec (J2000)")
-    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=36, color="red")  # pixel coords
-    cb1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
-    #cb1.set_label("Flux density (mJy/beam)")
+    ax_full.plot([x], [y], marker=reticle(which='rt'), ms=36, color="white")  # pixel coords
+
+    cb1 = fig.colorbar(
+        im_full, ax=ax_full,
+        orientation="horizontal", fraction=0.046, pad=0.10
+    )
+    cb1.set_label("Flux density (mJy/beam)")
     ax_full.set_title(f"Field @ MJD={t_mjd_str}")
 
     # Top-right: detection-time cutout (WCS TAN centered at candidate)
@@ -865,9 +879,14 @@ def save_candidate_summary(
     ax_cut.set_xlabel("RA (J2000)")
     ax_cut.set_ylabel("Dec (J2000)")
     ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)],
-                marker=reticle(which='rt'), ms=36, color="red")
-    cb2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
+                marker=reticle(which='rt'), ms=36, color="white")
+
+    cb2 = fig.colorbar(
+        im_cut, ax=ax_cut,
+        orientation="horizontal", fraction=0.046, pad=0.10
+    )
     cb2.set_label("Flux density (mJy/beam)")
+
     ax_cut.set_title(f"Cutout @ MJD={t_mjd_str}")
 
     # metadata text box
@@ -984,7 +1003,7 @@ def save_candidate_summary(
     # # Top-left: WCS full frame
     # ax_full = fig.add_subplot(gs[0,0], projection=wcs_full)
     # im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    # ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="red")
+    # ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="white")
     # ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
     # ax_full.set_xlabel("Right Ascension (J2000)")
     # ax_full.set_ylabel("Declination (J2000)")
@@ -995,7 +1014,7 @@ def save_candidate_summary(
     # # Top-right: WCS cutout
     # ax_cut = fig.add_subplot(gs[0,1], projection=wcs_cut)
     # im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    # ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="red")
+    # ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="white")
     # ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
     # ax_cut.set_xlabel("Right Ascension (J2000)")
     # ax_cut.set_ylabel("Declination (J2000)")
@@ -1009,7 +1028,7 @@ def save_candidate_summary(
     # # Middle: full-res light curve
     # ax_lc_full = fig.add_subplot(gs[1, :])  # spans full width below
     # ax_lc_full.plot(times, lc_full, color="tab:blue", lw=1.6)
-    # ax_lc_full.axvline(times[t_full_center], color="red", ls="--", lw=1.0, label="Detection time")
+    # ax_lc_full.axvline(times[t_full_center], color="white", ls="--", lw=1.0, label="Detection time")
     # ax_lc_full.set_ylabel("Flux density (mJy/beam)")
     # ax_lc_full.grid(True, alpha=0.3)
     # ax_lc_full.legend(loc="best")
@@ -1018,11 +1037,11 @@ def save_candidate_summary(
     # ax_lc_box = fig.add_subplot(gs[2, :])
     # if T_eff > 0:
     #     ax_lc_box.plot(times_sm, lc_sm, color="tab:green", lw=1.6)
-    #     ax_lc_box.axvline(times_sm[k_center], color="red", ls="--", lw=1.0, label=f"Smoothed center (w={w})")
+    #     ax_lc_box.axvline(times_sm[k_center], color="white", ls="--", lw=1.0, label=f"Smoothed center (w={w})")
     #     ax_lc_box.legend(loc="best")
     # else:
     #     ax_lc_box.text(0.5, 0.5, f"Width {w} > T; no smoothed LC",
-    #                    transform=ax_lc_box.transAxes, ha="center", va="center", color="red")
+    #                    transform=ax_lc_box.transAxes, ha="center", va="center", color="white")
     # ax_lc_box.set_xlabel("Time (s)")
     # ax_lc_box.set_ylabel(f"Flux density - boxcar mean, w={w} (mJy/beam)")
     # ax_lc_box.grid(True, alpha=0.3)
@@ -1116,7 +1135,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     ax.set_xlabel("Right Ascension (J2000)")
     ax.set_ylabel("Declination (J2000)")
     # Mark the detection pixel at center
-    ax.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
+    ax.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="white")
     # Title updates with time
     def _update(k: int):
         im.set_data(cube[k])
@@ -1144,7 +1163,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     # ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
     # ax_img.set_xlabel("Right Ascension (J2000)")
     # ax_img.set_ylabel("Declination (J2000)")
-    # ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="red")
+    # ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="white")
     # cb = fig2.colorbar(im2, ax=ax_img, fraction=0.046, pad=0.04)
     # cb.set_label("Intensity (arb. units)")
     # # Title with RA/Dec, SNR if available
@@ -1167,13 +1186,13 @@ def save_candidate_snippet_products(snippet_rec: dict,
     # print(cand)
     # try:
     #     tline = cand.get("time_center_peak", cand["time_center"])
-    #     ax_lc.axvline(tline, color="red", ls="--", lw=1.0, label="Candidate peak")
+    #     ax_lc.axvline(tline, color="white", ls="--", lw=1.0, label="Candidate peak")
 
     # except KeyError:
     #     print("time_center not found")
         
     # # if np.isfinite(t0):
-    # #     ax_lc.axvline(t0, color="red", ls="--", lw=1.0, label="Detection time")
+    # #     ax_lc.axvline(t0, color="white", ls="--", lw=1.0, label="Detection time")
     # #     ax_lc.legend(loc="best")
     # ax_lc.set_xlabel("Time (s)")
     # ax_lc.set_ylabel("Peak flux density (mJy/beam)")
