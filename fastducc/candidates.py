@@ -800,7 +800,7 @@ def save_candidate_summary(
             size_rad = spatial_size * float(pix_rad)  # radians
             pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
             c2d = Cutout2D(
-                data=cont_im,
+                data=data,
                 position=pos,
                 size=(size_rad * u.rad, size_rad * u.rad),
                 wcs=cont_w_2d,
