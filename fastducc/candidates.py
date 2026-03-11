@@ -1635,7 +1635,7 @@ def aggregate_beam_candidate_tables(
         meta = parse_candidate_filename(p, require="all")
         field_name = meta["field"]
         sbid = meta["sbid"]
-        scan_id = meta["scan_id"]
+        scan_id = meta.get("scan_id", 1)
         if field_name and sbid and scan_id:
             out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.csv")
             out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.vot")
@@ -1653,7 +1653,7 @@ def aggregate_beam_candidate_tables(
         field_name = meta["field"]
         sbid = meta["sbid"]
         beam_id = meta["beam"]
-        scan_id = meta["scan_id"]
+        scan_id = meta.get("scan_id", 1)
         for col in ("time_center", "ra_deg", "dec_deg", "snr"):
             if col not in t.colnames:
                 raise ValueError(f"Missing required column '{col}' in {p}")
@@ -2235,7 +2235,7 @@ def aggregate_observation_from_super_summaries(
         meta = parse_candidate_filename(p, require='super')
         f_field = meta['field'] 
         f_sbid = meta['sbid']
-        f_scan = meta['scan_id']
+        f_scan = meta.get("scan_id", 1)
         f_kind = meta['kind']
         if f_kind != kind:
             continue
