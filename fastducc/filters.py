@@ -213,100 +213,87 @@ def nms_snr_maps_per_width(
 
     return detections_by_width
 
+
 def group_filter_across_widths(
-        detections_by_width: Dict[int, List[Dict[str, Any]]],
-        times: np.ndarray,
-        *,
-        spatial_radius: int = 3,
-        time_radius: int = 0,
-        policy: str = "max_snr",
-        max_per_time_group: Optional[int] = None,
-        ny_nx: Optional[Tuple[int, int]] = None,
+    detections_by_width: Dict[int, List[Dict[str, Any]]],
+    times: np.ndarray,
+    *,
+    spatial_radius: int = 3,
+    time_radius: int = 8,                # in samples of center_idx
+    policy: str = "max_snr",             # "max_snr" | "prefer_short" | "prefer_long"
+    max_per_time_group: Optional[int] = None,  # kept for API parity; rarely needed here
+    ny_nx: Optional[Tuple[int, int]] = None,
 ) -> List[Dict[str, Any]]:
 
+    # 1) Flatten all detections across widths
+    all_dets: List[Dict[str, Any]] = []
+    for dets in detections_by_width.values():
+        all_dets.extend(dets)
+    if not all_dets:
+        return []
 
-
-        # Flatten by time center
-    by_time: Dict[int, List[Dict[str, Any]]] = {}
-    for w, dets in detections_by_width.items():
-        for d in dets:
-            ci = int(d["center_idx"])
-            by_time.setdefault(ci, []).append(d)
-
-    # If temporal NMS is requested, prepare a global occupancy structure keyed by center_idx
-    occ_by_center: Dict[int, np.ndarray] = {}
-
-    # If Ny,Nx not provided, infer from detections
+    # 2) Determine Ny, Nx
     if ny_nx is None:
-        max_y = -1
-        max_x = -1
-        for dets in by_time.values():
-            for d in dets:
-                if d["y"] > max_y: 
-                    max_y = d["y"]
-                if d["x"] > max_x: 
-                    max_x = d["x"]
-        Ny = max_y + 1 if max_y >= 0 else 1
-        Nx = max_x + 1 if max_x >= 0 else 1
+        max_y = max(int(d["y"]) for d in all_dets)
+        max_x = max(int(d["x"]) for d in all_dets)
+        Ny, Nx = max_y + 1, max_x + 1
     else:
         Ny, Nx = ny_nx
 
-    final: List[Dict[str, Any]] = []
-
-    # Helper to get sorted order per policy
-    def sort_dets(dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # 3) Sort globally by policy (SNR-first)
+    def sort_key(d):
         if policy == "max_snr":
-            return sorted(dets, key=lambda d: d["snr"], reverse=True)
+            return (-float(d["snr"]),)
         elif policy == "prefer_short":
-            return sorted(dets, key=lambda d: (d["width_samples"], -d["snr"]))
+            return (int(d["width_samples"]), -float(d["snr"]))
         elif policy == "prefer_long":
-            return sorted(dets, key=lambda d: (-d["width_samples"], -d["snr"]))
+            return (-int(d["width_samples"]), -float(d["snr"]))
         else:
             raise ValueError(f"Unknown policy='{policy}'")
+    all_dets.sort(key=sort_key)
 
-    # Process each time-center group independently
-    for center_idx, dets in by_time.items():
-        if len(dets) == 0:
+    # 4) Occupancy across time centers (lazy-allocated per center_idx)
+    occ_by_center: Dict[int, np.ndarray] = {}
+    final: List[Dict[str, Any]] = []
+
+    # (Optional) enforce at most K per exact center_idx
+    kept_per_center: Dict[int, int] = {}
+
+    for d in all_dets:
+        ci = int(d["center_idx"])
+        y  = int(d["y"]); x = int(d["x"])
+
+        # Check availability across +/-time_radius
+        available = True
+        for dt in range(-time_radius, time_radius + 1):
+            ci2 = ci + dt
+            occ = occ_by_center.get(ci2)
+            if occ is None:
+                # not yet touched => all True
+                continue
+            if not occ[y, x]:
+                available = False
+                break
+        if not available:
             continue
 
-        # Initialize occupancy for this time center if needed
-        if center_idx not in occ_by_center:
-            occ_by_center[center_idx] = np.ones((Ny, Nx), dtype=bool)
+        # Respect optional per-time limit (usually None here)
+        if (max_per_time_group is not None) and (kept_per_center.get(ci, 0) >= max_per_time_group):
+            continue
 
-        # Sort by policy
-        dets_sorted = sort_dets(dets)
+        # Accept
+        final.append(d)
+        kept_per_center[ci] = kept_per_center.get(ci, 0) + 1
 
-        kept = 0
-        for d in dets_sorted:
-            y = int(d["y"]); 
-            x = int(d["x"])
-            # If spatial spot already suppressed for this center, skip
-            if not occ_by_center[center_idx][y, x]:
-                continue
-
-            # Accept detection
-            final.append(d)
-
-            # Suppress neighborhood for this center
-            y0 = max(0, y - spatial_radius)
-            y1 = min(Ny, y + spatial_radius + 1)
-            x0 = max(0, x - spatial_radius)
-            x1 = min(Nx, x + spatial_radius + 1)
-            occ_by_center[center_idx][y0:y1, x0:x1] = False
-
-            # Optional temporal NMS: suppress the same spatial neighborhood in nearby center_idx groups
-            if time_radius > 0:
-                for dt in range(-time_radius, time_radius + 1):
-                    ci2 = center_idx + dt
-                    if ci2 == center_idx:
-                        continue
-                    if ci2 in by_time:
-                        if ci2 not in occ_by_center:
-                            occ_by_center[ci2] = np.ones((Ny, Nx), dtype=bool)
-                        occ_by_center[ci2][y0:y1, x0:x1] = False
-
-            kept += 1
-            if (max_per_time_group is not None) and (kept >= max_per_time_group):
-                break
+        # Suppress spatial neighborhood across +/-time_radius
+        y0 = max(0, y - spatial_radius); y1 = min(Ny, y + spatial_radius + 1)
+        x0 = max(0, x - spatial_radius); x1 = min(Nx, x + spatial_radius + 1)
+        for dt in range(-time_radius, time_radius + 1):
+            ci2 = ci + dt
+            occ = occ_by_center.get(ci2)
+            if occ is None:
+                occ = np.ones((Ny, Nx), dtype=bool)
+                occ_by_center[ci2] = occ
+            occ[y0:y1, x0:x1] = False
 
     return final

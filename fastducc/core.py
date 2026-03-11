@@ -577,12 +577,16 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 threshold_sigma=cfg.boxcar_threshold,
                 spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None
             )
+
             final_dets = filters.group_filter_across_widths(
                 dets_by_w, times,
-                spatial_radius=cfg.nms_radius, time_radius=0,
-                policy="max_snr", max_per_time_group=1,
+                spatial_radius=cfg.nms_radius,
+                time_radius=8,           # merge across widths within +/- 8 sample
+                policy="max_snr",
+                max_per_time_group=1,
                 ny_nx=(cube.shape[1], cube.shape[2])
             )
+
             if len(final_dets) > 0:
                 annotated = ducc_wcs.annotate_candidates_with_sky_coords(
                     msname=cfg.msname, final_detections=final_dets,

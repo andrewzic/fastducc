@@ -20,7 +20,7 @@ def boxcar_search_time(
     valid_mask: Optional[np.ndarray] = None,
     subtract_mean_per_pixel: bool = False,
     std_mode: str = "spatial_per_window",  # "spatial_per_window" | "temporal_per_pixel"
-    spatial_estimator: str = "clipped_rms",  # "mad" | "clipped_rms"
+    spatial_estimator: str = "mad",  # "mad" | "clipped_rms"
     clip_sigma: float = 3.0,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[int, np.ndarray]]]:
     """

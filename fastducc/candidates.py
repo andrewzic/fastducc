@@ -779,33 +779,34 @@ def save_candidate_summary(
     if continuum_dir:
         meta_guess = parse_candidate_filename(out_prefix)  # use filename parser shipped in this module
         beam_lbl = meta_guess.get("beam", "") if isinstance(meta_guess, dict) else ""
-        try:
-            fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits*")))
-            if beam_lbl:
-                fits_cands = [p for p in fits_cands if beam_lbl in os.path.basename(p)]
-            if len(fits_cands) == 0:
-                fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits*")))  # fallback: first available
-            if len(fits_cands) > 0:
-                with fits.open(fits_cands[0], memmap=False) as hdul:
-                    data = hdul[0].data
-                    hdr  = hdul[0].header
-                if data.ndim > 2:
-                    data = np.squeeze(data)
-                cont_w = WCS(hdr)
-                # angular cutout size corresponding to 'spatial_size' of the transient cube
-                size_rad = spatial_size * float(pix_rad)  # radians
-                pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
-                c2d = Cutout2D(data, pos, (size_rad * u.rad, size_rad * u.rad), wcs=cont_w, mode="partial")
-                cont_im = c2d.data
-                cont_wcs = c2d.wcs
-                cont_vmin = np.nanpercentile(cont_im, 5.0)
-                cont_vmax = np.nanpercentile(cont_im, 99.5)
-        except Exception:
-            cont_im, cont_wcs = None, None
+        print(f"Looking for continuum FITS in '{continuum_dir}' with beam label '{beam_lbl}'...")
+        # try:
+        fits_cands = sorted(glob.glob(os.path.join(continuum_dir, f"*{beam_lbl}*.fits")))
+        # if beam_lbl:
+        #     fits_cands = [p for p in fits_cands if beam_lbl in os.path.basename(p)]
+        if len(fits_cands) == 0:
+            fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits")))  # fallback: first available
+        if len(fits_cands) > 0:
+            with fits.open(fits_cands[0], memmap=False) as hdul:
+                data = hdul[0].data
+                hdr  = hdul[0].header
+            if data.ndim > 2:
+                data = np.squeeze(data)
+            cont_w = WCS(hdr)
+            # angular cutout size corresponding to 'spatial_size' of the transient cube
+            size_rad = spatial_size * float(pix_rad)  # radians
+            pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
+            c2d = Cutout2D(data, pos, (size_rad * u.rad, size_rad * u.rad), wcs=cont_w, mode="partial")
+            cont_im = c2d.data
+            cont_wcs = c2d.wcs
+            cont_vmin = np.nanpercentile(cont_im, 5.0)
+            cont_vmax = np.nanpercentile(cont_im, 99.5)
+        # except Exception:
+        #     cont_im, cont_wcs = None, None
 
     # --- figure layout ---
     out_fig = f"{out_prefix}_summary.pdf"
-    fig = plt.figure(figsize=(16, 9), dpi=dpi)#, constrained_layout=True)
+    fig = plt.figure(figsize=(18, 12), dpi=dpi)#, constrained_layout=True)
     gs = GridSpec(
         nrows=2, ncols=3, figure=fig,
         height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0],

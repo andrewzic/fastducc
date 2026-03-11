@@ -52,9 +52,9 @@ def main():
                                     )
 
     pix_rad = args.pixsize_arcsec / 206265.0
-    ra0_rad, dec0_rad, used_field = ducc.get_phase_center(args.msname, field_name=None)
+    ra0_rad, dec0_rad, used_field = ducc0.get_phase_center(args.msname, field_name=None)
 
-    _wcs = ducc._build_fullframe_wcs(npix_x=args.npix_x, npix_y=args.npix_y,
+    _wcs = ducc0._build_fullframe_wcs(npix_x=args.npix_x, npix_y=args.npix_y,
                                      ra0_rad=ra0_rad, dec0_rad=dec0_rad,
                                      pixscale_rad=pix_rad,
                                      ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=2000.0)
