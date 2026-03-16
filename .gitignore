@@ -7,3 +7,5 @@
 *.tmp
 *.bkp
 bkp*
+__pycache__/
+*.pyc
