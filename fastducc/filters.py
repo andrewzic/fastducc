@@ -71,6 +71,7 @@ def nms_snr_map_2d(
         det.setdefault("width_samples", 1)
         det.setdefault("time_start", 0.0)
         det.setdefault("time_end", 0.0)
+        det.setdefault("duration", 0.0)
         det.setdefault("t0_idx", 0)
         det.setdefault("t1_idx_excl", 0)
         det.setdefault("center_idx", 0)
@@ -87,6 +88,12 @@ def nms_snr_map_2d(
             else:
                 k = None
             if k is not None:
+                dt = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
+                det["t0_idx"] = k
+                det["t1_idx_excl"] = k + 1
+                det["time_start"] = float(times[k]) - 0.5 * dt
+                det["time_end"] = float(times[k]) + 0.5 * dt
+                det["duration"] = dt
                 det["center_idx"] = k
                 det["time_center"] = float(times[k])
 
@@ -113,6 +120,7 @@ def nms_snr_maps_per_width(
     """
     Spatial (and optional temporal) NMS using compiled 2D max-filter for peaks.
     """
+    dt = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
     detections_by_width: Dict[int, List[Dict[str, Any]]] = {}
 
     for w, snr_w in snr_cubes.items():
@@ -168,23 +176,12 @@ def nms_snr_maps_per_width(
 
                 t1 = t0 + w  # exclusive
                 
-                time_start = float(times[t0])
-                time_end = float(times[t1 - 1])
+                time_start = float(times[t0]) - 0.5 * dt
+                time_end = float(times[t1 - 1]) + 0.5 * dt
+                duration = time_end - time_start
                 
                 center_idx  = t0 + (w // 2)
-                time_center = float(times[center_idx])
-
-                # time_center = 0.5 * (time_start + time_end)
-
-                # k = np.searchsorted(times[t0:t1], time_center)
-                # if k == 0:
-                #     center_idx = t0
-                # elif k >= (t1 - t0):
-                #     center_idx = t1 - 1
-                # else:
-                #     left = t0 + (k - 1)
-                #     right = t0 + k
-                #     center_idx = left if abs(times[left] - time_center) <= abs(times[right] - time_center) else right
+                time_center = 0.5 * (time_start + time_end)
 
                 det = {
                     "y": int(y),
@@ -197,6 +194,7 @@ def nms_snr_maps_per_width(
                     "time_start": time_start,
                     "time_end": time_end,
                     "time_center": float(time_center),
+                    "duration": float(duration),
                 }
                 detections.append(det)
 

@@ -344,12 +344,12 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
         t = Table(names=[
             "srcname","x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
             "ra_hms","dec_dms","snr","width_samples",
-            "time_start","time_end","time_center",
+            "time_start","time_end","time_center","duration",
             "t0_idx","t1_idx_excl","center_idx","phase_center_field"
         ], dtype=[
             str, int,int,float,float,float,float,float,float,
             "U20","U20",float,int,
-            float,float,float,
+            float,float,float,float,
             int,int,int,"U64"
         ])
         return t
@@ -383,6 +383,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
     time_start   = np.array(col("time_start"), dtype=float)
     time_end     = np.array(col("time_end"), dtype=float)
     time_center  = np.array(col("time_center"), dtype=float)
+    duration     = np.array(col("duration"), dtype=float)
 
     t0_idx       = np.array(col("t0_idx", default=np.int64(-1)), dtype=np.int64)
     t1_idx_excl  = np.array(col("t1_idx_excl", default=np.int64(-1)), dtype=np.int64)
@@ -409,6 +410,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
     t["time_start"]  = time_start * u.s
     t["time_end"]    = time_end * u.s
     t["time_center"] = time_center * u.s
+    t["duration"]    = duration * u.s
     t["t0_idx"]      = t0_idx
     t["t1_idx_excl"] = t1_idx_excl
     t["center_idx"]  = center_idx
@@ -1211,11 +1213,11 @@ def _stack_tables_or_empty(tables):
         # Create a minimal empty table with common columns used in pipeline
         return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
                             "ra_hms","dec_dms","snr","std","width_samples",
-                            "time_start","time_end","time_center","t0_idx","t1_idx_excl",
+                            "time_start","time_end","time_center","duration","t0_idx","t1_idx_excl",
                             "center_idx","phase_center_field","chunk_id","algo"],
                      dtype=[int,int,float,float,float,float,float,float,
                             "U20","U20",float,float,int,
-                            float,float,float,int,int,
+                            float,float,float,float,int,int,
                             int,"U64",int,"U16"])
     # Use outer join to be resilient to column differences across chunks
     T = vstack(tables, join_type="outer", metadata_conflicts="silent")
@@ -1242,11 +1244,11 @@ def _stack_tables_or_empty(tables):
         # Create a minimal empty table with common columns used in pipeline
         return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
                             "ra_hms","dec_dms","snr","std","width_samples",
-                            "time_start","time_end","time_center","t0_idx","t1_idx_excl",
+                            "time_start","time_end","time_center","duration","t0_idx","t1_idx_excl",
                             "center_idx","phase_center_field","chunk_id","algo"],
                      dtype=[int,int,float,float,float,float,float,float,
                             "U20","U20",float,float,int,
-                            float,float,float,int,int,
+                            float,float,float,float,int,int,
                             int,"U64",int,"U16"])
     # Use outer join to be resilient to column differences across chunks
     T = vstack(tables, join_type="outer", metadata_conflicts="silent")
@@ -1695,10 +1697,15 @@ def aggregate_beam_candidate_tables(
 
     # Empty case
     if len(rows) == 0:
-        names = ['event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr', 'beam_ids', 'field', 'sbid']
+        names = [
+            'event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr',
+            'max_snr_time_center', 'max_snr_beam'
+        ]
         if kind == 'boxcar':
+            names.append('max_snr_width')
             names.append('width_samples')
-        names += ['scan_ids', 'n_beams', 'n_detections']
+            names.append('width_all')
+        names += ['beam_ids', 'beam_all', 'snr_all', 'field', 'sbid', 'scan_ids', 'n_beams', 'n_detections']
         out = Table(names=names)
         if out_csv: 
             out.write(out_csv, format='csv', overwrite=True)
@@ -1736,6 +1743,8 @@ def aggregate_beam_candidate_tables(
             beams = sorted({det.get('beam_id', '')})
             scans = sorted({det.get('scan_id', '')})
             ra_hms, dec_dms, srcname = _sexagesimal_from_deg(float(det["ra_deg"]), float(det["dec_deg"]))
+            w = det.get('width_samples', None)
+            w_str = str(int(w)) if w is not None else ''
             ev = {
                 'srcname': srcname,
                 'time_center': float(det['time_center']),
@@ -1752,11 +1761,13 @@ def aggregate_beam_candidate_tables(
                 'n_detections': 1,
                 'max_snr_beam': str(det.get('beam_id', '')),
                 'max_snr_time_center': float(det['time_center']),
+                'beam_all': str(det.get('beam_id', '')),
+                'snr_all': f"{float(det['snr']):.2f}",
             }
             if kind == 'boxcar':
-                w = det.get('width_samples', None)
-                ev['width_samples'] = str(int(w)) if w is not None else ''
+                ev['width_samples'] = w_str
                 ev['max_snr_width'] = int(w) if w is not None else -1
+                ev['width_all'] = w_str
             events.append(ev)
             continue
 
@@ -1767,9 +1778,12 @@ def aggregate_beam_candidate_tables(
         for comp in comps:
             inds = [a0 + int(ii) for ii in comp]
             sub = [rows[ii] for ii in inds]
-            best = max(sub, key=lambda r: float(r.get('snr', -np.inf)))
-            beams = sorted({r.get('beam_id', '') for r in sub})
-            scans = sorted({r.get('scan_id', '') for r in sub})
+            # Sort sub by SNR descending so the lists align by descending SNR
+            sub_sorted = sorted(sub, key=lambda r: float(r.get('snr', -np.inf)), reverse=True)
+            best = sub_sorted[0]
+            beams_all_lst = [str(r.get('beam_id', '')) for r in sub_sorted]
+            beams_unique = sorted({b for b in beams_all_lst if b})
+            scans = sorted({r.get('scan_id', '') for r in sub_sorted})
             ra_hms, dec_dms, srcname = _sexagesimal_from_deg(float(best["ra_deg"]), float(best["dec_deg"]))
             ev = {
                 'srcname': srcname,
@@ -1779,23 +1793,26 @@ def aggregate_beam_candidate_tables(
                 'ra_hms': str(ra_hms),
                 'dec_dms': str(dec_dms),
                 'max_snr': float(best['snr']),
-                'beam_ids': ','.join([b for b in beams if b]),
+                'beam_ids': ','.join(beams_unique),
                 'scan_ids': ','.join([s for s in scans if s]),
-                'fields': ','.join(sorted({r.get('field','') for r in sub})),
-                'sbids' : ','.join(sorted({r.get('sbid','') for r in sub})),
-                'n_beams': len([b for b in beams if b]),
-                'n_detections': len(sub),
+                'fields': ','.join(sorted({r.get('field','') for r in sub_sorted})),
+                'sbids' : ','.join(sorted({r.get('sbid','') for r in sub_sorted})),
+                'n_beams': len(beams_unique),
+                'n_detections': len(sub_sorted),
                 'max_snr_beam': str(best.get('beam_id', '')),
                 'max_snr_time_center': float(best['time_center']),
+                'beam_all': ','.join(beams_all_lst),
+                'snr_all': ','.join([f"{float(r.get('snr', 0.0)):.2f}" for r in sub_sorted]),
             }
             if kind == 'boxcar':
-                widths = sorted({int(r.get('width_samples', -1)) for r in sub
+                widths_unique = sorted({int(r.get('width_samples', -1)) for r in sub_sorted
                                  if r.get('width_samples', None) is not None and int(r.get('width_samples', -1)) >= 0})
-                ev['width_samples'] = ','.join([str(w) for w in widths])
+                ev['width_samples'] = ','.join([str(w) for w in widths_unique])
                 try:
                     ev['max_snr_width'] = int(best.get('width_samples', -1))
                 except Exception:
                     ev['max_snr_width'] = -1                
+                ev['width_all'] = ','.join([str(int(r.get('width_samples', 1))) for r in sub_sorted])
             events.append(ev)
 
     events.sort(key=lambda r: r['time_center'])
@@ -1803,11 +1820,15 @@ def aggregate_beam_candidate_tables(
         ev['event_id'] = i
 
     # Build event table (columns preserved)
-    colnames = ['event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
-                'max_snr', 'beam_ids']
+    colnames = [
+        'event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
+        'max_snr', 'max_snr_time_center', 'max_snr_beam'
+    ]
     if kind == 'boxcar':
+        colnames.append('max_snr_width')
         colnames.append('width_samples')
-    colnames += ['scan_ids', 'n_beams', 'n_detections']
+        colnames.append('width_all')
+    colnames += ['beam_ids', 'beam_all', 'snr_all', 'scan_ids', 'n_beams', 'n_detections']
     event_tab = Table(rows=[[ev.get(c) for c in colnames] for ev in events], names=colnames)
     if out_csv: 
         event_tab.write(out_csv, format='csv', overwrite=True)
