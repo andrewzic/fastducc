@@ -385,16 +385,29 @@ def main():
     time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in set(t_main.colnames()) else 'TIME'
     it = t_main.iter([time_col], sort=True)
     total_chunks = sum(1 for _ in it)
+    dts = [i[1][0] - i[0][0] for i in zip(it[:-1], it[1:])]
+    dt = np.median(dts)
     print(f"Found {total_chunks} time chunks in MS: {cfg.msname}")
+    print(f"Found time resolution {dt}s")
     t_main.close()
 
+    # MAKE CHUNKS HAVE OVERLAP TO ACCOUNT FOR DISPERSIVE DELAYS
+    # for DM = 1000 and 0.6-1GHz band, DM delay is ~7 s.
+    #  So a 10s buffer around each chunk should be sufficient
+
+    buffer_overlap = 10.0 #s
+    buffer_overlap_samps = int(buffer_overlap / dt)
+    
     chunk_size = max(1, args.chunk_size)
+    if chunk_size < 2* buffer_overlap_samps:
+        print(f"WARNING: chunk_size {chunk_size} is smaller than 2 * buffer_overlap_samps {2*buffer_overlap_samps}. Consider increasing chunk_size.")
+    
     chunk_bounds = []
     start = 0
-    while start < total_chunks:
-        end = min(start + chunk_size - 1, total_chunks - 1)
+    while start < total_chunks: #nb total chunks is the total number of unique time samples in the ms...
+        end = min(start + chunk_size + buffer_overlap_samps - 1, total_chunks - 1)
         chunk_bounds.append((start, end))
-        start = end + 1
+        start = end + 1 - buffer_overlap_samps
 
     # Execute chunks: serial, Dask-Local, or Dask-SLURM
     agg_list = []
