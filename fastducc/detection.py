@@ -45,9 +45,9 @@ def boxcar_search_time(
         data = data - mean_map
 
     # Convert widths
+    dt = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
     widths_samples: List[int] = []
     if widths_in_seconds:
-        dt = np.median(np.diff(times))
         if not np.isfinite(dt) or dt <= 0:
             raise ValueError("Invalid dt; cannot convert seconds to samples.")
         for w_sec in widths:
@@ -124,27 +124,18 @@ def boxcar_search_time(
         for i in range(t0_idx.size):
             t0 = int(t0_idx[i])
             t1 = t0 + w  # exclusive, safe: t1 <= T
-            time_start = float(times[t0])
-            time_end = float(times[t1 - 1])
+            time_start = float(times[t0]) - 0.5 * dt
+            time_end = float(times[t1 - 1]) + 0.5 * dt
+            duration = time_end - time_start
 
             center_idx  = t0 + (w // 2)
-            time_center = float(times[center_idx])
-
-            # # nearest index to time_center, constrained to [t0, t1-1]
-            # k = np.searchsorted(times[t0:t1], time_center)
-            # if k == 0:
-            #     center_idx = t0
-            # elif k >= (t1 - t0):
-            #     center_idx = t1 - 1
-            # else:
-            #     left = t0 + (k - 1)
-            #     right = t0 + k
-            #     center_idx = left if abs(times[left] - time_center) <= abs(times[right] - time_center) else right
+            time_center = 0.5 * (time_start + time_end)
 
             det = {
                 "time_start": time_start,
                 "time_end": time_end,
                 "time_center": float(time_center),
+                "duration": float(duration),
                 "t0_idx": t0,
                 "t1_idx_excl": t1,
                 "center_idx": int(center_idx),
@@ -292,6 +283,7 @@ def variance_search(
             "time_start": None,
             "time_end": None,
             "time_center": None,
+            "duration": None,
             "center_idx": None,
         }
         detections.append(det)
@@ -418,10 +410,11 @@ def variance_search_welford(
             "std": float(std_map64[y, x]),
             # placeholders to satisfy downstream code
             "time_start": 0,
-            "time_end": 20,
-            "time_center": 10,
-            "center_idx": 10,
-            "width_samples": 1,
+            "time_end": 99999,
+            "time_center": 9999,
+            "duration": 999,
+            "center_idx": 9999,
+            "width_samples": 999,
         }
         detections.append(det)
 
