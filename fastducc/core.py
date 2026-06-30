@@ -451,13 +451,14 @@ def consolidate_catalogues(cfg: Config):
 
 
 
-def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int):
+def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int, scan_ids: int | None = None):
     """
     Worker task: image the chunk, produce per-chunk outputs, and return per-chunk Welford aggregates.
     """
     # Imaging: open MS inside worker (t_main=None)
-    times, cube = imaging.image_time_samples(
+    times, cube, scan_ids = imaging.image_time_samples(
         msname=cfg.msname, t_main=None,
+        scan_number=scan_ids,
         start_time_idx=start, end_time_idx=end,
         corr_mode=cfg.corr_mode, basis=cfg.basis, single_pol=cfg.single_pol,
         data_column=cfg.data_column,

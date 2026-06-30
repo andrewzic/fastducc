@@ -213,6 +213,7 @@ def image_time_samples(
     corr_mode: str = 'average',  # 'average' | 'stokesI' | 'single'
     basis: str = 'auto',         # for stokesI: 'auto' | 'linear' | 'circular'
     single_pol: str = 'XX',      # used when corr_mode='single'
+    scan_number: int | None = None,
     average_correlations: bool = True,
     corr_index: int | None = None,
     use_weight_spectrum: bool = True,
@@ -449,5 +450,5 @@ def image_time_samples(
     #it.close()
     #t_main.close()
     
-    results = (times, cube)    
+    results = (times, cube, scan_number)
     return results

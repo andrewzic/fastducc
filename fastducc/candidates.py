@@ -1377,6 +1377,11 @@ def parse_candidate_filename(path: str, *, require: str | None = None) -> dict:
     m_scan = re.search(r'(\d{14})', fname)
     if m_scan:
         info["scan_id"] = m_scan.group(1)
+    else:
+        # Catch "combined" scan directories (e.g. cont_combined, native_combined)
+        m_combined = re.search(r'(\w+_combined)', fname)
+        if m_combined:
+            info["scan_id"] = m_combined.group(1)
 
     # NOTE: now includes periodicity
     m_kind_super = re.search(r'_(boxcar|variance|periodicity)_super_summary\.(?:vot|xml|csv)$', fname, re.IGNORECASE)

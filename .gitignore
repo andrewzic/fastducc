@@ -9,3 +9,4 @@
 bkp*
 __pycache__/
 *.pyc
+.aider*

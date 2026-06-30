@@ -398,16 +398,26 @@ def main():
     buffer_overlap = 10.0 #s
     buffer_overlap_samps = int(buffer_overlap / dt)
     
+
     chunk_size = max(1, args.chunk_size)
-    if chunk_size < 2* buffer_overlap_samps:
-        print(f"WARNING: chunk_size {chunk_size} is smaller than 2 * buffer_overlap_samps {2*buffer_overlap_samps}. Consider increasing chunk_size.")
+    if chunk_size < 2 * buffer_overlap_samps:
+        print(f"WARNING: chunk_size {chunk_size} is smaller than 2 * buffer_overlap_samps {2*buffer_overlap_samps}.")
     
-    chunk_bounds = []
-    start = 0
-    while start < total_chunks: #nb total chunks is the total number of unique time samples in the ms...
-        end = min(start + chunk_size + buffer_overlap_samps - 1, total_chunks - 1)
-        chunk_bounds.append((start, end))
-        start = end + 1 - buffer_overlap_samps
+    chunk_bounds, scan_per_time_idx = ms_utils.get_scan_aware_chunk_bounds(
+        cfg.msname, time_col, chunk_size, buffer_overlap_samps
+    )
+    print(f"Defined {len(chunk_bounds)} scan-aware chunks across {len(np.unique(scan_per_time_idx))} scans.")
+    
+    # chunk_size = max(1, args.chunk_size)
+    # if chunk_size < 2* buffer_overlap_samps:
+    #     print(f"WARNING: chunk_size {chunk_size} is smaller than 2 * buffer_overlap_samps {2*buffer_overlap_samps}. Consider increasing chunk_size.")
+    
+    # chunk_bounds = []
+    # start = 0
+    # while start < total_chunks: #nb total chunks is the total number of unique time samples in the ms...
+    #     end = min(start + chunk_size + buffer_overlap_samps - 1, total_chunks - 1)
+    #     chunk_bounds.append((start, end))
+    #     start = end + 1 - buffer_overlap_samps
 
     # Execute chunks: serial, Dask-Local, or Dask-SLURM
     agg_list = []

@@ -35,6 +35,41 @@ def get_channel_lambdas(ms):
     tf.close()
     return nchan, channel_freqs, channel_lambdas
 
+def get_scan_aware_chunk_bounds(
+    msname: str,
+    time_col: str,
+    chunk_size: int,
+    buffer_overlap_samps: int,
+) -> tuple[list[tuple[int, int]], np.ndarray]:
+    """
+    Returns (chunk_bounds, scan_per_time_idx) where:
+      - chunk_bounds: list of (start, end) into the sorted unique-time index sequence.
+        Chunks never span scan boundaries. Overlap buffer is added within scans only.
+      - scan_per_time_idx: int array of shape (total_unique_times,) giving the
+        SCAN_NUMBER at each time index.
+    """
+    t = table(msname, readonly=True)
+    times_all = t.getcol(time_col)
+    has_scan = 'SCAN_NUMBER' in set(t.colnames())
+    scans_all = t.getcol('SCAN_NUMBER') if has_scan else np.zeros(len(times_all), dtype=int)
+    t.close()
+    # Reduce to unique times (sorted), keeping first-row scan for each
+    unique_times, first_idx = np.unique(times_all, return_index=True)
+    scan_per_time = scans_all[first_idx]   # shape: (total_chunks,)
+    # Find where scan changes → these are hard boundaries
+    scan_change = np.where(np.diff(scan_per_time) != 0)[0] + 1  # indices of first sample of new scan
+    boundaries = np.concatenate(([0], scan_change, [len(unique_times)]))
+    chunk_bounds = []
+    for b_start, b_end in zip(boundaries[:-1], boundaries[1:]):
+        # Slice of time indices belonging to this scan
+        scan_end = b_end - 1   # inclusive last index in this scan
+        pos = b_start
+        while pos <= scan_end:
+            end = min(pos + chunk_size + buffer_overlap_samps - 1, scan_end)
+            chunk_bounds.append((pos, end))
+            pos = end + 1 - buffer_overlap_samps
+    return chunk_bounds, scan_per_time
+
 
 def get_time(t):
     vis_time = t.getcol('TIME_CENTROID')

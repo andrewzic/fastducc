@@ -287,7 +287,7 @@ def run_periodicity(args=None) -> str:
         with np.load(meta["path"]) as z:
             X_blk = z["X"]
             t0 = float(z["t0"])
-        phase = np.exp(-1j * 2.0 * np.pi * fkeep * t0).astype(np.complex64)
+        phase = np.exp(1j * 2.0 * np.pi * fkeep * t0).astype(np.complex64)
         mm += X_blk * phase[None, None, :]
 
     # power cube
