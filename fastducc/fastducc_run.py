@@ -11,7 +11,7 @@ try:
 except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
-from fastducc.types import Config
+from fastducc.fd_types import Config
 from fastducc import candidates, ms_utils, imaging
 from fastducc import core as fd_core
 from fastducc.catalogues import get_psrcat_csv_path, get_racs_vot_path

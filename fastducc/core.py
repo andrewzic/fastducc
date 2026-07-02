@@ -10,7 +10,7 @@ except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
 from fastducc import wcs as ducc_wcs
-from fastducc.types import Config, WelfordState
+from fastducc.fd_types import Config, WelfordState
 from fastducc import filters, kernels, candidates, detection, imaging
 
 def init_welford(cfg: Config) -> WelfordState:
