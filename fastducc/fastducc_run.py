@@ -421,10 +421,17 @@ def main():
 
     # Execute chunks: serial, Dask-Local, or Dask-SLURM
     agg_list = []
+    
+    # Pre-compute scan_id_str for each chunk
+    chunk_scan_ids = []
+    for (s, e) in chunk_bounds:
+        chunk_scans = scan_per_time_idx[s:e+1]
+        chunk_scan_ids.append(ms_utils.derive_scan_id(chunk_scans))
+        
     if args.parallel_mode == 'serial':
-        for (start, end) in chunk_bounds:
-            print(f"[Serial] Chunk {start}..{end}")
-            times, cube, c, m, M2 = fd_core.process_chunk_task(cfg, ms_base, candidates_dir, start, end)
+        for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
+            print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str})")
+            times, cube, c, m, M2 = fd_core.process_chunk_task(cfg, ms_base, candidates_dir, start, end, scan_id_str)
             agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2))
 
     elif args.parallel_mode == 'dask-local':
@@ -435,8 +442,8 @@ def main():
             processes=(args.dask_scheduler == 'processes')
         )
         with Client(cluster) as client:
-            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e)
-                       for (s, e) in chunk_bounds]
+            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str)
+                       for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
             agg_list = client.gather(futures)
         cluster.close()
 
@@ -467,8 +474,8 @@ def main():
         with Client(cluster) as client:
             # (optional) wait for workers before submitting
             # client.wait_for_workers(min(1, args.dask_workers or 1))
-            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e)
-                       for (s, e) in chunk_bounds]
+            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str)
+                       for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
             agg_list = client.gather(futures)
 
         # Graceful stop after the client context exits

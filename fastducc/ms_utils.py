@@ -70,6 +70,23 @@ def get_scan_aware_chunk_bounds(
             pos = end + 1 - buffer_overlap_samps
     return chunk_bounds, scan_per_time
 
+def derive_scan_id(scan_numbers: np.ndarray) -> str:
+    """
+    Given an array of scan numbers for a chunk, return the dominant scan ID as a string.
+    Returns '' if no valid scan number is found (e.g. all zeros).
+    """
+    if len(scan_numbers) == 0:
+        return ""
+    
+    # Filter out zeros
+    valid_scans = scan_numbers[scan_numbers != 0]
+    if len(valid_scans) == 0:
+        return ""
+    
+    # Return the most common (mode)
+    unique_scans, counts = np.unique(valid_scans, return_counts=True)
+    return str(unique_scans[np.argmax(counts)])
+
 
 def get_time(t):
     vis_time = t.getcol('TIME_CENTROID')

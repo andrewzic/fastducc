@@ -331,7 +331,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
 
     Expected keys per candidate dict (from annotate_candidates_with_sky_coords):
       'x','y','l','m','ra_rad','dec_rad','ra_hms','dec_dms','snr','width_samples',
-      'time_start','time_end','time_center','t0_idx','t1_idx_excl','center_idx',
+      'time_start','time_end','time_center','t0_idx','t1_idx_excl','center_idx','scan_id',
       'phase_center_field' (some keys may be missing depending on pipeline)
 
     Returns
@@ -345,12 +345,12 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
             "srcname","x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
             "ra_hms","dec_dms","snr","width_samples",
             "time_start","time_end","time_center","duration",
-            "t0_idx","t1_idx_excl","center_idx","phase_center_field"
+            "t0_idx","t1_idx_excl","center_idx","scan_id","phase_center_field"
         ], dtype=[
             str, int,int,float,float,float,float,float,float,
             "U20","U20",float,int,
             float,float,float,float,
-            int,int,int,"U64"
+            int,int,int,int,"U64"
         ])
         return t
 
@@ -387,6 +387,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
 
     t0_idx       = np.array(col("t0_idx", default=np.int64(-1)), dtype=np.int64)
     t1_idx_excl  = np.array(col("t1_idx_excl", default=np.int64(-1)), dtype=np.int64)
+    scan_id      = np.array(col("scan_id", default=np.int64(-1)), dtype=np.int64)
     center_idx   = np.array(col("center_idx", default=np.int64(-1)), dtype=np.int64)
 
     # Field name (string)
@@ -414,6 +415,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
     t["t0_idx"]      = t0_idx
     t["t1_idx_excl"] = t1_idx_excl
     t["center_idx"]  = center_idx
+    t["scan_id"]     = scan_id
     t["phase_center_field"] = field_name
 
     return t

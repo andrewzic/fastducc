@@ -451,14 +451,13 @@ def consolidate_catalogues(cfg: Config):
 
 
 
-def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int, scan_ids: int | None = None):
+def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int, scan_id_str: str = ""):
     """
     Worker task: image the chunk, produce per-chunk outputs, and return per-chunk Welford aggregates.
     """
     # Imaging: open MS inside worker (t_main=None)
-    times, cube, scan_ids = imaging.image_time_samples(
+    times, cube = imaging.image_time_samples(
         msname=cfg.msname, t_main=None,
-        scan_number=scan_ids,
         start_time_idx=start, end_time_idx=end,
         corr_mode=cfg.corr_mode, basis=cfg.basis, single_pol=cfg.single_pol,
         data_column=cfg.data_column,
@@ -475,7 +474,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     M2 = np.zeros((Ny, Nx), dtype=np.float64)
     kernels.welford_update_cube(c, m, M2, cube, ignore_nan=True)
 
-    chunk_root = os.path.join(candidates_dir, f"{ms_base}_chunk_{start:06d}")
+    scan_suffix = f"_scan_{scan_id_str}" if scan_id_str else ""
+    chunk_root = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}_chunk_{start:06d}")
 
     # Optional per-chunk variance search
     if cfg.enable_var and cfg.enable_var_chunk:
@@ -506,6 +506,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
                     flip_u=True, flip_v=True, field_name=None
                 )
+                for cand in annotated_var:
+                    cand["scan_id"] = scan_id_str
                 t_var = candidates.candidates_to_astropy_table(annotated_var)
                 candidates.save_candidates_table(t_var,
                                                 csv_path=f"{var_root}_candidates.csv",
@@ -595,6 +597,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
                     flip_u=True, flip_v=True, field_name=None
                 )
+                for cand in annotated:
+                    cand["scan_id"] = scan_id_str
                 t_box = candidates.candidates_to_astropy_table(annotated)
                 candidates.save_candidates_table(t_box,
                     csv_path=f"{box_root}_candidates.csv",
