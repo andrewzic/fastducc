@@ -3,7 +3,7 @@ import numpy as np
 import astropy.constants as const
 import astropy.units as u
 
-from casacore.tables import table
+from casacore.tables import table, taql
 try:
     import ducc0
 except Exception as e:
@@ -35,6 +35,25 @@ def get_channel_lambdas(ms):
     tf.close()
     return nchan, channel_freqs, channel_lambdas
 
+def get_unique_times(msname: str, time_col: str) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Get sorted unique times and scan numbers efficiently using TaQL.
+    """
+    t = table(msname, readonly=True)
+    has_scan = 'SCAN_NUMBER' in set(t.colnames())
+    if has_scan:
+        res = taql(f"SELECT DISTINCT {time_col}, SCAN_NUMBER FROM $t ORDERBY {time_col}", tables={'t': t})
+        unique_times = res.getcol(time_col)
+        scan_per_time = res.getcol('SCAN_NUMBER')
+        res.close()
+    else:
+        res = taql(f"SELECT DISTINCT {time_col} FROM $t ORDERBY {time_col}", tables={'t': t})
+        unique_times = res.getcol(time_col)
+        scan_per_time = np.zeros(len(unique_times), dtype=int)
+        res.close()
+    t.close()
+    return unique_times, scan_per_time
+
 def get_scan_aware_chunk_bounds(
     msname: str,
     time_col: str,
@@ -48,14 +67,7 @@ def get_scan_aware_chunk_bounds(
       - scan_per_time_idx: int array of shape (total_unique_times,) giving the
         SCAN_NUMBER at each time index.
     """
-    t = table(msname, readonly=True)
-    times_all = t.getcol(time_col)
-    has_scan = 'SCAN_NUMBER' in set(t.colnames())
-    scans_all = t.getcol('SCAN_NUMBER') if has_scan else np.zeros(len(times_all), dtype=int)
-    t.close()
-    # Reduce to unique times (sorted), keeping first-row scan for each
-    unique_times, first_idx = np.unique(times_all, return_index=True)
-    scan_per_time = scans_all[first_idx]   # shape: (total_chunks,)
+    unique_times, scan_per_time = get_unique_times(msname, time_col)
     # Find where scan changes → these are hard boundaries
     scan_change = np.where(np.diff(scan_per_time) != 0)[0] + 1  # indices of first sample of new scan
     boundaries = np.concatenate(([0], scan_change, [len(unique_times)]))
@@ -135,12 +147,18 @@ def get_timebin(t_main, time_col: str) -> float:
     """
     Get the timebin of the MS from the INTERVAL column.
     """
+    nrows = t_main.nrows()
+    if nrows == 0:
+        return 1.0
+    
+    # Read at most 10,000 rows to avoid loading a massive column into memory
+    nrow_to_read = min(10000, nrows)
     try:
-        intervals = t_main.getcol('INTERVAL')
+        intervals = t_main.getcol('INTERVAL', 0, nrow_to_read)
         timebin = float(np.median(intervals))
     except Exception:
         # Fallback to time_col if INTERVAL is somehow missing
-        times = t_main.getcol(time_col)
+        times = t_main.getcol(time_col, 0, nrow_to_read)
         times = np.sort(np.unique(times))
         if len(times) > 1:
             timebin = float(np.median(np.diff(times)))
@@ -153,8 +171,9 @@ def open_ms(msname: str):
     t_main = table(msname, readonly=True)
     colnames = set(t_main.colnames())
     time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
-    times_all = t_main.getcol(time_col)
-    total_chunks = len(np.unique(times_all))
+    # Use get_unique_times helper to avoid loading full time column in Python
+    unique_times, _ = get_unique_times(msname, time_col)
+    total_chunks = len(unique_times)
     return t_main, total_chunks, time_col
 
 

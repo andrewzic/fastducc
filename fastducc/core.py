@@ -451,7 +451,7 @@ def consolidate_catalogues(cfg: Config):
 
 
 
-def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int, scan_id_str: str = ""):
+def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int, scan_id_str: str = "", chunk_times: np.ndarray | None = None):
     """
     Worker task: image the chunk, produce per-chunk outputs, and return per-chunk Welford aggregates.
     """
@@ -459,6 +459,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     times, cube = imaging.image_time_samples(
         msname=cfg.msname, t_main=None,
         start_time_idx=start, end_time_idx=end,
+        chunk_times=chunk_times,
         corr_mode=cfg.corr_mode, basis=cfg.basis, single_pol=cfg.single_pol,
         data_column=cfg.data_column,
         npix_x=cfg.npix_x, npix_y=cfg.npix_y,

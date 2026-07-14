@@ -384,15 +384,14 @@ def main():
     # Compute chunk bounds (using casacore once in the driver)
     t_main = table(cfg.msname, readonly=True)
     time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in set(t_main.colnames()) else 'TIME'
-    times_all = t_main.getcol(time_col)
-    unique_times = np.unique(times_all)
-    total_chunks = len(unique_times)
-    
     dt = ms_utils.get_timebin(t_main, time_col)
+    t_main.close()
+
+    unique_times, scan_per_time_idx = ms_utils.get_unique_times(cfg.msname, time_col)
+    total_chunks = len(unique_times)
         
     print(f"Found {total_chunks} time chunks in MS: {cfg.msname}")
     print(f"Found time resolution {dt}s")
-    t_main.close()
 
     # MAKE CHUNKS HAVE OVERLAP TO ACCOUNT FOR DISPERSIVE DELAYS
     # for DM = 1000 and 0.6-1GHz band, DM delay is ~7 s.
@@ -434,7 +433,10 @@ def main():
     if args.parallel_mode == 'serial':
         for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
             print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str})")
-            times, cube, c, m, M2 = fd_core.process_chunk_task(cfg, ms_base, candidates_dir, start, end, scan_id_str)
+            chunk_times = unique_times[start:end+1]
+            times, cube, c, m, M2 = fd_core.process_chunk_task(
+                cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
+            )
             agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2))
 
     elif args.parallel_mode == 'dask-local':
@@ -445,7 +447,7 @@ def main():
             processes=(args.dask_scheduler == 'processes')
         )
         with Client(cluster) as client:
-            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str)
+            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
                        for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
             agg_list = client.gather(futures)
         cluster.close()
@@ -477,7 +479,7 @@ def main():
         with Client(cluster) as client:
             # (optional) wait for workers before submitting
             # client.wait_for_workers(min(1, args.dask_workers or 1))
-            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str)
+            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
                        for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
             agg_list = client.gather(futures)
 

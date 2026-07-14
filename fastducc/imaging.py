@@ -209,6 +209,7 @@ def image_time_samples(
     t_main: Any | None = None,
     start_time_idx: int | None = None,
     end_time_idx: int | None = None,
+    chunk_times: np.ndarray | None = None,
     data_column: str = 'DATA',
     corr_mode: str = 'average',  # 'average' | 'stokesI' | 'single'
     basis: str = 'auto',         # for stokesI: 'auto' | 'linear' | 'circular'
@@ -261,8 +262,6 @@ def image_time_samples(
     colnames = set(t_main.colnames())
     time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
     #import ipdb; ipdb.set_trace()
-    it = t_main.iter([time_col], sort=True)
-    
     # Frequencies
     t_spw = table(f"{msname}/SPECTRAL_WINDOW", readonly=True)
     n_spw = t_spw.nrows()
@@ -271,35 +270,37 @@ def image_time_samples(
     chan_freq = t_spw.getcell('CHAN_FREQ', 0)  # [nchan] Hz
     t_spw.close()
 
-    #set up iterator over table, grouped by common timestamps
-    
-    #declare results list as list of tuple of float (for timestamp) and ndarray (for image)
-    #results: list[tuple[float, np.ndarray]] = []
+    if chunk_times is not None:
+        times = chunk_times
+        nt_window = len(times)
+        # Fast query selecting only rows in the time window
+        query_str = f"{time_col} >= {times[0]:.17g} AND {time_col} <= {times[-1]:.17g}"
+        t_chunk_window = t_main.query(query_str)
+    else:
+        nsub, vis_time, all_times = ms_utils.get_time(t_main)
+        start_idx = 0 if start_time_idx is None else int(start_time_idx)
+        end_idx   = (nsub - 1) if end_time_idx is None else int(end_time_idx)
+        if start_idx < 0 or end_idx < start_idx or end_idx >= nsub:
+            raise ValueError("Invalid start/end time indices")
+        times = all_times[start_idx:end_idx+1]
+        nt_window = end_idx - start_idx + 1
+        t_chunk_window = t_main
 
-    
-    nsub, vis_time, all_times = ms_utils.get_time(t_main)
-    #pre initialise img cube in mem and fill as we go
-    # the number of time samples should be the min of (N - start_idx, end_idx - start_idx, N) where N is no. of time samples
+    # Build the iterator over the subset table
+    it = t_chunk_window.iter([time_col], sort=True)
 
-    start_idx = 0 if start_time_idx is None else int(start_time_idx)
-    end_idx   = (nsub - 1) if end_time_idx is None else int(end_time_idx)
-    if start_idx < 0 or end_idx < start_idx or end_idx >= nsub:
-        raise ValueError("Invalid start/end time indices")
-
-    times = all_times[start_idx:end_idx+1]
-    nt_window = end_idx - start_idx + 1
-    
     cube = np.empty((nt_window, npix_y, npix_x))#, dtype=dtype_img)
     
     cube_idx = 0
     labels, lbl2idx = ms_utils.get_corr_label_indices(msname)
     
     for t_chunk_idx, t_chunk in enumerate(tqdm(it)):
-        # Apply start/end time-chunk windowing
-        if start_time_idx is not None and t_chunk_idx < start_time_idx:
-            continue
-        if end_time_idx is not None and t_chunk_idx > end_time_idx:
-            break
+        # Apply start/end time-chunk windowing ONLY if chunk_times is not provided
+        if chunk_times is None:
+            if start_time_idx is not None and t_chunk_idx < start_time_idx:
+                continue
+            if end_time_idx is not None and t_chunk_idx > end_time_idx:
+                break
 
         times_ = t_chunk.getcol(time_col)
         time_val = float(times_[0])
