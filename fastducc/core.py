@@ -440,7 +440,7 @@ def finalise_welford_serial(cfg: Config, wf_state: WelfordState, *, run_final_va
 
 def consolidate_catalogues(cfg: Config):
     var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
-    box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_chunk_*_boxcar_candidates.csv")
+    box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
     candidates.consolidate_chunk_catalogues(
         ms_base=cfg.ms_base,
         out_dir=cfg.candidates_dir,

@@ -678,7 +678,7 @@ def save_candidate_summary(
     use_std_images: bool = False,
     spatial_size: int = 50,
     center_policy: str = "right",
-    cmap: str = "inferno",
+    cmap: str = "viridis",
     dpi: int = 200,
     # WCS parameters for the fastducc imaging grid:
     npix_x: Optional[int] = None, npix_y: Optional[int] = None,
@@ -1064,7 +1064,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
                                     dec_rad: float,
                                     ra_sign: int = -1,
                                     dec_sign: int = 1,
-                                    cmap: str = "inferno",
+                                    cmap: str = "viridis",
                                     gif_fps: int = 5,
                                     dpi: int = 300) -> dict:
     """
@@ -1945,7 +1945,7 @@ def aggregate_observation(
     kind = kind.lower().strip()
     if pattern is None:
         suf = '*_boxcar_all.vot' if kind == 'boxcar' else '*_variance_all.vot'
-        pattern = os.path.join(obs_root, '**', 'candidates', suf) #obs_root/candidates/*.vot
+        pattern = os.path.join(obs_root, 'candidates', suf) #obs_root/candidates/*.vot
         
 
     files = sorted(glob.glob(pattern, recursive=True))
@@ -2247,7 +2247,7 @@ def aggregate_observation_from_super_summaries(
         raise ValueError("kind must be 'variance' or 'boxcar'")
 
     if pattern is None:
-        pattern = os.path.join(obs_root, "**", "candidates", f"*_{kind}_super_summary.vot")
+        pattern = os.path.join(obs_root, "*", "candidates", f"*_{kind}_super_summary.vot")
     files = sorted(glob.glob(pattern, recursive=True))
 
     if out_dir is None:

@@ -20,6 +20,24 @@ from fastducc.catalogues import get_psrcat_csv_path, get_racs_vot_path
 psrcat_path = get_psrcat_csv_path()
 racs_path   = get_racs_vot_path()
 
+def log_memory(stage: str):
+    try:
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        self_mb = process.memory_info().rss / (1024 * 1024)
+        try:
+            children = process.children(recursive=True)
+            child_mb = sum(c.memory_info().rss for c in children) / (1024 * 1024)
+        except Exception:
+            child_mb = 0.0
+        virtual_mem = psutil.virtual_memory()
+        sys_used = virtual_mem.used / (1024 * 1024)
+        sys_total = virtual_mem.total / (1024 * 1024)
+        print(f"[MEM PROFILE] Stage: {stage} | Self RSS: {self_mb:.2f} MB | Children RSS: {child_mb:.2f} MB | System Used: {sys_used:.2f}/{sys_total:.2f} MB", flush=True)
+    except Exception as e:
+        print(f"[MEM PROFILE ERROR] Could not log memory at {stage}: {e}", flush=True)
+
 def build_cli():
 
     parser = argparse.ArgumentParser(description='Image MS in time chunks using ducc0 wgridder')
@@ -363,6 +381,7 @@ def aggregate_obs_main(argv=None):
     
 
 def main():
+    log_memory("Main Startup")
 
     if sys.argv[1] == "aggregate":
         aggregate_main(sys.argv)
@@ -378,16 +397,20 @@ def main():
         main_serial(args)
         return None
 
+    log_memory("Before derive_paths and make_config")
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = ms_utils.derive_paths(args.msname)
     cfg = make_config(args, (ms_base, candidates_dir, chunk_prefix_root, all_prefix_root))
 
     # Compute chunk bounds (using casacore once in the driver)
+    log_memory("Before opening t_main (casacore)")
     t_main = table(cfg.msname, readonly=True)
     time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in set(t_main.colnames()) else 'TIME'
     dt = ms_utils.get_timebin(t_main, time_col)
     t_main.close()
+    log_memory("After closing t_main (casacore)")
 
     unique_times, scan_per_time_idx = ms_utils.get_unique_times(cfg.msname, time_col)
+    log_memory("After get_unique_times (casacore)")
     total_chunks = len(unique_times)
         
     print(f"Found {total_chunks} time chunks in MS: {cfg.msname}")
@@ -408,6 +431,7 @@ def main():
     chunk_bounds, scan_per_time_idx = ms_utils.get_scan_aware_chunk_bounds(
         cfg.msname, time_col, chunk_size, buffer_overlap_samps
     )
+    log_memory("After get_scan_aware_chunk_bounds (casacore)")
     print(f"Defined {len(chunk_bounds)} scan-aware chunks across {len(np.unique(scan_per_time_idx))} scans.")
     
     # chunk_size = max(1, args.chunk_size)
@@ -457,6 +481,7 @@ def main():
 
         scheduler_opts = {"dashboard_address": ":0"}
 
+        log_memory("Before creating SLURMCluster")
         cluster = SLURMCluster(
             queue=args.slurm_partition,
             account=args.slurm_account,
@@ -467,36 +492,47 @@ def main():
             interface=args.slurm_interface,
             scheduler_options=scheduler_opts, #avoid dashboard port conflicts
         )
+        log_memory("After creating SLURMCluster")
         # scale to number of workers (or adapt if dask_workers==0)
         if args.dask_workers and args.dask_workers > 0:
             cluster.scale(args.dask_workers)
+            log_memory(f"After cluster.scale({args.dask_workers})")
         else:
             # adaptively allocate between 1 and len(chunk_bounds) workers
             cluster.adapt(minimum=1, maximum=max(1, len(chunk_bounds)))
+            log_memory("After cluster.adapt")
 
 
         # Connect the client and run
+        log_memory("Before Client(cluster) context creation")
         with Client(cluster) as client:
+            log_memory("After Client(cluster) context creation")
             # (optional) wait for workers before submitting
             # client.wait_for_workers(min(1, args.dask_workers or 1))
             futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
                        for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
+            log_memory("After futures submit")
             agg_list = client.gather(futures)
+            log_memory("After futures gather")
 
+        log_memory("After Client closed")
         # Graceful stop after the client context exits
         try:
             cluster.scale(0)  # retire workers first
         finally:
             cluster.close()
+        log_memory("After SLURMCluster closed")
 
     else:
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
 
+    log_memory("Before finalise_welford_parallel")
     _ = fd_core.finalise_welford_parallel(cfg, agg_list, run_final_variance=True)
+    log_memory("After finalise_welford_parallel")
 
     # Consolidate per-chunk catalogues into candidates/
     var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
-    box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_chunk_*_boxcar_candidates.csv")
+    box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
     candidates.consolidate_chunk_catalogues(
         ms_base=cfg.ms_base,
         out_dir=cfg.candidates_dir,
@@ -504,6 +540,7 @@ def main():
         box_csv_pattern=box_pattern,
         remove_chunk_catalogues=True
     )
+    log_memory("After consolidate_chunk_catalogues (Finished)")
 
     
 if __name__ == '__main__':

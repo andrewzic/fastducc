@@ -42,12 +42,12 @@ def get_unique_times(msname: str, time_col: str) -> tuple[np.ndarray, np.ndarray
     t = table(msname, readonly=True)
     has_scan = 'SCAN_NUMBER' in set(t.colnames())
     if has_scan:
-        res = taql(f"SELECT DISTINCT {time_col}, SCAN_NUMBER FROM $t ORDERBY {time_col}", tables={'t': t})
+        res = taql(f"SELECT DISTINCT {time_col}, SCAN_NUMBER FROM $1 ORDERBY {time_col}", tables=[t])
         unique_times = res.getcol(time_col)
         scan_per_time = res.getcol('SCAN_NUMBER')
         res.close()
     else:
-        res = taql(f"SELECT DISTINCT {time_col} FROM $t ORDERBY {time_col}", tables={'t': t})
+        res = taql(f"SELECT DISTINCT {time_col} FROM $1 ORDERBY {time_col}", tables=[t])
         unique_times = res.getcol(time_col)
         scan_per_time = np.zeros(len(unique_times), dtype=int)
         res.close()
@@ -79,6 +79,8 @@ def get_scan_aware_chunk_bounds(
         while pos <= scan_end:
             end = min(pos + chunk_size + buffer_overlap_samps - 1, scan_end)
             chunk_bounds.append((pos, end))
+            if end == scan_end:
+                break
             pos = end + 1 - buffer_overlap_samps
     return chunk_bounds, scan_per_time
 
@@ -128,6 +130,7 @@ def get_phase_center(msname: str, field_name: str | None = None):
     t_field = table(f"{msname}/FIELD", readonly=True)
     names = t_field.getcol("NAME")          # shape: (nfield,)
     phase_dir = t_field.getcol("PHASE_DIR") # shape: (nfield, 2, n_poly) in radians
+    t_field.close()
 
     idx = 0
     if field_name is not None:
