@@ -131,12 +131,30 @@ def get_phase_center(msname: str, field_name: str | None = None):
     return ra0_rad, dec0_rad, str(names[idx])
 
 # --- 3) MS open & chunk count ---
+def get_timebin(t_main, time_col: str) -> float:
+    """
+    Get the timebin of the MS from the INTERVAL column.
+    """
+    try:
+        intervals = t_main.getcol('INTERVAL')
+        timebin = float(np.median(intervals))
+    except Exception:
+        # Fallback to time_col if INTERVAL is somehow missing
+        times = t_main.getcol(time_col)
+        times = np.sort(np.unique(times))
+        if len(times) > 1:
+            timebin = float(np.median(np.diff(times)))
+        else:
+            timebin = 1.0
+    return timebin
+
+
 def open_ms(msname: str):
     t_main = table(msname, readonly=True)
     colnames = set(t_main.colnames())
     time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
-    it = t_main.iter([time_col], sort=True)
-    total_chunks = sum(1 for _ in it)
+    times_all = t_main.getcol(time_col)
+    total_chunks = len(np.unique(times_all))
     return t_main, total_chunks, time_col
 
 

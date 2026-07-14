@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import numpy as np
 
 from dask.distributed import Client, LocalCluster
 from dask_jobqueue import SLURMCluster
@@ -383,10 +384,12 @@ def main():
     # Compute chunk bounds (using casacore once in the driver)
     t_main = table(cfg.msname, readonly=True)
     time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in set(t_main.colnames()) else 'TIME'
-    it = t_main.iter([time_col], sort=True)
-    total_chunks = sum(1 for _ in it)
-    dts = [i[1][0] - i[0][0] for i in zip(it[:-1], it[1:])]
-    dt = np.median(dts)
+    times_all = t_main.getcol(time_col)
+    unique_times = np.unique(times_all)
+    total_chunks = len(unique_times)
+    
+    dt = ms_utils.get_timebin(t_main, time_col)
+        
     print(f"Found {total_chunks} time chunks in MS: {cfg.msname}")
     print(f"Found time resolution {dt}s")
     t_main.close()
