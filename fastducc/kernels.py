@@ -406,10 +406,10 @@ def _welford_update(c, m, M2, x):
 
 
 @njit(parallel=True)
-def welford_update_cube(count, mean, M2, cube, ignore_nan=True):
+def welford_update_cube(count, mean, M2, ema_mean, cube, alphas, do_highpass=False, ignore_nan=True):
     """
     Update running per-pixel aggregates using all samples in `cube` (T, Ny, Nx).
-    In-place updates on `count`, `mean`, `M2`.
+    In-place updates on `count`, `mean`, `M2`, and optionally `ema_mean`.
     """
     T, Ny, Nx = cube.shape
     for y in prange(Ny):
@@ -417,14 +417,28 @@ def welford_update_cube(count, mean, M2, cube, ignore_nan=True):
             c = count[y, x]
             m = mean[y, x]
             m2 = M2[y, x]
+            ema = ema_mean[y, x]
             for t in range(T):
                 val = np.float64(cube[t, y, x])
                 if ignore_nan and not np.isfinite(val):
                     continue
-                c, m, m2 = _welford_update(c, m, m2, val)
+                
+                if do_highpass:
+                    alpha = alphas[t]
+                    if np.isnan(ema):
+                        ema = val
+                    else:
+                        ema = ema * (1.0 - alpha) + val * alpha
+                    
+                    val_to_use = val - ema
+                else:
+                    val_to_use = val
+                    
+                c, m, m2 = _welford_update(c, m, m2, val_to_use)
             count[y, x] = c
             mean[y, x]  = m
             M2[y, x]    = m2
+            ema_mean[y, x] = ema
 
 
 @njit(parallel=True)

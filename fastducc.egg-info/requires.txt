@@ -1,0 +1,7 @@
+numpy
+numba
+tqdm
+matplotlib
+astropy
+scipy
+ducc0>=0.40

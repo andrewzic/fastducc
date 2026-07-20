@@ -10,3 +10,7 @@ bkp*
 __pycache__/
 *.pyc
 .aider*
+build/*
+
+*.xml
+fastducc/catalogues/racs/*.xml

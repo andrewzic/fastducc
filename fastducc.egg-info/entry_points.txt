@@ -1,0 +1,4 @@
+[console_scripts]
+ducc-continuum-img = fastducc.ducc_continuum_img:main
+fastducc = fastducc.cli:main
+fastducc-run = fastducc.fastducc_run:main

@@ -67,6 +67,7 @@ def build_cli():
     parser.add_argument('--do-plot', action='store_true')
     parser.add_argument('--var-threshold-sigma', type=float, default=8.0, help="S/N threshold to use for boxcar detections (default: 8.0)")
     parser.add_argument('--var-keep-top-k', type=int, default=None)
+    parser.add_argument('--var-highpass-cutoff', type=float, default=30.0, help="Cutoff timescale in seconds for the EMA high-pass filter, useful for sidelobe suppression in variance search. Set to 0 to disable (default: 0.0)")
     parser.add_argument('--rms-clip-sigma', type=float, default=3.0)
     parser.add_argument('--nms-radius', type=int, default=6)
     # --- Search toggles ---
@@ -90,13 +91,22 @@ def build_cli():
     parser.set_defaults(do_boxcar_search=True)
     parser.add_argument(
         '--enable-var', dest='enable_var', action='store_true',
-        help='Enable variance (std-map/Welford) variability search (default: enabled)'
+        help='Enable variance (std-map/Welford) variability search — master switch for all variance modes (default: enabled)'
     )
     parser.add_argument(
         '--disable-var', dest='enable_var', action='store_false',
-        help='Disable variance (std-map/Welford) variability search'
+        help='Disable all variance (std-map/Welford) variability searches'
     )
     parser.set_defaults(enable_var=True)
+    parser.add_argument(
+        '--enable-var-obs', dest='enable_var_obs', action='store_true',
+        help='Enable whole-observation variance search on the final merged std-map (default: disabled)'
+    )
+    parser.add_argument(
+        '--disable-var-obs', dest='enable_var_obs', action='store_false',
+        help='Disable whole-observation variance search'
+    )
+    parser.set_defaults(enable_var_obs=False)
     parser.add_argument(
         '--do-var-search', dest='do_var_search', action='store_true',
         help='Perform variance (std-map/Welford) variability search (default: enabled)'
@@ -108,13 +118,13 @@ def build_cli():
     parser.set_defaults(do_var_search=True)
     parser.add_argument(
         '--enable-var-chunk', dest='enable_var_chunk', action='store_true',
-        help='Enable variance (std-map/Welford) variability search per chunk (default: disabled)'
+        help='Enable variance (std-map/Welford) variability search per chunk (default: enabled)'
     )
     parser.add_argument(
         '--disable-var-chunk', dest='enable_var_chunk', action='store_false',
         help='Disable variance (std-map/Welford) variability search per chunk'
     )
-    parser.set_defaults(enable_var_chunk=False)
+    parser.set_defaults(enable_var_chunk=True)
     parser.add_argument('--plot-cands-only', dest='plot_cands_only', action='store_true', help='When plotting is enabled, only read and plot candidates instead of searching for them')
     parser.add_argument('--save-var-lightcurves',  dest='save_var_lightcurves',  action='store_true', help='Save lightcurves for variance candidates')
     parser.add_argument('--no-save-var-lightcurves',  dest='save_var_lightcurves',  action='store_false')
@@ -277,6 +287,7 @@ def make_config(args, paths) -> Config:
         do_var_search=args.do_var_search, do_boxcar_search=args.do_boxcar_search,
         plot_cands_only=args.plot_cands_only,
         enable_var_chunk=args.enable_var_chunk,
+        enable_var_obs=args.enable_var_obs,
         save_var_lightcurves=args.save_var_lightcurves,
         save_full_var_lightcurves=args.save_full_var_lightcurves,
         save_var_snippets=args.save_var_snippets,
@@ -288,7 +299,8 @@ def make_config(args, paths) -> Config:
         do_plot=args.do_plot,
         ms_base=ms_base, candidates_dir=candidates_dir,
         chunk_prefix_root=chunk_prefix_root, all_prefix_root=all_prefix_root,
-        continuum_dir=args.continuum_dir
+        continuum_dir=args.continuum_dir,
+        var_highpass_cutoff_sec=args.var_highpass_cutoff
     )
 
 def main_serial(args):
@@ -527,7 +539,7 @@ def main():
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
 
     log_memory("Before finalise_welford_parallel")
-    _ = fd_core.finalise_welford_parallel(cfg, agg_list, run_final_variance=True)
+    _ = fd_core.finalise_welford_parallel(cfg, agg_list)
     log_memory("After finalise_welford_parallel")
 
     # Consolidate per-chunk catalogues into candidates/

@@ -18,12 +18,26 @@ def init_welford(cfg: Config) -> WelfordState:
     return WelfordState(
         count=np.zeros((Ny, Nx), dtype=np.int64),
         mean=np.zeros((Ny, Nx), dtype=np.float64),
-        M2=np.zeros((Ny, Nx), dtype=np.float64)
+        M2=np.zeros((Ny, Nx), dtype=np.float64),
+        ema_mean=np.full((Ny, Nx), np.nan, dtype=np.float64),
+        last_time=np.nan
     )
 
 def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx: int):
+    # compute alphas if highpass is enabled
+    do_highpass = cfg.var_highpass_cutoff_sec > 0
+    alphas = np.zeros(len(times), dtype=np.float64)
+    if do_highpass:
+        for i, t in enumerate(times):
+            if np.isnan(wf.last_time):
+                alphas[i] = 1.0
+            else:
+                dt = max(0.0, t - wf.last_time)
+                alphas[i] = 1.0 - np.exp(-dt / cfg.var_highpass_cutoff_sec)
+            wf.last_time = t
+
     # Accumulate Welford
-    kernels.welford_update_cube(wf.count, wf.mean, wf.M2, cube, ignore_nan=True)
+    kernels.welford_update_cube(wf.count, wf.mean, wf.M2, wf.ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
     if not cfg.enable_var:
         return []  # no candidates in this chunk
 
@@ -83,7 +97,7 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{var_root}_cand_{srcname}",
                 spatial_size=50,
-                center_policy="right", cmap="inferno", dpi=180,
+                center_policy="right", cmap="viridis", dpi=180,
                 # WCS / scale
                 npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                 ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
@@ -93,6 +107,7 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
                 std_map=std_map_partial, use_std_images=True,
                 continuum_dir=getattr(cfg, "continuum_dir", None),
                 method="variance",
+                var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
             )
 
         # Snippet products from std-map (time length = 1)
@@ -103,7 +118,7 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
                 out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                 pixscale_rad=cfg.pix_rad,
                 ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=1, dpi=180
+                ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
             )
     return annotated_var
 
@@ -169,7 +184,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{box_root}_cand_{srcname}_w{w}",
                 spatial_size=50,
-                center_policy="right", cmap="inferno", dpi=300,
+                center_policy="right", cmap="viridis", dpi=300,
                 npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                 ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
                 pix_rad=cfg.pix_rad,
@@ -196,7 +211,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
                 out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
                 pixscale_rad=cfg.pix_rad,
                 ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=6, dpi=180
+                ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=6, dpi=180
             )
     return annotated
 
@@ -255,7 +270,7 @@ def finalise_welford(cfg: Config, wf: WelfordState, times, cube):
     fits.writeto(full_std_fits, data=std_map_full.astype(np.float32), header=hdr, overwrite=True)
 
     # Optional: run final variance detection on full std-map and save catalogue
-    if cfg.enable_var:
+    if cfg.enable_var and cfg.enable_var_obs:
         var_final, snr_img = detection.variance_search_welford(
             std_map_full,
             threshold_sigma=cfg.var_threshold,
@@ -291,8 +306,6 @@ def finalise_welford(cfg: Config, wf: WelfordState, times, cube):
 def finalise_welford_parallel(
         cfg: Config,
         agg_list: List,               # List[Tuple[np.ndarray, np.ndarray, np.ndarray]] as (count, mean, M2) per chunk
-        *,
-        run_final_variance: bool = True
 ):
     """
     Reduce per-chunk Welford aggregates into a full-observation std-map,
@@ -306,8 +319,6 @@ def finalise_welford_parallel(
     agg_list : list of (times, cube, count, mean, M2)
         Per-chunk aggregates returned by the parallel chunk tasks.
         Each array is shape (Ny, Nx): count=int64, mean=float64, M2=float64.
-    run_final_variance : bool
-        If True and cfg.enable_var, run variance_search_welford on the full std-map.
 
     Returns
     -------
@@ -365,7 +376,7 @@ def finalise_welford_parallel(
     print(f"[Final] wrote full std-map -> {full_std_fits}")
 
     # --- 4) Optional final variance search on the full std-map ---
-    if run_final_variance and cfg.enable_var:
+    if cfg.enable_var_obs and cfg.enable_var:
         var_final, snr_img = detection.variance_search_welford(
             std_map_full,
             threshold_sigma=cfg.var_threshold,
@@ -409,13 +420,14 @@ def finalise_welford_parallel(
                         all_times, all_cube, cand,
                         out_prefix=f"{var_root}_cand_{srcname}",
                         spatial_size=50,
-                        center_policy="right", cmap="inferno", dpi=180,
+                        center_policy="right", cmap="viridis", dpi=180,
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
                         pix_rad=cfg.pix_rad, ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
                         std_map=std_map_full, use_std_images=True,
                         continuum_dir=getattr(cfg, "continuum_dir", None),
                         method="variance",
+                        var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
                     )
                 if cfg.save_var_snippets:
                     std_snip = candidates.make_stdmap_snippet(std_map_full, cand, spatial_size=50)
@@ -424,18 +436,19 @@ def finalise_welford_parallel(
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                        ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=1, dpi=180
+                        ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
                     )
 
     return std_map_full
 
-def finalise_welford_serial(cfg: Config, wf_state: WelfordState, *, run_final_variance=True):
+
+def finalise_welford_serial(cfg: Config, wf_state: WelfordState):
     """
     Finalise from a live WelfordState (count, mean, M2) as in serial runs,
     using the same parallel finalise routine.
     """
-    agg_list = [(wf_state.count, wf_state.mean, wf_state.M2)]
-    return finalise_welford_parallel(cfg, agg_list, run_final_variance=run_final_variance)
+    agg_list = [(None, None, wf_state.count, wf_state.mean, wf_state.M2)]
+    return finalise_welford_parallel(cfg, agg_list)
 
 
 def consolidate_catalogues(cfg: Config):
@@ -473,7 +486,22 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     c = np.zeros((Ny, Nx), dtype=np.int64) #count for welford
     m = np.zeros((Ny, Nx), dtype=np.float64) #
     M2 = np.zeros((Ny, Nx), dtype=np.float64)
-    kernels.welford_update_cube(c, m, M2, cube, ignore_nan=True)
+    ema_mean = np.full((Ny, Nx), np.nan, dtype=np.float64)
+    
+    # compute alphas if highpass is enabled
+    do_highpass = cfg.var_highpass_cutoff_sec > 0
+    alphas = np.zeros(len(times), dtype=np.float64)
+    if do_highpass:
+        last_t = np.nan
+        for i, t in enumerate(times):
+            if np.isnan(last_t):
+                alphas[i] = 1.0
+            else:
+                dt = max(0.0, t - last_t)
+                alphas[i] = 1.0 - np.exp(-dt / cfg.var_highpass_cutoff_sec)
+            last_t = t
+
+    kernels.welford_update_cube(c, m, M2, ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
 
     scan_suffix = f"_scan_{scan_id_str}" if scan_id_str else ""
     chunk_root = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}_chunk_{start:06d}")
@@ -539,7 +567,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         times=times, cube=cube, candidate=cand,
                         out_prefix=f"{var_root}_cand_{srcname}",
                         spatial_size=50,
-                        center_policy="right", cmap="inferno", dpi=300,
+                        center_policy="right", cmap="viridis", dpi=300,
                         # WCS / scale
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
@@ -549,6 +577,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         std_map=std_map_partial, use_std_images=True,
                         continuum_dir=getattr(cfg, "continuum_dir", None),
                         method="variance",
+                        var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
                     )
                 if cfg.save_var_snippets:
                     std_snip = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
@@ -557,7 +586,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                        ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=1, dpi=180
+                        ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
                     )
                 else:
                     print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
@@ -633,7 +662,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         times=times, cube=cube, candidate=cand,
                         out_prefix=f"{box_root}_cand_{srcname}_w{w}",
                         spatial_size=50,
-                        center_policy="right", cmap="inferno", dpi=180,
+                        center_policy="right", cmap="viridis", dpi=180,
                         # WCS / scale
                         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
@@ -657,7 +686,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
                         pixscale_rad=cfg.pix_rad,
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                        ra_sign=-1, dec_sign=-1, cmap="inferno", gif_fps=6, dpi=180
+                        ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=6, dpi=180
                     )
             else:
                 print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")

@@ -21,6 +21,7 @@ class Config:
     enable_var: bool
     do_var_search: bool
     enable_var_chunk: bool
+    enable_var_obs: bool
     enable_boxcar: bool
     do_boxcar_search: bool
     var_threshold: float
@@ -41,9 +42,12 @@ class Config:
     save_box_lightcurves: bool
     save_box_snippets: bool
     continuum_dir: Optional[str] | None
+    var_highpass_cutoff_sec: float
 
 @dataclass
 class WelfordState:
     count: np.ndarray
     mean:  np.ndarray
     M2:    np.ndarray
+    ema_mean: np.ndarray
+    last_time: float

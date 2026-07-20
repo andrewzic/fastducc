@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: fastducc
+Version: 0.1.0
+Summary: Imaging and transient detection utilities
+Author: Andrew Zic
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: numba
+Requires-Dist: tqdm
+Requires-Dist: matplotlib
+Requires-Dist: astropy
+Requires-Dist: scipy
+Requires-Dist: ducc0>=0.40
