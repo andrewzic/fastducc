@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import glob
 import os
+import shutil
 import itertools
 import re
 from typing import IO, Iterable, Tuple, List, Dict, Any, Optional, Union
@@ -998,21 +999,25 @@ def save_candidate_summary(
     else:
         wsclean_interval = "—"
 
+    srcname = candidate.get("srcname", "—")
+
     txt = (
+        f"Name: {srcname}\n"
         f"Field: {field}\n"
+        f"S/N: {snr_str}\n"
         f"SBID: {sbid}\n"
         f"Beam: {beam}\n"        
         f"Scan: {scan}\n"
         f"Coord (J2000): {ra_hms} {dec_dms}\n"
         f"Coord (x,y): ({x:d}, {y:d})\n"
-        f"S/N: {snr_str}\n"
         f"iMJD: {imjd}\n"
         f"Obs time (start): {mjd[0]:.7f} MJD\n"
         f"Det. time: {det_time_str}\n"
         f"Method: {method}\n"
         f"Width: {width_str}\n"
-        f"CASA timerange: {casa_timerange}\n"
-        f"wsclean: {wsclean_interval}"
+        f"wsclean: {wsclean_interval}\n"
+        f"CASA timerange:\n"
+        f"{casa_timerange}"
     )
 
     box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
@@ -1024,7 +1029,7 @@ def save_candidate_summary(
     if method.lower() == "variance" and var_highpass_cutoff_sec > 0:
         # EMA high-pass filtered lightcurve (matches Welford accumulation)
         lc_filtered = np.empty_like(lc_full)
-        ema = lc_full[0]
+        ema = np.nanmean(lc_full)
         for ii in range(len(lc_full)):
             dt = (times[ii] - times[max(0, ii - 1)]) if ii > 0 else 0.0
             alpha = 1.0 - np.exp(-dt / var_highpass_cutoff_sec)
@@ -1047,6 +1052,28 @@ def save_candidate_summary(
     ax_lc.set_ylabel("Flux density (mJy/beam)")
     ax_lc.grid(True, alpha=0.3)
     ax_lc.legend(loc="best")
+
+    # --- Metadata footer (provenance / audit trail) ---
+    import datetime
+    import socket
+    import getpass
+    import subprocess
+    
+    gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    host = socket.gethostname()
+    username = getpass.getuser()
+    git_hash = "—"
+    try:
+        git_hash = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL
+        ).decode("utf-8").strip()
+    except Exception:
+        pass
+    
+    meta_footer = f"Generated: {gen_time} | Host: {host} | User: {username} | Git: {git_hash}"
+    fig.text(0.5, 0.01, meta_footer, ha="center", va="bottom", fontsize=8, color="gray", alpha=0.7)
 
     fig.savefig(out_fig, bbox_inches="tight")
     plt.close(fig)
@@ -1227,7 +1254,7 @@ def save_candidate_snippet_products(snippet_rec: dict,
     peak_flux = det_frame[y_center, x_center]
     vmin = np.nanpercentile(det_frame, 5.0)
     if np.isfinite(peak_flux) and peak_flux > vmin:
-        vmax = peak_flux
+        vmax = np.abs(peak_flux)
     else:
         vmax = np.nanpercentile(det_frame, 99.5)
 
@@ -2302,6 +2329,262 @@ def annotate_observation_with_catalogs(
 
 
 
+def organize_candidate_outputs(
+    obs_root: str,
+    kind: str,
+    out_tab: Table,
+    out_dir: str,
+    *,
+    link_mode: str = "symlink",
+    structure: str = "categorized",
+    clean_existing: bool = True,
+    obs_rows_sub: Optional[List[List[Dict[str, Any]]]] = None,
+) -> None:
+    """
+    Organize per-candidate artefacts (summary plots, lightcurves, FITS cutouts,
+    dynamic spectra, catalog entries) under <out_dir>/<kind>/<srcname>/...
+
+    Parameters
+    ----------
+    obs_root : str
+        Path to SBID directory (e.g., ".../SB77974").
+    kind : str
+        Candidate family ('boxcar' or 'variance').
+    out_tab : astropy.table.Table
+        The observation-level super summary table.
+    out_dir : str
+        Base candidates directory (e.g., ".../SB77974/candidates").
+    link_mode : {'symlink', 'copy'}
+        Whether to symlink (relative) or copy artefact files.
+    structure : {'categorized', 'flat'}
+        Whether to place artefacts in category subfolders (plots, lightcurves, cutouts, etc.)
+        or flat inside <srcname>/.
+    clean_existing : bool
+        Whether to auto-purge candidate directories before re-populating them (default: True).
+    obs_rows_sub : list of list of dict, optional
+        Per-candidate list of sub-rows from individual scan summaries.
+    """
+    kind = kind.lower().strip()
+    if out_tab is None or len(out_tab) == 0:
+        print(f"[ObsOrganize] No candidates in output table for kind={kind}; skipping organization.")
+        return
+
+    kind_dir = os.path.join(out_dir, kind)
+    os.makedirs(kind_dir, exist_ok=True)
+
+    abs_out_dir = os.path.abspath(out_dir)
+
+    # 1. Discover all candidate directories under obs_root, excluding out_dir and its subdirectories
+    cand_dir_set = set()
+    for pat in [
+        os.path.join(obs_root, "candidates"),
+        os.path.join(obs_root, "*", "candidates"),
+        os.path.join(obs_root, "*", "*", "candidates"),
+    ]:
+        for d in glob.glob(pat):
+            if os.path.isdir(d):
+                abs_d = os.path.abspath(d)
+                if abs_d == abs_out_dir or abs_d.startswith(abs_out_dir + os.sep):
+                    continue
+                cand_dir_set.add(d)
+
+    all_artefacts: List[str] = []
+    all_comp_rows: List[Dict[str, Any]] = []
+
+    for cdir in sorted(cand_dir_set):
+        try:
+            for item in os.listdir(cdir):
+                item_path = os.path.join(cdir, item)
+                item_lower = item.lower()
+
+                # Strict family filter on file names during indexing
+                if kind == "boxcar" and any(t in item_lower for t in ["_var_", "_variance_", "_periodicity_"]):
+                    continue
+                elif kind == "variance" and any(t in item_lower for t in ["_boxcar_", "_box_", "_periodicity_"]):
+                    continue
+
+                if any(k in item for k in ["_cand_", "_summary", "_lc_", "_cutout", ".ds"]):
+                    all_artefacts.append(item_path)
+
+                # Only read scan-level candidate summary tables (_all, _super_summary, _candidates)
+                is_scan_table = (
+                    item_lower.endswith(("_all.vot", "_all.csv", "_all.xml", "_super_summary.vot", "_super_summary.csv", "_candidates.csv", "_candidates.vot"))
+                    and not any(tag in item_lower for tag in ["_obs_", "_entry", "_full_candidate_list"])
+                )
+
+                if is_scan_table:
+                    try:
+                        fmt = "votable" if item_lower.endswith((".vot", ".xml")) else "csv"
+                        t_comp = Table.read(item_path, format=fmt)
+                        if "ra_deg" in t_comp.colnames and "dec_deg" in t_comp.colnames:
+                            meta_comp = parse_candidate_filename(item_path)
+                            for r_comp in t_comp:
+                                d_comp = {col: r_comp[col] for col in t_comp.colnames}
+                                if not d_comp.get("scan_id") and meta_comp.get("scan_id"):
+                                    d_comp["scan_id"] = meta_comp["scan_id"]
+                                if not d_comp.get("beam") and meta_comp.get("beam"):
+                                    d_comp["beam"] = meta_comp["beam"]
+                                all_comp_rows.append(d_comp)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    print(f"[ObsOrganize] Indexed {len(all_artefacts)} artefact paths and {len(all_comp_rows)} component candidate entries under {obs_root}")
+
+    organized_count = 0
+    linked_files_count = 0
+
+    for idx, row in enumerate(out_tab):
+        srcname = str(row["srcname"]).strip()
+        if not srcname:
+            continue
+
+        safe_srcname = srcname.replace("/", "_")
+        cand_dir = os.path.join(kind_dir, safe_srcname)
+        if clean_existing and os.path.exists(cand_dir):
+            try:
+                shutil.rmtree(cand_dir)
+            except Exception as e:
+                print(f"[ObsOrganize] WARNING: Failed to clean existing directory {cand_dir}: {e}")
+
+        os.makedirs(cand_dir, exist_ok=True)
+
+        if structure == "categorized":
+            plots_dir = os.path.join(cand_dir, "plots")
+            lc_dir = os.path.join(cand_dir, "lightcurves")
+            cutouts_dir = os.path.join(cand_dir, "cutouts")
+            ds_dir = os.path.join(cand_dir, "dynamic_spectra")
+            cat_dir = os.path.join(cand_dir, "catalogs")
+            for d in (plots_dir, lc_dir, cutouts_dir, ds_dir, cat_dir):
+                os.makedirs(d, exist_ok=True)
+        else:
+            plots_dir = lc_dir = cutouts_dir = ds_dir = cat_dir = cand_dir
+
+        names_to_match = {srcname}
+        if obs_rows_sub and idx < len(obs_rows_sub):
+            for sub_r in obs_rows_sub[idx]:
+                sub_name = str(sub_r.get("srcname", "")).strip()
+                if sub_name:
+                    names_to_match.add(sub_name)
+
+        cand_ra = float(row["ra_deg"])
+        cand_dec = float(row["dec_deg"])
+
+        matched_artefacts = set()
+        for art_path in all_artefacts:
+            art_name = os.path.basename(art_path)
+            art_name_lower = art_name.lower()
+
+            # Enforce strict family filtering to prevent cross-family artefact pollution
+            if kind == "boxcar":
+                if any(tag in art_name_lower for tag in ["_var_", "_variance_", "_periodicity_", "_period_"]):
+                    continue
+            elif kind == "variance":
+                if any(tag in art_name_lower for tag in ["_boxcar_", "_box_", "_periodicity_", "_period_"]):
+                    continue
+            elif kind == "periodicity":
+                if any(tag in art_name_lower for tag in ["_boxcar_", "_box_", "_var_", "_variance_"]):
+                    continue
+
+            for name in names_to_match:
+                if (f"cand_{name}" in art_name or f"_{name}_" in art_name or f"_{name}." in art_name):
+                    matched_artefacts.add(art_path)
+                    break
+
+        for src_path in sorted(matched_artefacts):
+            art_name = os.path.basename(src_path)
+            art_name_lower = art_name.lower()
+
+            if art_name_lower.endswith((".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg")):
+                dest_folder = plots_dir
+            elif art_name_lower.endswith((".fits", ".fit")) and ("cutout" in art_name_lower or "cand" in art_name_lower):
+                dest_folder = cutouts_dir
+            elif art_name_lower.endswith(".npz") and ("_lc" in art_name_lower or "lightcurve" in art_name_lower):
+                dest_folder = lc_dir
+            elif art_name_lower.endswith(".ds") or "dynamic" in art_name_lower or ("ds" in art_name_lower and art_name_lower.endswith((".npz", ".fits"))):
+                dest_folder = ds_dir
+            elif art_name_lower.endswith((".csv", ".vot", ".xml", ".reg", ".ann")):
+                dest_folder = cat_dir
+            elif art_name_lower.endswith((".fits", ".fit")):
+                dest_folder = cutouts_dir
+            else:
+                dest_folder = cand_dir
+
+            dest_path = os.path.join(dest_folder, art_name)
+
+            try:
+                if link_mode == "symlink":
+                    rel_src = os.path.relpath(src_path, dest_folder)
+                    if os.path.lexists(dest_path):
+                        os.remove(dest_path)
+                    os.symlink(rel_src, dest_path)
+                else:
+                    if os.path.isdir(src_path):
+                        if os.path.exists(dest_path):
+                            shutil.rmtree(dest_path)
+                        shutil.copytree(src_path, dest_path)
+                    else:
+                        shutil.copy2(src_path, dest_path)
+                linked_files_count += 1
+            except Exception as e:
+                print(f"[ObsOrganize] WARNING: Failed to {link_mode} '{src_path}' -> '{dest_path}': {e}")
+
+        # 1. Write observation-level summary table (1 row for this candidate)
+        try:
+            obs_summary_tab = out_tab[idx:idx+1]
+            obs_csv_cat = os.path.join(cat_dir, f"{safe_srcname}_obs_summary.csv")
+            obs_vot_cat = os.path.join(cat_dir, f"{safe_srcname}_obs_summary.vot")
+            obs_summary_tab.write(obs_csv_cat, format="csv", overwrite=True)
+            obs_summary_tab.write(obs_vot_cat, format="votable", overwrite=True)
+
+            if structure == "categorized":
+                obs_csv_root = os.path.join(cand_dir, f"{safe_srcname}_obs_summary.csv")
+                obs_summary_tab.write(obs_csv_root, format="csv", overwrite=True)
+        except Exception as e:
+            print(f"[ObsOrganize] WARNING: Could not write obs summary table for {srcname}: {e}")
+
+        # 2. Agglomerate & write all component candidate entries matching this source across scans/beams/chunks
+        try:
+            matched_comp_rows = []
+            cos_dec = math.cos(math.radians(cand_dec))
+            for d_comp in all_comp_rows:
+                comp_src = str(d_comp.get("srcname", "")).strip()
+                if comp_src and comp_src in names_to_match:
+                    matched_comp_rows.append(d_comp)
+                    continue
+                try:
+                    r_ra = float(d_comp["ra_deg"])
+                    r_dec = float(d_comp["dec_deg"])
+                    dra = (r_ra - cand_ra) * cos_dec
+                    ddec = r_dec - cand_dec
+                    sep_arcsec = math.hypot(dra, ddec) * 3600.0
+                    if sep_arcsec <= 35.0:
+                        matched_comp_rows.append(d_comp)
+                except Exception:
+                    pass
+
+            if not matched_comp_rows and obs_rows_sub and idx < len(obs_rows_sub) and obs_rows_sub[idx]:
+                matched_comp_rows = obs_rows_sub[idx]
+
+            if matched_comp_rows:
+                comp_list_tab = Table(rows=matched_comp_rows)
+                list_csv_cat = os.path.join(cat_dir, f"{safe_srcname}_full_candidate_list.csv")
+                list_vot_cat = os.path.join(cat_dir, f"{safe_srcname}_full_candidate_list.vot")
+                comp_list_tab.write(list_csv_cat, format="csv", overwrite=True)
+                comp_list_tab.write(list_vot_cat, format="votable", overwrite=True)
+
+                if structure == "categorized":
+                    list_csv_root = os.path.join(cand_dir, f"{safe_srcname}_full_candidate_list.csv")
+                    comp_list_tab.write(list_csv_root, format="csv", overwrite=True)
+        except Exception as e:
+            print(f"[ObsOrganize] WARNING: Could not write full candidate list table for {srcname}: {e}")
+
+        organized_count += 1
+
+    print(f"[ObsOrganize] Organized {organized_count} candidates ({linked_files_count} files/links created) under {kind_dir}")
+
+
 def aggregate_observation_from_super_summaries(
     obs_root: str,
     *,
@@ -2313,6 +2596,9 @@ def aggregate_observation_from_super_summaries(
     racs_vot_path: Optional[str] = None,     # e.g. "/path/to/RACS-mid1_components.xml"
     match_radius_arcsec: float = 40.0,
     simbad_enable: bool = False,
+    organize: bool = True,
+    link_mode: str = "symlink",
+    organize_structure: str = "categorized",
 ) -> Table:    
     """
     Read *per-scan* cross-beam super summaries (VOT) under obs_root,
@@ -2447,6 +2733,7 @@ def aggregate_observation_from_super_summaries(
     comps = _cluster_indices_by_sky(ra, dec, seplimit_arcsec=sky_tol_arcsec)
 
     obs_rows = []
+    obs_rows_sub = []
     for comp_idxs in comps:
         sub = [rows[i] for i in comp_idxs]
 
@@ -2506,9 +2793,12 @@ def aggregate_observation_from_super_summaries(
             row_out["width_samples_all"] = ",".join(str(w) for w in sorted(widths_union))
 
         obs_rows.append(row_out)
+        obs_rows_sub.append(sub)
 
     # Sort, id, and write
-    obs_rows.sort(key=lambda d: float(d.get("max_snr", -np.inf)), reverse=True)
+    paired = sorted(zip(obs_rows, obs_rows_sub), key=lambda p: float(p[0].get("max_snr", -np.inf)), reverse=True)
+    obs_rows = [p[0] for p in paired]
+    obs_rows_sub = [p[1] for p in paired]
     for i, d in enumerate(obs_rows):
         d["source_id"] = i
 
@@ -2554,5 +2844,18 @@ def aggregate_observation_from_super_summaries(
         label_mode="srcname+snr+match",
     )
 
-    
+    if organize:
+        try:
+            organize_candidate_outputs(
+                obs_root=obs_root,
+                kind=kind,
+                out_tab=out_tab,
+                out_dir=out_dir,
+                link_mode=link_mode,
+                structure=organize_structure,
+                obs_rows_sub=obs_rows_sub,
+            )
+        except Exception as e:
+            print(f"[ObsSuper] WARNING: Candidate output organization failed: {e}")
+
     return out_tab
