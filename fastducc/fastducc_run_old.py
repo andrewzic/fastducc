@@ -151,9 +151,14 @@ def process_variance_chunk(cfg: Config, times, cube, wf: WelfordState, start_idx
     do_highpass = cfg.var_highpass_cutoff_sec > 0
     alphas = np.zeros(len(times), dtype=np.float64)
     if do_highpass:
+        dt_median = np.median(np.diff(times)) if len(times) > 1 else 0.0
+        if np.isnan(wf.last_time):
+            # First chunk: initialize EMA mean to the chunk mean
+            wf.ema_mean[:] = np.nanmean(cube, axis=0, dtype=np.float64)
+            
         for i, t in enumerate(times):
             if np.isnan(wf.last_time):
-                alphas[i] = 1.0
+                alphas[i] = 1.0 - np.exp(-dt_median / cfg.var_highpass_cutoff_sec)
             else:
                 dt = max(0.0, t - wf.last_time)
                 alphas[i] = 1.0 - np.exp(-dt / cfg.var_highpass_cutoff_sec)
