@@ -43,6 +43,8 @@ def boxcar_search_time(
     if subtract_mean_per_pixel:
         mean_map = data.mean(axis=0, keepdims=True)
         data = data - mean_map
+        # Re-zero data where raw cube is 0.0 or NaN to prevent mean subtraction from creating fake signal on zero-padded samples
+        data = np.where((cube == 0.0) | np.isnan(cube), 0.0, data)
 
     # Convert widths
     dt = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
@@ -92,9 +94,26 @@ def boxcar_search_time(
                     s = 1.0
                 snr[t0, :, :] = S[t0, :, :] / s
 
+                # Zero out SNR for zero-padded or invalid frames/pixels
+                c_idx = t0 + (w // 2)
+                t1 = t0 + w
+                if np.all(cube[c_idx] == 0.0) or np.any(np.all(cube[t0:t1] == 0.0, axis=(1, 2))):
+                    snr[t0, :, :] = 0.0
+                else:
+                    zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (np.mean(cube[t0:t1], axis=0) == 0.0) | np.isnan(np.mean(cube[t0:t1], axis=0))
+                    snr[t0, zero_pix] = 0.0
+
         elif std_mode == "temporal_per_pixel":
             snr = kernels._temporal_std_snr(data, csum, csum2, w)  # (T_eff, Ny, Nx)
             T_eff = snr.shape[0]
+            for t0 in range(T_eff):
+                c_idx = t0 + (w // 2)
+                t1 = t0 + w
+                if np.all(cube[c_idx] == 0.0) or np.any(np.all(cube[t0:t1] == 0.0, axis=(1, 2))):
+                    snr[t0, :, :] = 0.0
+                else:
+                    zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (np.mean(cube[t0:t1], axis=0) == 0.0) | np.isnan(np.mean(cube[t0:t1], axis=0))
+                    snr[t0, zero_pix] = 0.0
         else:
             raise ValueError(f"Unknown std_mode='{std_mode}'")
 
@@ -148,6 +167,11 @@ def boxcar_search_time(
                     kernels._moving_sum_from_csum(csum, w)[t0, ys[i], xs[i]]
                 ),
             }
+
+            from fastducc.filters import is_zero_flux_candidate
+            if is_zero_flux_candidate(det, cube):
+                continue
+
             detections.append(det)
 
     return detections, snr_cubes

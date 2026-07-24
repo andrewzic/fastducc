@@ -28,6 +28,7 @@ except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
 from fastducc import wcs as ducc_wcs
+from fastducc.filters import is_zero_flux_candidate
 from fastducc import kernels
 
 def make_stdmap_snippet(
@@ -142,6 +143,11 @@ def extract_candidate_snippets(
         raise ValueError("times length must match cube time axis")
     if spatial_size < 1 or time_factor < 1:
         raise ValueError("spatial_size and time_factor must be >= 1")
+
+    # Filter out zero-flux candidates
+    detections = [d for d in detections if not is_zero_flux_candidate(d, cube)]
+    if not detections:
+        return []
 
     # --- spatial center index within snippet ---
     half_sp = spatial_size // 2
@@ -618,6 +624,10 @@ def save_candidate_lightcurves(
     if times.shape[0] != T:
         raise ValueError("times length must match cube time axis")
 
+    if is_zero_flux_candidate(candidate, cube):
+        print(f"[Warning] Skipping lightcurves for zero-flux candidate {candidate.get('srcname', '')}")
+        return {}
+
     # get candidate info
     y = int(candidate["y"])
     x = int(candidate["x"])
@@ -717,6 +727,10 @@ def save_candidate_summary(
         raise ValueError("times length must match cube time axis")
     if any(v is None for v in (npix_x, npix_y, ra0_rad, dec0_rad, pix_rad)):
         raise ValueError("Provide npix_x/npix_y and ra0_rad/dec0_rad/pix_rad for WCS.")
+
+    if is_zero_flux_candidate(candidate, cube):
+        print(f"[Warning] Skipping summary plot for zero-flux candidate {candidate.get('srcname', '')}")
+        return {}
 
     y = int(candidate["y"])
     x = int(candidate["x"])

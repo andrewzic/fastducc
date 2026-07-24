@@ -145,7 +145,8 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
         threshold_sigma=cfg.boxcar_threshold,
         spatial_radius=cfg.nms_radius,
         time_radius=2,
-        valid_mask=None
+        valid_mask=None,
+        cube=cube
     )
     final_dets = filters.group_filter_across_widths(
         dets_by_w, times,
@@ -153,7 +154,8 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
         time_radius=0,
         policy="max_snr",
         max_per_time_group=1,
-        ny_nx=(cube.shape[1], cube.shape[2])
+        ny_nx=(cube.shape[1], cube.shape[2]),
+        cube=cube
     )
     if len(final_dets) == 0:
         return []
@@ -616,7 +618,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
             dets_by_w = filters.nms_snr_maps_per_width(
                 snr_cubes, times,
                 threshold_sigma=cfg.boxcar_threshold,
-                spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None
+                spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None,
+                cube=cube
             )
 
             final_dets = filters.group_filter_across_widths(
@@ -625,7 +628,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 time_radius=8,           # merge across widths within +/- 8 sample
                 policy="max_snr",
                 max_per_time_group=1,
-                ny_nx=(cube.shape[1], cube.shape[2])
+                ny_nx=(cube.shape[1], cube.shape[2]),
+                cube=cube
             )
 
             if len(final_dets) > 0:
