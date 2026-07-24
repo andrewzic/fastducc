@@ -213,6 +213,14 @@ def build_cli_aggregate_obs(argv=None):
                    help="Output directory (default: <obs-root>/candidates)")
     p.add_argument("--pattern", default=None,
                    help="Override VOT glob (default: <obs-root>/**/candidates/*_<kind>_super_summary.vot)")
+    p.add_argument("--organize", action="store_true", default=True,
+                   help="Organize candidate outputs into per-candidate directory trees under <outdir>/<kind>/<srcname>/ (default: True)")
+    p.add_argument("--no-organize", action="store_false", dest="organize",
+                   help="Disable candidate output directory tree organization")
+    p.add_argument("--link-mode", choices=["symlink", "copy"], default="symlink",
+                   help="How to place artefact files into candidate directories: relative symlink or copy (default: symlink)")
+    p.add_argument("--organize-structure", choices=["categorized", "flat"], default="categorized",
+                   help="Directory tree structure for candidate subfolders (default: categorized)")
     return p.parse_args(argv)
 
 
@@ -387,6 +395,9 @@ def aggregate_obs_main(argv=None):
         racs_vot_path=racs_path,
         match_radius_arcsec=40.0,
         simbad_enable=False,
+        organize=args.organize,
+        link_mode=args.link_mode,
+        organize_structure=args.organize_structure,
     )
     return 0
 
