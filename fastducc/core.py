@@ -28,9 +28,14 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
     do_highpass = cfg.var_highpass_cutoff_sec > 0
     alphas = np.zeros(len(times), dtype=np.float64)
     if do_highpass:
+        dt_median = np.median(np.diff(times)) if len(times) > 1 else 0.0
+        if np.isnan(wf.last_time):
+            # First chunk: initialize EMA mean to the chunk mean
+            wf.ema_mean[:] = np.nanmean(cube, axis=0, dtype=np.float64)
+            
         for i, t in enumerate(times):
             if np.isnan(wf.last_time):
-                alphas[i] = 1.0
+                alphas[i] = 1.0 - np.exp(-dt_median / cfg.var_highpass_cutoff_sec)
             else:
                 dt = max(0.0, t - wf.last_time)
                 alphas[i] = 1.0 - np.exp(-dt / cfg.var_highpass_cutoff_sec)
@@ -486,20 +491,22 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     c = np.zeros((Ny, Nx), dtype=np.int64) #count for welford
     m = np.zeros((Ny, Nx), dtype=np.float64) #
     M2 = np.zeros((Ny, Nx), dtype=np.float64)
-    ema_mean = np.full((Ny, Nx), np.nan, dtype=np.float64)
-    
     # compute alphas if highpass is enabled
     do_highpass = cfg.var_highpass_cutoff_sec > 0
     alphas = np.zeros(len(times), dtype=np.float64)
     if do_highpass:
+        ema_mean = np.nanmean(cube, axis=0, dtype=np.float64)
         last_t = np.nan
+        dt_median = np.median(np.diff(times)) if len(times) > 1 else 0.0
         for i, t in enumerate(times):
             if np.isnan(last_t):
-                alphas[i] = 1.0
+                alphas[i] = 1.0 - np.exp(-dt_median / cfg.var_highpass_cutoff_sec)
             else:
                 dt = max(0.0, t - last_t)
                 alphas[i] = 1.0 - np.exp(-dt / cfg.var_highpass_cutoff_sec)
             last_t = t
+    else:
+        ema_mean = np.full((Ny, Nx), np.nan, dtype=np.float64)
 
     kernels.welford_update_cube(c, m, M2, ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
 
@@ -510,6 +517,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     if cfg.enable_var and cfg.enable_var_chunk:
         var_root = chunk_root + "_var"
         std_map_partial = kernels.welford_finalise_std(c, M2, ddof=1)
+        annotated_var = []
         if cfg.do_var_search:
             var_dets, snr_img = detection.variance_search_welford(
                 std_map_partial,
