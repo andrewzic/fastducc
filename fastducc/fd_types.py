@@ -43,6 +43,8 @@ class Config:
     save_box_snippets: bool
     continuum_dir: Optional[str] | None
     var_highpass_cutoff_sec: float
+    use_local_threshold: bool = True
+    local_window_size: int = 64
 
 @dataclass
 class WelfordState:

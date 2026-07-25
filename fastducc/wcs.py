@@ -44,7 +44,7 @@ def radec_from_lm(l: float, m: float, ra0_rad: float, dec0_rad: float) -> Tuple[
     if lm2 >= 1.0:
         raise ValueError(f"|l|^2+|m|^2 >= 1 ({lm2:.3f}); outside the valid tangent plane.")
     n = math.sqrt(max(0.0, 1.0 - lm2))
-    ra  = ra0_rad  + math.atan2(l, n*math.cos(dec0_rad) - m*math.sin(dec0_rad))
+    ra  = (ra0_rad  + math.atan2(l, n*math.cos(dec0_rad) - m*math.sin(dec0_rad))) % (2.0 * math.pi)
     dec = math.asin(m*math.cos(dec0_rad) + n*math.sin(dec0_rad))
     return ra, dec
 

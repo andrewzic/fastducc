@@ -2335,9 +2335,16 @@ def annotate_observation_with_catalogs(
     if "srcname" in out_tab.colnames:
         insert_at = out_tab.colnames.index("srcname") + 1
 
-    out_tab.add_column(Table.Column(name="source_name", data=source_name), index=insert_at)
-    out_tab.add_column(Table.Column(name="source_offset_arcsec", data=source_offset), index=insert_at + 1)
-    out_tab.add_column(Table.Column(name="source_catalog", data=source_cat), index=insert_at + 2)
+    for col_name, col_data in [
+        ("source_name", source_name),
+        ("source_offset_arcsec", source_offset),
+        ("source_catalog", source_cat),
+    ]:
+        if col_name in out_tab.colnames:
+            out_tab[col_name] = col_data
+        else:
+            out_tab.add_column(Table.Column(name=col_name, data=col_data), index=insert_at)
+            insert_at += 1
 
     return out_tab
 

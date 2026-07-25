@@ -1,7 +1,7 @@
-from typing import Tuple
-
+from typing import Tuple, Optional, Union
 from numba import njit, prange
 import numpy as np
+from scipy.ndimage import uniform_filter
 
 try:
     import ducc0
@@ -454,3 +454,75 @@ def welford_finalise_std(count, M2, ddof=1):
             denom = count[y, x] - ddof
             out[y, x] = np.sqrt(M2[y, x] / denom) if denom > 0 else np.nan
     return out
+
+
+def _local_mean_std_2d(
+    img: np.ndarray,
+    valid_mask: Optional[np.ndarray] = None,
+    window_size: Union[int, Tuple[int, int]] = 64,
+    min_std: float = 1e-12
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute 2-D local mean and local standard deviation maps using sliding boxcar uniform filtering.
+    Boundary-aware: Outside-boundary pixels and invalid_mask pixels are excluded from local statistics.
+
+    Parameters
+    ----------
+    img : (Ny, Nx) ndarray
+        Input 2D map.
+    valid_mask : (Ny, Nx) ndarray of bool, optional
+        Mask of valid pixels (True = valid). If None, all pixels are valid.
+    window_size : int or tuple of (int, int), default=64
+        Size of sliding window for local estimation.
+    min_std : float, default=1e-12
+        Minimum allowed standard deviation to avoid division by zero.
+
+    Returns
+    -------
+    mean_map : (Ny, Nx) ndarray
+        Local mean map.
+    std_map : (Ny, Nx) ndarray
+        Local standard deviation map.
+    """
+    Ny, Nx = img.shape
+    if isinstance(window_size, int):
+        w = (window_size, window_size)
+    else:
+        w = (int(window_size[0]), int(window_size[1]))
+
+    if valid_mask is None:
+        valid_mask = np.ones((Ny, Nx), dtype=bool)
+    else:
+        valid_mask = valid_mask.astype(bool, copy=False)
+
+    # Valid weights mask (1.0 for valid pixels inside boundary, 0.0 outside/invalid)
+    weights = np.where(valid_mask & np.isfinite(img), 1.0, 0.0)
+    data = np.where(weights > 0.0, img, 0.0)
+    data_sq = np.where(weights > 0.0, img * img, 0.0)
+
+    # Mode='constant', cval=0.0 handles boundary pixels by padding 0 for weights and data
+    win_area = float(w[0] * w[1])
+    sum_w = uniform_filter(weights, size=w, mode='constant', cval=0.0) * win_area
+    sum_d = uniform_filter(data, size=w, mode='constant', cval=0.0) * win_area
+    sum_d2 = uniform_filter(data_sq, size=w, mode='constant', cval=0.0) * win_area
+
+    # Safe division for mean and variance
+    valid_count = np.maximum(sum_w, 1.0)
+    mean_map = sum_d / valid_count
+    mean_sq_map = sum_d2 / valid_count
+
+    var_map = np.maximum(0.0, mean_sq_map - mean_map**2)
+    std_map = np.sqrt(var_map)
+
+    # Fallback for regions with zero valid pixels or non-finite/zero std
+    invalid_regions = (sum_w < 1.0) | (~np.isfinite(std_map)) | (std_map < min_std)
+    if np.any(invalid_regions):
+        valid_pixels = img[valid_mask & np.isfinite(img)]
+        global_std = float(np.nanstd(valid_pixels)) if valid_pixels.size > 0 else 1.0
+        if not np.isfinite(global_std) or global_std <= min_std:
+            global_std = 1.0
+        mean_map[invalid_regions] = 0.0
+        std_map[invalid_regions] = global_std
+
+    return mean_map, std_map
+

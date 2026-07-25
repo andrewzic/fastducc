@@ -61,7 +61,9 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
         valid_mask=None,
         spatial_estimator="clipped_rms",
         clip_sigma=cfg.rms_clip_sigma,
-        subtract_mean_of_std_map=True
+        subtract_mean_of_std_map=True,
+        use_local_threshold=getattr(cfg, "use_local_threshold", True),
+        local_window_size=getattr(cfg, "local_window_size", 64)
     )
 
     # Spatial NMS + annotation
@@ -138,7 +140,9 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
         return_snr_cubes=True,
         keep_top_k=50,
         std_mode="spatial_per_window",
-        subtract_mean_per_pixel=True
+        subtract_mean_per_pixel=True,
+        use_local_threshold=getattr(cfg, "use_local_threshold", True),
+        local_window_size=getattr(cfg, "local_window_size", 64)
     )
     dets_by_w = filters.nms_snr_maps_per_width(
         snr_cubes, times,
@@ -286,7 +290,9 @@ def finalise_welford(cfg: Config, wf: WelfordState, times, cube):
             valid_mask=None,
             spatial_estimator="clipped_rms",
             clip_sigma=cfg.rms_clip_sigma,
-            subtract_mean_of_std_map=True
+            subtract_mean_of_std_map=True,
+            use_local_threshold=getattr(cfg, "use_local_threshold", True),
+            local_window_size=getattr(cfg, "local_window_size", 64)
         )
         if len(var_final) > 0:
             var_nms = filters.nms_snr_map_2d(
@@ -392,7 +398,9 @@ def finalise_welford_parallel(
             valid_mask=None,
             spatial_estimator="clipped_rms",
             clip_sigma=cfg.rms_clip_sigma,
-            subtract_mean_of_std_map=True
+            subtract_mean_of_std_map=True,
+            use_local_threshold=getattr(cfg, "use_local_threshold", True),
+            local_window_size=getattr(cfg, "local_window_size", 64)
         )
         if len(var_final) > 0:
 

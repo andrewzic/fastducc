@@ -70,6 +70,10 @@ def build_cli():
     parser.add_argument('--var-highpass-cutoff', type=float, default=30.0, help="Cutoff timescale in seconds for the EMA high-pass filter, useful for sidelobe suppression in variance search. Set to 0 to disable (default: 0.0)")
     parser.add_argument('--rms-clip-sigma', type=float, default=3.0)
     parser.add_argument('--nms-radius', type=int, default=6)
+    parser.add_argument('--local-box-size', type=int, default=64, help="Sliding 2D window size in pixels for local background & stdev thresholding (default: 64)")
+    parser.add_argument('--enable-local-stats', dest='use_local_threshold', action='store_true', help="Enable 2D local background & stdev thresholding (default: enabled)")
+    parser.add_argument('--disable-local-stats', dest='use_local_threshold', action='store_false', help="Disable 2D local thresholding, fallback to global statistics")
+    parser.set_defaults(use_local_threshold=True)
     # --- Search toggles ---
     parser.add_argument(
         '--enable-boxcar', dest='enable_boxcar', action='store_true',
@@ -308,7 +312,9 @@ def make_config(args, paths) -> Config:
         ms_base=ms_base, candidates_dir=candidates_dir,
         chunk_prefix_root=chunk_prefix_root, all_prefix_root=all_prefix_root,
         continuum_dir=args.continuum_dir,
-        var_highpass_cutoff_sec=args.var_highpass_cutoff
+        var_highpass_cutoff_sec=args.var_highpass_cutoff,
+        use_local_threshold=getattr(args, "use_local_threshold", True),
+        local_window_size=getattr(args, "local_box_size", 64)
     )
 
 def main_serial(args):
