@@ -17,9 +17,11 @@ from astropy.io import fits
 from astropy.table import Table, vstack
 from astropy.time import Time
 
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
-from ligo.skymap.plot.marker import reticle
+try:
+    from ligo.skymap.plot.marker import reticle
+except Exception:
+    def reticle(which='rt'):
+        return 'o'
 
 
 try:

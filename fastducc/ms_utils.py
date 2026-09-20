@@ -27,8 +27,13 @@ def get_corr_label_indices(msname: str):
 
 
 def get_channel_lambdas(ms):
-    tf = table(f"{ms}/SPECTRAL_WINDOW")
-    # get all channel frequencies and convert that to wavelengths
+    spw_path = f"{ms}/SPECTRAL_WINDOW"
+    tf = table(spw_path, readonly=True)
+    if tf.nrows() == 0 and ms.endswith(".uvsub.ms"):
+        alt_ms = ms[:-9] + ".ms"
+        if os.path.exists(alt_ms):
+            tf.close()
+            tf = table(f"{alt_ms}/SPECTRAL_WINDOW", readonly=True)
     channel_freqs = tf[0]["CHAN_FREQ"]
     nchan = len(channel_freqs)
     channel_lambdas = const.c.to(u.m/u.s).value / channel_freqs
