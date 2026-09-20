@@ -21,6 +21,7 @@ class Config:
     enable_var: bool
     do_var_search: bool
     enable_var_chunk: bool
+    enable_var_scan: bool
     enable_var_obs: bool
     enable_boxcar: bool
     do_boxcar_search: bool

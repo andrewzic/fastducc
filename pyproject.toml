@@ -22,6 +22,7 @@ dependencies = [
 
 fastducc = "fastducc.cli:main"
 fastducc-run = "fastducc.fastducc_run:main"
+fastducc-periodicity = "fastducc.nufft_periodicity:run_periodicity"
 ducc-continuum-img = "fastducc.ducc_continuum_img:main"
 
 [tool.setuptools.packages.find]

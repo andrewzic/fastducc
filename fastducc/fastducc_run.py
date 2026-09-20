@@ -129,6 +129,15 @@ def build_cli():
         help='Disable variance (std-map/Welford) variability search per chunk'
     )
     parser.set_defaults(enable_var_chunk=True)
+    parser.add_argument(
+        '--enable-var-scan', dest='enable_var_scan', action='store_true',
+        help='Enable variance (std-map/Welford) variability search per scan (default: enabled)'
+    )
+    parser.add_argument(
+        '--disable-var-scan', dest='enable_var_scan', action='store_false',
+        help='Disable variance (std-map/Welford) variability search per scan'
+    )
+    parser.set_defaults(enable_var_scan=True)
     parser.add_argument('--plot-cands-only', dest='plot_cands_only', action='store_true', help='When plotting is enabled, only read and plot candidates instead of searching for them')
     parser.add_argument('--save-var-lightcurves',  dest='save_var_lightcurves',  action='store_true', help='Save lightcurves for variance candidates')
     parser.add_argument('--no-save-var-lightcurves',  dest='save_var_lightcurves',  action='store_false')
@@ -245,7 +254,7 @@ def build_cli_periodicity(argv=None):
     p.add_argument("--pixscale-arcsec", type=float, default=22.0)
     p.add_argument("--fmin", type=float, default=0.5, help="Minimum spin frequency to keep (Hz)")
     p.add_argument("--dm", type=float, default=0.0, help="Dispersion Measure (pc cm^-3)")
-    p.add_argument("--eps", type=float, default=1e-7, help="DUCC NUFFT tolerance")
+    p.add_argument("--eps", type=float, default=1e-5, help="DUCC NUFFT tolerance")
     p.add_argument("--nfft-t", type=int, default=None, help="Length of frequency axis (power of 2)")
     p.add_argument("--block-rows", type=int, default=20000)
     p.add_argument("--partials-dir", default="partials_periodicity")
@@ -273,12 +282,20 @@ def build_cli_periodicity(argv=None):
     p.add_argument("--out-csv", default=None, help="Override candidate CSV output path")
     p.add_argument("--out-vot", default=None, help="Override candidate VOT output path")
 
-    # parallel execution
-    p.add_argument("--parallel-mode", choices=["serial", "dask-local"], default="serial")
+    # parallel execution & limits
+    p.add_argument("--max-blocks", type=int, default=None, help="Limit number of blocks processed for testing")
+    p.add_argument("--parallel-mode", choices=["serial", "dask-local", "dask-slurm"], default="dask-local")
     p.add_argument("--dask-workers", type=int, default=0)
     p.add_argument("--threads-per-worker", type=int, default=1)
     p.add_argument("--dask-scheduler", choices=["processes", "threads"], default="processes")
     p.add_argument("--scheduler-address", default=None, help="Existing Dask scheduler address")
+    p.add_argument('--slurm-partition', default=None, help='SLURM partition/queue')
+    p.add_argument('--slurm-account',  default=None, help='SLURM account/project')
+    p.add_argument('--slurm-cores-per-worker', type=int, default=4, help='CPUs/cores per SLURM worker')
+    p.add_argument('--slurm-mem', default='128GB', help='Memory limit per SLURM worker (e.g., 128GB)')
+    p.add_argument('--slurm-walltime', default='02:00:00', help='SLURM job walltime (e.g. 02:00:00)')
+    p.add_argument('--slurm-job-extra', nargs='*', default=None, help='Extra SLURM directives')
+    p.add_argument('--slurm-interface', default=None, help='Network interface for SLURM workers')
 
     return p.parse_args(argv)
 
@@ -299,6 +316,7 @@ def make_config(args, paths) -> Config:
         do_var_search=args.do_var_search, do_boxcar_search=args.do_boxcar_search,
         plot_cands_only=args.plot_cands_only,
         enable_var_chunk=args.enable_var_chunk,
+        enable_var_scan=args.enable_var_scan,
         enable_var_obs=args.enable_var_obs,
         save_var_lightcurves=args.save_var_lightcurves,
         save_full_var_lightcurves=args.save_full_var_lightcurves,
@@ -416,8 +434,13 @@ def main():
         aggregate_main(sys.argv)
         return None
 
-    elif  sys.argv[1] == "aggregate_obs":
+    elif sys.argv[1] == "aggregate_obs":
         aggregate_obs_main(sys.argv)
+        return None
+    elif sys.argv[1] == "periodicity":
+        from fastducc import nufft_periodicity
+        args = build_cli_periodicity(sys.argv[2:])
+        nufft_periodicity.run_periodicity(args)
         return None
     
     args = build_cli()
@@ -487,10 +510,12 @@ def main():
         for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
             print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str})")
             chunk_times = unique_times[start:end+1]
-            times, cube, c, m, M2 = fd_core.process_chunk_task(
+            res = fd_core.process_chunk_task(
                 cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
             )
-            agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2))
+            times, cube, c, m, M2 = res[0], res[1], res[2], res[3], res[4]
+            sid = res[5] if len(res) > 5 else scan_id_str
+            agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2, sid))
 
     elif args.parallel_mode == 'dask-local':
         n_workers = args.dask_workers if args.dask_workers > 0 else None
@@ -508,7 +533,25 @@ def main():
     elif args.parallel_mode == 'dask-slurm':
         # SLURMCluster (requires dask_jobqueue)
 
+        import sys
+        slurm_interface = args.slurm_interface
+        if slurm_interface is None:
+            try:
+                import psutil
+                if 'ib0' in psutil.net_if_addrs():
+                    slurm_interface = 'ib0'
+            except Exception:
+                pass
         scheduler_opts = {"dashboard_address": ":0"}
+        if slurm_interface:
+            scheduler_opts["interface"] = slurm_interface
+        prologue = [
+            "module load python-scientific/3.11.5-foss-2023b 2>/dev/null || true",
+            "unset PYTHONPATH",
+            f"source {os.path.dirname(sys.executable)}/activate 2>/dev/null || true",
+            "export OMP_NUM_THREADS=1",
+            "export OPENBLAS_NUM_THREADS=1"
+        ]
 
         log_memory("Before creating SLURMCluster")
         cluster = SLURMCluster(
@@ -518,8 +561,12 @@ def main():
             memory=args.slurm_mem,
             walltime=args.slurm_walltime,
             job_extra_directives=args.slurm_job_extra,
-            interface=args.slurm_interface,
+            interface=slurm_interface,
+            python=sys.executable,
+            job_script_prologue=prologue,
             scheduler_options=scheduler_opts, #avoid dashboard port conflicts
+            processes=1,
+            worker_extra_args=["--nthreads", "1", "--memory-limit", "0"],
         )
         log_memory("After creating SLURMCluster")
         # scale to number of workers (or adapt if dask_workers==0)

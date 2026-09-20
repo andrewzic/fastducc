@@ -345,20 +345,21 @@ def finalise_welford_parallel(
     M2_acc    = np.zeros((Ny, Nx), dtype=np.float64)
 
     
-    for (times, cube, c, m, M2) in agg_list:
+    for item in agg_list:
+        times, cube, c, m, M2 = item[0], item[1], item[2], item[3], item[4]
         # combine per-chunk aggregate into the accumulator
         count_acc, mean_acc, M2_acc = welford_combine_aggregates(count_acc, mean_acc, M2_acc, c, m, M2)
         
-    all_times = np.concatenate([a[0] for a in agg_list])
+    all_times = np.concatenate([item[0] for item in agg_list])
     order = np.argsort(all_times)
     all_times = all_times[order]
     if cfg.save_full_var_lightcurves:
-        all_cube = np.empty((int(np.sum(a[1].shape[0] for a in agg_list)), cfg.npix_y, cfg.npix_x), dtype=agg_list[0][1].dtype)
+        all_cube = np.empty((int(np.sum(item[1].shape[0] for item in agg_list)), cfg.npix_y, cfg.npix_x), dtype=agg_list[0][1].dtype)
         start_ = 0
-        for a in agg_list:
-            nsub = a[1].shape[0]
+        for item in agg_list:
+            nsub = item[1].shape[0]
             end_ = start_ + nsub
-            all_cube[start_:end_] = a[1]
+            all_cube[start_:end_] = item[1]
             start_ += nsub
 
         all_cube = all_cube[order]
@@ -387,6 +388,66 @@ def finalise_welford_parallel(
     full_std_fits = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_std_map_full.fits")
     fits.writeto(full_std_fits, data=std_map_full.astype(np.float32), header=hdr, overwrite=True)
     print(f"[Final] wrote full std-map -> {full_std_fits}")
+
+    # --- 3b) Optional per-scan variance search on aggregated Welford maps within each scan ---
+    if cfg.enable_var and getattr(cfg, "enable_var_scan", False):
+        scan_groups = {}
+        for item in agg_list:
+            sid = item[5] if len(item) > 5 else ""
+            if sid:
+                if sid not in scan_groups:
+                    scan_groups[sid] = []
+                scan_groups[sid].append(item)
+
+        for sid, s_items in scan_groups.items():
+            c_scan = np.zeros((Ny, Nx), dtype=np.int64)
+            m_scan = np.zeros((Ny, Nx), dtype=np.float64)
+            M2_scan = np.zeros((Ny, Nx), dtype=np.float64)
+            s_times = []
+            for item in s_items:
+                times, cube, c, m, M2 = item[0], item[1], item[2], item[3], item[4]
+                c_scan, m_scan, M2_scan = welford_combine_aggregates(c_scan, m_scan, M2_scan, c, m, M2)
+                s_times.append(times)
+            scan_times = np.concatenate(s_times) if s_times else np.array([])
+            
+            std_map_scan = kernels.welford_finalise_std(c_scan, M2_scan, ddof=1)
+            var_scan_dets, snr_img = detection.variance_search_welford(
+                std_map_scan,
+                threshold_sigma=cfg.var_threshold,
+                return_snr_image=True,
+                keep_top_k=cfg.var_keep_k,
+                valid_mask=None,
+                spatial_estimator="clipped_rms",
+                clip_sigma=cfg.rms_clip_sigma,
+                subtract_mean_of_std_map=True,
+                use_local_threshold=getattr(cfg, "use_local_threshold", True),
+                local_window_size=getattr(cfg, "local_window_size", 64)
+            )
+            if len(var_scan_dets) > 0:
+                var_nms = filters.nms_snr_map_2d(
+                    snr_2d=snr_img, base_detections=var_scan_dets,
+                    threshold_sigma=cfg.var_threshold,
+                    spatial_radius=cfg.nms_radius,
+                    valid_mask=None,
+                    times=scan_times, time_tag_policy="none"
+                )
+                annotated_var = ducc_wcs.annotate_candidates_with_sky_coords(
+                    msname=cfg.msname, final_detections=var_nms,
+                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                    pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
+                    flip_u=True, flip_v=True, field_name=None
+                )
+                for cand in annotated_var:
+                    cand["scan_id"] = sid
+                
+                var_root = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_scan_{sid}_var")
+                t_var = candidates.candidates_to_astropy_table(annotated_var)
+                candidates.save_candidates_table(
+                    t_var,
+                    csv_path=f"{var_root}_candidates.csv",
+                    vot_path=f"{var_root}_candidates.vot"
+                )
+                print(f"[Final] wrote per-scan variance candidates for scan {sid} -> {var_root}_candidates.csv")
 
     # --- 4) Optional final variance search on the full std-map ---
     if cfg.enable_var_obs and cfg.enable_var:
@@ -712,6 +773,6 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
 
     if cfg.save_full_var_lightcurves:
-        return times, cube, c, m, M2
+        return times, cube, c, m, M2, scan_id_str
     else:
-        return times, None, c, m, M2
+        return times, None, c, m, M2, scan_id_str
