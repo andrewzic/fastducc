@@ -715,7 +715,7 @@ def save_candidate_summary(
 
     Returns
     -------
-    dict : {"figure": "<out_prefix>_summary.png", "}
+    dict : {"figure": out_fig, "fits_cutout": out_fits, "fits_fullframe": out_fits_full}
     """
     from matplotlib.gridspec import GridSpec
     from matplotlib.offsetbox import AnchoredText
@@ -1130,8 +1130,29 @@ def save_candidate_summary(
     hdu = fits.PrimaryHDU(data=cutout_det.astype(np.float32), header=hdr)
     hdu.writeto(out_fits, overwrite=True)
 
+    # --- Save the fullframe as a FITS file with WCS ---
+    out_fits_full = f"{out_prefix}{mjd_tag}_fullframe.fits"
+    hdr_full = wcs_full.to_header()
+    hdr_full["BUNIT"] = "JY/BEAM"
+    hdr_full["COMMENT"] = "Detection frame full field from transient imaging"
+    if ra_hms and dec_dms:
+        hdr_full["OBJRA"] = ra_hms
+        hdr_full["OBJDEC"] = dec_dms
 
-    return {"figure": out_fig, "fits_cutout": out_fits}
+    hdr_full["CDELT1"] = wcs_full.wcs.cdelt[0]
+    hdr_full["CDELT2"] = wcs_full.wcs.cdelt[1]
+    hdr_full["PC1_1"] = 1.0
+    hdr_full["PC1_2"] = 0.0
+    hdr_full["PC2_1"] = 0.0
+    hdr_full["PC2_2"] = 1.0
+
+    if getattr(wcs_full.wcs, "radesys", None):
+        hdr_full["RADESYS"] = wcs_full.wcs.radesys
+
+    hdu_full = fits.PrimaryHDU(data=frame_for_display.astype(np.float32), header=hdr_full)
+    hdu_full.writeto(out_fits_full, overwrite=True)
+
+    return {"figure": out_fig, "fits_cutout": out_fits, "fits_fullframe": out_fits_full}
 
     
     # # --- Build the figure ---
@@ -2365,7 +2386,7 @@ def organize_candidate_outputs(
 ) -> None:
     """
     Organize per-candidate artefacts (summary plots, lightcurves, FITS cutouts,
-    dynamic spectra, catalog entries) under <out_dir>/<kind>/<srcname>/...
+    fullframe FITS images, dynamic spectra, catalog entries) under <out_dir>/<kind>/<srcname>/...
 
     Parameters
     ----------
@@ -2380,7 +2401,7 @@ def organize_candidate_outputs(
     link_mode : {'symlink', 'copy'}
         Whether to symlink (relative) or copy artefact files.
     structure : {'categorized', 'flat'}
-        Whether to place artefacts in category subfolders (plots, lightcurves, cutouts, etc.)
+        Whether to place artefacts in category subfolders (plots, lightcurves, cutouts, fullframes, etc.)
         or flat inside <srcname>/.
     clean_existing : bool
         Whether to auto-purge candidate directories before re-populating them (default: True).
@@ -2426,7 +2447,7 @@ def organize_candidate_outputs(
                 elif kind == "variance" and any(t in item_lower for t in ["_boxcar_", "_box_", "_periodicity_"]):
                     continue
 
-                if any(k in item for k in ["_cand_", "_summary", "_lc_", "_cutout", ".ds"]):
+                if any(k in item for k in ["_cand_", "_summary", "_lc_", "_cutout", "_fullframe", ".ds"]):
                     all_artefacts.append(item_path)
 
                 # Only read scan-level candidate summary tables (_all, _super_summary, _candidates)
@@ -2477,12 +2498,13 @@ def organize_candidate_outputs(
             plots_dir = os.path.join(cand_dir, "plots")
             lc_dir = os.path.join(cand_dir, "lightcurves")
             cutouts_dir = os.path.join(cand_dir, "cutouts")
+            fullframes_dir = os.path.join(cand_dir, "fullframes")
             ds_dir = os.path.join(cand_dir, "dynamic_spectra")
             cat_dir = os.path.join(cand_dir, "catalogs")
-            for d in (plots_dir, lc_dir, cutouts_dir, ds_dir, cat_dir):
+            for d in (plots_dir, lc_dir, cutouts_dir, fullframes_dir, ds_dir, cat_dir):
                 os.makedirs(d, exist_ok=True)
         else:
-            plots_dir = lc_dir = cutouts_dir = ds_dir = cat_dir = cand_dir
+            plots_dir = lc_dir = cutouts_dir = fullframes_dir = ds_dir = cat_dir = cand_dir
 
         names_to_match = {srcname}
         if obs_rows_sub and idx < len(obs_rows_sub):
@@ -2521,6 +2543,8 @@ def organize_candidate_outputs(
 
             if art_name_lower.endswith((".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg")):
                 dest_folder = plots_dir
+            elif art_name_lower.endswith((".fits", ".fit")) and ("fullframe" in art_name_lower or "full_frame" in art_name_lower):
+                dest_folder = fullframes_dir
             elif art_name_lower.endswith((".fits", ".fit")) and ("cutout" in art_name_lower or "cand" in art_name_lower):
                 dest_folder = cutouts_dir
             elif art_name_lower.endswith(".npz") and ("_lc" in art_name_lower or "lightcurve" in art_name_lower):
