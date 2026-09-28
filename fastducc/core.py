@@ -528,10 +528,18 @@ def finalise_welford_serial(cfg: Config, wf_state: WelfordState):
 
 
 def consolidate_catalogues(cfg: Config):
-    var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
-    box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
+    dm_val = float(getattr(cfg, "current_dm", 0.0))
+    if dm_val != 0.0:
+        dm_tag = f"_dm{dm_val:06.2f}"
+        ms_base_tag = f"{cfg.ms_base}{dm_tag}"
+        var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{dm_tag}*_var_candidates.csv")
+        box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{dm_tag}*_chunk_*_boxcar_candidates.csv")
+    else:
+        ms_base_tag = cfg.ms_base
+        var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
+        box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
     candidates.consolidate_chunk_catalogues(
-        ms_base=cfg.ms_base,
+        ms_base=ms_base_tag,
         out_dir=cfg.candidates_dir,
         var_csv_pattern=var_pattern,
         box_csv_pattern=box_pattern,
@@ -544,6 +552,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     """
     Worker task: image the chunk, produce per-chunk outputs, and return per-chunk Welford aggregates.
     """
+    dm_val = float(getattr(cfg, "current_dm", 0.0))
     # Imaging: open MS inside worker (t_main=None)
     times, cube = imaging.image_time_samples(
         msname=cfg.msname, t_main=None,
@@ -554,7 +563,11 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
         npix_x=cfg.npix_x, npix_y=cfg.npix_y,
         pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
         epsilon=cfg.epsilon, do_wgridding=cfg.do_wgridding,
-        nthreads=cfg.nthreads, verbosity=cfg.verbosity, do_plot=cfg.do_plot
+        nthreads=cfg.nthreads, verbosity=cfg.verbosity, do_plot=cfg.do_plot,
+        dm=dm_val,
+        collapse_channels=getattr(cfg, "collapse_channels", False),
+        nsubbands=getattr(cfg, "nsubbands", 1),
+        exact_uvw=getattr(cfg, "exact_uvw", True),
     )
 
     # Per-chunk Welford aggregates
@@ -582,7 +595,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     kernels.welford_update_cube(c, m, M2, ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
 
     scan_suffix = f"_scan_{scan_id_str}" if scan_id_str else ""
-    chunk_root = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}_chunk_{start:06d}")
+    dm_suffix = f"_dm{dm_val:06.2f}" if dm_val != 0.0 else ""
+    chunk_root = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_chunk_{start:06d}")
 
     # Optional per-chunk variance search
     if cfg.enable_var and cfg.enable_var_chunk:
@@ -598,7 +612,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 valid_mask=None,
                 spatial_estimator="clipped_rms",
                 clip_sigma=cfg.rms_clip_sigma,
-                subtract_mean_of_std_map=True
+                subtract_mean_of_std_map=True,
+                dm=dm_val,
             )
             if len(var_dets) > 0:
                 var_nms = filters.nms_snr_map_2d(
@@ -616,6 +631,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 )
                 for cand in annotated_var:
                     cand["scan_id"] = scan_id_str
+                    cand["dm"] = dm_val
                 t_var = candidates.candidates_to_astropy_table(annotated_var)
                 candidates.save_candidates_table(t_var,
                                                 csv_path=f"{var_root}_candidates.csv",
@@ -682,7 +698,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 return_snr_cubes=True,
                 keep_top_k=50,
                 std_mode="spatial_per_window",
-                subtract_mean_per_pixel=True
+                subtract_mean_per_pixel=True,
+                dm=dm_val,
             )
             dets_by_w = filters.nms_snr_maps_per_width(
                 snr_cubes, times,
@@ -710,6 +727,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 )
                 for cand in annotated:
                     cand["scan_id"] = scan_id_str
+                    cand["dm"] = dm_val
                 t_box = candidates.candidates_to_astropy_table(annotated)
                 candidates.save_candidates_table(t_box,
                     csv_path=f"{box_root}_candidates.csv",

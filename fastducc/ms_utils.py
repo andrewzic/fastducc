@@ -4,10 +4,6 @@ import astropy.constants as const
 import astropy.units as u
 
 from casacore.tables import table, taql
-try:
-    import ducc0
-except Exception as e:
-    raise RuntimeError('ducc0 is required') from e
 
 # CASA POLARIZATION CORR_TYPE integer codes to labels
 _CORR_CODE_TO_NAME = {
@@ -89,22 +85,74 @@ def get_scan_aware_chunk_bounds(
             pos = end + 1 - buffer_overlap_samps
     return chunk_bounds, scan_per_time
 
-def derive_scan_id(scan_numbers: np.ndarray) -> str:
+def derive_scan_id(
+    scan_numbers: np.ndarray,
+    times: np.ndarray | None = None,
+    msname: str | None = None,
+    unique_times: np.ndarray | None = None,
+    scan_per_time_idx: np.ndarray | None = None,
+) -> str:
     """
-    Given an array of scan numbers for a chunk, return the dominant scan ID as a string.
-    Returns '' if no valid scan number is found (e.g. all zeros).
+    Given an array of scan numbers for a chunk, return a scan ID string in
+    YYYYMMDDHHMMSS format (e.g. '20260212134534').
+
+    Extraction precedence:
+      1) If msname contains a 14-digit timestamp in its path or filename and there
+         is <= 1 unique scan in the MS, use that timestamp.
+      2) If scan_per_time_idx and unique_times are available, find the first sample
+         of this scan across the entire MS and format as YYYYMMDDHHMMSS.
+      3) If times is provided, format its first timestamp as YYYYMMDDHHMMSS.
+      4) If scan_numbers already has a 14-digit integer, use it.
     """
-    if len(scan_numbers) == 0:
+    import re
+    if len(scan_numbers) == 0 and (times is None or len(times) == 0):
         return ""
-    
-    # Filter out zeros
-    valid_scans = scan_numbers[scan_numbers != 0]
-    if len(valid_scans) == 0:
-        return ""
-    
-    # Return the most common (mode)
-    unique_scans, counts = np.unique(valid_scans, return_counts=True)
-    return str(unique_scans[np.argmax(counts)])
+
+    # 1) Check msname path for 14-digit scan timestamp (e.g. directory or filename)
+    if msname:
+        m = re.search(r'(?<!\d)(\d{14})(?!\d)', os.path.abspath(msname))
+        if m:
+            n_scans_total = len(np.unique(scan_per_time_idx)) if scan_per_time_idx is not None else 1
+            if n_scans_total <= 1:
+                return m.group(1)
+
+    # 2) For multiple scans or non-dated msname, derive from the scan start time
+    if scan_per_time_idx is not None and unique_times is not None and len(scan_numbers) > 0:
+        valid_scans = scan_numbers[scan_numbers != 0]
+        if len(valid_scans) > 0:
+            unique_scans, counts = np.unique(valid_scans, return_counts=True)
+            dom_scan = unique_scans[np.argmax(counts)]
+            first_idx = np.where(scan_per_time_idx == dom_scan)[0][0]
+            t_start = float(unique_times[first_idx])
+            try:
+                from astropy.time import Time
+                return Time(t_start / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
+            except Exception:
+                import datetime
+                dt = datetime.datetime(1858, 11, 17, tzinfo=datetime.timezone.utc) + datetime.timedelta(seconds=t_start)
+                return dt.strftime("%Y%m%d%H%M%S")
+
+    # 3) Fallback: use first timestamp from chunk times
+    if times is not None and len(times) > 0:
+        t_start = float(times[0])
+        try:
+            from astropy.time import Time
+            return Time(t_start / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
+        except Exception:
+            import datetime
+            dt = datetime.datetime(1858, 11, 17, tzinfo=datetime.timezone.utc) + datetime.timedelta(seconds=t_start)
+            return dt.strftime("%Y%m%d%H%M%S")
+
+    # 4) If scan_numbers already contains a 14-digit number
+    if len(scan_numbers) > 0:
+        valid_scans = scan_numbers[scan_numbers != 0]
+        if len(valid_scans) > 0:
+            unique_scans, counts = np.unique(valid_scans, return_counts=True)
+            dom_str = str(unique_scans[np.argmax(counts)])
+            if len(dom_str) == 14 and dom_str.isdigit():
+                return dom_str
+
+    return ""
 
 
 def get_time(t):

@@ -46,6 +46,11 @@ class Config:
     var_highpass_cutoff_sec: float
     use_local_threshold: bool = True
     local_window_size: int = 64
+    current_dm: float = 0.0
+    dm_trials: Optional[List[float]] = None
+    collapse_channels: bool = False
+    nsubbands: int = 1
+    exact_uvw: bool = True
 
 @dataclass
 class WelfordState:

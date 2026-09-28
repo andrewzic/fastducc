@@ -7,13 +7,14 @@ from dask.distributed import Client, LocalCluster
 from dask_jobqueue import SLURMCluster
 
 from casacore.tables import table
+
 try:
     import ducc0
 except Exception as e:
     raise RuntimeError('ducc0 is required') from e
-
+    
 from fastducc.fd_types import Config
-from fastducc import candidates, ms_utils, imaging
+from fastducc import candidates, ms_utils, imaging, dedisp
 from fastducc import core as fd_core
 from fastducc.catalogues import get_psrcat_csv_path, get_racs_vot_path
 
@@ -155,6 +156,30 @@ def build_cli():
     parser.add_argument('--no-save-box-snippets',  dest='save_box_snippets',     action='store_false')
     parser.set_defaults(save_box_snippets=False)
     parser.add_argument('--continuum-dir', default=None, help='Path to directory containing deep per-beam continuum fits images.')
+
+    # --- Dedispersion & DM search parameters ---
+    parser.add_argument('--dm', type=float, default=None,
+                        help='Single trial DM (pc cm^-3). Default is 0.0 if not specified.')
+    parser.add_argument('--dm-min', type=float, default=0.0,
+                        help='Minimum trial DM (pc cm^-3, default: 0.0)')
+    parser.add_argument('--dm-max', type=float, default=0.0,
+                        help='Maximum trial DM (pc cm^-3, default: 0.0)')
+    parser.add_argument('--dm-step', type=float, default=None,
+                        help='Trial DM step size (pc cm^-3). If None and dm-max > dm-min, computed using --dm-tol.')
+    parser.add_argument('--dm-tol', type=float, default=1.0,
+                        help='Smearing tolerance factor in samples for optimal DM trial grid generation (default: 1.0).')
+    parser.add_argument('--collapse-channels', dest='collapse_channels', action='store_true',
+                        help='Average/collapse channel dimension after dedispersion before imaging (default: False).')
+    parser.add_argument('--no-collapse-channels', dest='collapse_channels', action='store_false',
+                        help='Retain channel dimension when imaging (default: True).')
+    parser.set_defaults(collapse_channels=False)
+    parser.add_argument('--nsubbands', type=int, default=1,
+                        help='Number of subbands to divide the bandwidth into before imaging (default: 1).')
+    parser.add_argument('--exact-uvw', dest='exact_uvw', action='store_true',
+                        help='Calculate exact per-channel UVW coordinates accounting for dispersion delay (default: True).')
+    parser.add_argument('--no-exact-uvw', dest='exact_uvw', action='store_false',
+                        help='Use baseline UVW coordinates at the snapshot reference timestamp without channel migration.')
+    parser.set_defaults(exact_uvw=True)
 
     # --- Parallel execution flags ---
     parser.add_argument(
@@ -303,7 +328,11 @@ def build_cli_periodicity(argv=None):
 def make_config(args, paths) -> Config:
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = paths
     ra0_rad, dec0_rad, _ = ms_utils.get_phase_center(args.msname, field_name=None)
-    pix_rad = args.pixsize_arcsec / 206265.0
+    current_dm = getattr(args, "dm", 0.0)
+    if current_dm is None:
+        current_dm = 0.0
+    collapse_channels = getattr(args, "collapse_channels", False)
+    nsubbands = getattr(args, "nsubbands", 1)
     return Config(
         msname=args.msname,
         npix_x=args.npix_x, npix_y=args.npix_y,
@@ -332,66 +361,16 @@ def make_config(args, paths) -> Config:
         continuum_dir=args.continuum_dir,
         var_highpass_cutoff_sec=args.var_highpass_cutoff,
         use_local_threshold=getattr(args, "use_local_threshold", True),
-        local_window_size=getattr(args, "local_box_size", 64)
+        local_window_size=getattr(args, "local_box_size", 64),
+        current_dm=current_dm,
+        collapse_channels=collapse_channels,
+        nsubbands=nsubbands,
+        exact_uvw=getattr(args, "exact_uvw", True),
     )
 
 def main_serial(args):
-    #args = build_cli()
-
-    ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = ms_utils.derive_paths(args.msname)
-    cfg = make_config(args, (ms_base, candidates_dir, chunk_prefix_root, all_prefix_root))
-    t_main, total_chunks, time_col = ms_utils.open_ms(args.msname)
-    # Discover total number of time chunks via iter
-    print(f"Found {total_chunks} time chunks in MS: {args.msname}")
-
-    # Convert arcsec to radians
-    pix_rad = args.pixsize_arcsec / 206265.0
-    ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(args.msname, field_name=None)
-
-    start = 0
-    chunk_size = max(1, args.chunk_size)
-    chunk_id = 0
-
-    wf = fd_core.init_welford(cfg)
-
-    #t_main = table(args.msname, readonly=True)
-    while start < total_chunks:
-        end = min(start + chunk_size - 1, total_chunks - 1)
-
-        print(f"[Chunk {chunk_id}] imaging time_idx {start}..{end}")
-        times, cube = imaging.image_time_samples(msname=args.msname,
-                                         t_main=t_main,
-                                         start_time_idx=start,
-                                         end_time_idx=end,
-                                         corr_mode=args.corr_mode,
-                                         basis=args.basis,
-                                         single_pol=args.single_pol,
-                                         data_column=args.data_column,
-                                         npix_x=args.npix_x,
-                                         npix_y=args.npix_y,
-                                         pixsize_x=pix_rad,
-                                         pixsize_y=pix_rad,
-                                         epsilon=args.epsilon,
-                                         do_wgridding=args.do_wgridding,
-                                         nthreads=args.nthreads,
-                                         verbosity=args.verbosity,
-                                         do_plot=args.do_plot,
-                                         )
-
-
-        # Variance/Welford chunk
-        var_ann = fd_core.process_variance_cube_chunk(cfg, times, cube, wf, start)
-
-        # Boxcar chunk
-        box_ann = fd_core.process_boxcar_chunk(cfg, times, cube, start)
-
-        #should this do something else with the annotations? maybe save per-chunk candidates if enabled?
-        start = end + 1
-        chunk_id += 1
-
-    # Finalisation
-    fd_core.finalise_welford(cfg, wf, times, cube)
-    fd_core.consolidate_catalogues(cfg)
+    args.parallel_mode = "serial"
+    return run_pipeline(args)
 
 def aggregate_main(argv=None):
 
@@ -427,28 +406,7 @@ def aggregate_obs_main(argv=None):
 
     
 
-def main():
-    log_memory("Main Startup")
-
-    if sys.argv[1] == "aggregate":
-        aggregate_main(sys.argv)
-        return None
-
-    elif sys.argv[1] == "aggregate_obs":
-        aggregate_obs_main(sys.argv)
-        return None
-    elif sys.argv[1] == "periodicity":
-        from fastducc import nufft_periodicity
-        args = build_cli_periodicity(sys.argv[2:])
-        nufft_periodicity.run_periodicity(args)
-        return None
-    
-    args = build_cli()
-
-    if args.parallel_mode == "serial":
-        main_serial(args)
-        return None
-
+def run_pipeline(args):
     log_memory("Before derive_paths and make_config")
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = ms_utils.derive_paths(args.msname)
     cfg = make_config(args, (ms_base, candidates_dir, chunk_prefix_root, all_prefix_root))
@@ -468,13 +426,38 @@ def main():
     print(f"Found {total_chunks} time chunks in MS: {cfg.msname}")
     print(f"Found time resolution {dt}s")
 
+    # Determine DM trial grid
+    if args.dm is not None:
+        dm_trials = [float(args.dm)]
+    elif args.dm_max > args.dm_min:
+        _, channel_freqs, _ = ms_utils.get_spw_info(cfg.msname)
+        plan = dedisp.DedispersionPlan(
+            freqs_hz=channel_freqs,
+            tsamp_s=dt,
+            dm_min=args.dm_min,
+            dm_max=args.dm_max,
+            dm_step=args.dm_step,
+            tolerance_samples=args.dm_tol,
+        )
+        dm_trials = [float(d) for d in plan.trial_dms]
+        print(f"Dedispersion Plan: {len(dm_trials)} trial DMs from {dm_trials[0]:.2f} to {dm_trials[-1]:.2f} pc cm^-3 (step ~ {plan.dm_step:.3f})")
+    else:
+        dm_trials = [0.0]
+
+    cfg.dm_trials = dm_trials
+
     # MAKE CHUNKS HAVE OVERLAP TO ACCOUNT FOR DISPERSIVE DELAYS
     # for DM = 1000 and 0.6-1GHz band, DM delay is ~7 s.
-    #  So a 10s buffer around each chunk should be sufficient
-
+    # So a 10s buffer around each chunk should be sufficient
     buffer_overlap = 10.0 #s
     buffer_overlap_samps = int(buffer_overlap / dt)
-    
+    max_dm = max(dm_trials)
+    if max_dm > 0.0:
+        _, channel_freqs, _ = ms_utils.get_spw_info(cfg.msname)
+        max_delay_samps = dedisp.get_dm_samps(channel_freqs, max_dm, dt)
+        if max_delay_samps + 1 > buffer_overlap_samps:
+            buffer_overlap_samps = max_delay_samps + 1
+            print(f"Adjusted buffer_overlap_samps to {buffer_overlap_samps} samples ({buffer_overlap_samps * dt:.2f} s) to accommodate max trial DM {max_dm:.2f}")
 
     chunk_size = max(1, args.chunk_size)
     if chunk_size < 2 * buffer_overlap_samps:
@@ -485,37 +468,48 @@ def main():
     )
     log_memory("After get_scan_aware_chunk_bounds (casacore)")
     print(f"Defined {len(chunk_bounds)} scan-aware chunks across {len(np.unique(scan_per_time_idx))} scans.")
-    
-    # chunk_size = max(1, args.chunk_size)
-    # if chunk_size < 2* buffer_overlap_samps:
-    #     print(f"WARNING: chunk_size {chunk_size} is smaller than 2 * buffer_overlap_samps {2*buffer_overlap_samps}. Consider increasing chunk_size.")
-    
-    # chunk_bounds = []
-    # start = 0
-    # while start < total_chunks: #nb total chunks is the total number of unique time samples in the ms...
-    #     end = min(start + chunk_size + buffer_overlap_samps - 1, total_chunks - 1)
-    #     chunk_bounds.append((start, end))
-    #     start = end + 1 - buffer_overlap_samps
 
-    # Execute chunks: serial, Dask-Local, or Dask-SLURM
-    agg_list = []
-    
     # Pre-compute scan_id_str for each chunk
     chunk_scan_ids = []
     for (s, e) in chunk_bounds:
         chunk_scans = scan_per_time_idx[s:e+1]
-        chunk_scan_ids.append(ms_utils.derive_scan_id(chunk_scans))
-        
+        chunk_times = unique_times[s:e+1]
+        chunk_scan_ids.append(ms_utils.derive_scan_id(
+            chunk_scans,
+            times=chunk_times,
+            msname=cfg.msname,
+            unique_times=unique_times,
+            scan_per_time_idx=scan_per_time_idx,
+        ))
+
+    def _process_dm_chunks(trial_dm: float, client=None):
+        cfg.current_dm = trial_dm
+        print(f"\n{'='*70}\n[DM Trial] Processing DM = {trial_dm:.2f} pc cm^-3\n{'='*70}")
+        if client is None:
+            # Serial execution
+            agg_list = []
+            for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
+                print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) | DM = {trial_dm:.2f}")
+                chunk_times = unique_times[start:end+1]
+                res = fd_core.process_chunk_task(
+                    cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
+                )
+                times, cube, c, m, M2 = res[0], res[1], res[2], res[3], res[4]
+                sid = res[5] if len(res) > 5 else scan_id_str
+                agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2, sid))
+            return agg_list
+        else:
+            # Dask parallel workers execution
+            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
+                       for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
+            return client.gather(futures)
+
     if args.parallel_mode == 'serial':
-        for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
-            print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str})")
-            chunk_times = unique_times[start:end+1]
-            res = fd_core.process_chunk_task(
-                cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
-            )
-            times, cube, c, m, M2 = res[0], res[1], res[2], res[3], res[4]
-            sid = res[5] if len(res) > 5 else scan_id_str
-            agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2, sid))
+        for trial_dm in dm_trials:
+            agg_list = _process_dm_chunks(trial_dm)
+            log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
+            _ = fd_core.finalise_welford_parallel(cfg, agg_list)
+            log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
 
     elif args.parallel_mode == 'dask-local':
         n_workers = args.dask_workers if args.dask_workers > 0 else None
@@ -525,15 +519,17 @@ def main():
             processes=(args.dask_scheduler == 'processes')
         )
         with Client(cluster) as client:
-            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
-                       for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
-            agg_list = client.gather(futures)
+            for trial_dm in dm_trials:
+                agg_list = _process_dm_chunks(trial_dm, client=client)
+                log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
+                _ = fd_core.finalise_welford_parallel(cfg, agg_list)
+                log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
         cluster.close()
 
     elif args.parallel_mode == 'dask-slurm':
         # SLURMCluster (requires dask_jobqueue)
-
-        import sys
+        if SLURMCluster is None:
+            raise RuntimeError("dask_jobqueue is required for --parallel-mode=dask-slurm")
         slurm_interface = args.slurm_interface
         if slurm_interface is None:
             try:
@@ -578,18 +574,15 @@ def main():
             cluster.adapt(minimum=1, maximum=max(1, len(chunk_bounds)))
             log_memory("After cluster.adapt")
 
-
         # Connect the client and run
         log_memory("Before Client(cluster) context creation")
         with Client(cluster) as client:
             log_memory("After Client(cluster) context creation")
-            # (optional) wait for workers before submitting
-            # client.wait_for_workers(min(1, args.dask_workers or 1))
-            futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
-                       for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
-            log_memory("After futures submit")
-            agg_list = client.gather(futures)
-            log_memory("After futures gather")
+            for trial_dm in dm_trials:
+                agg_list = _process_dm_chunks(trial_dm, client=client)
+                log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
+                _ = fd_core.finalise_welford_parallel(cfg, agg_list)
+                log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
 
         log_memory("After Client closed")
         # Graceful stop after the client context exits
@@ -602,10 +595,6 @@ def main():
     else:
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
 
-    log_memory("Before finalise_welford_parallel")
-    _ = fd_core.finalise_welford_parallel(cfg, agg_list)
-    log_memory("After finalise_welford_parallel")
-
     # Consolidate per-chunk catalogues into candidates/
     var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
     box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
@@ -617,6 +606,27 @@ def main():
         remove_chunk_catalogues=True
     )
     log_memory("After consolidate_chunk_catalogues (Finished)")
+
+
+def main():
+    log_memory("Main Startup")
+
+    if len(sys.argv) > 1 and sys.argv[1] == "aggregate":
+        aggregate_main(sys.argv)
+        return None
+    elif len(sys.argv) > 1 and sys.argv[1] == "aggregate_obs":
+        aggregate_obs_main(sys.argv)
+        return None
+    elif len(sys.argv) > 1 and sys.argv[1] == "periodicity":
+        from fastducc import nufft_periodicity
+        args = build_cli_periodicity(sys.argv[2:])
+        nufft_periodicity.run_periodicity(args)
+        return None
+    
+    args = build_cli()
+    run_pipeline(args)
+    return None
+
 
     
 if __name__ == '__main__':

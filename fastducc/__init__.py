@@ -8,6 +8,7 @@ Submodules:
 - fastducc_run: CLI / orchestration to image MS in time chunks and run detection
 - imaging: per-chunk dirty image generation (ducc0 wgridder)
 - detection: boxcar/SNR maps
+- dedisp: brute-force dedispersion utility
 - kernels: numba-accelerated primitives (moving sums, MAD/RMS, temporal SNR, max-filter)
 - filters: candidate filtering utils including  NMS, cross-width grouping
 - ms_utils: Measurement Set helpers (corr labels, spectral window, times, field centers)
@@ -22,6 +23,7 @@ __all__ = [
     "catalogues",
     "core",
     "cli",
+    "dedisp",
     "imaging",
     "detection",
     "kernels",
@@ -29,6 +31,7 @@ __all__ = [
     "ms_utils",
     "wcs",
     "candidates",
+    "dedisp",
     "types"
 ]
 

@@ -26,8 +26,8 @@ except Exception:
 
 try:
     import ducc0
-except Exception as e:
-    raise RuntimeError('ducc0 is required') from e
+except Exception:
+    ducc0 = None
 
 from fastducc import wcs as ducc_wcs
 from fastducc.filters import is_zero_flux_candidate
@@ -353,12 +353,12 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
         # return an empty table with typical schema
         t = Table(names=[
             "srcname","x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
-            "ra_hms","dec_dms","snr","width_samples",
+            "ra_hms","dec_dms","dm","snr","width_samples",
             "time_start","time_end","time_center","duration",
             "t0_idx","t1_idx_excl","center_idx","scan_id","phase_center_field"
         ], dtype=[
             str, int,int,float,float,float,float,float,float,
-            "U20","U20",float,int,
+            "U20","U20",float,float,int,
             float,float,float,float,
             int,int,int,int,"U64"
         ])
@@ -385,7 +385,9 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
     ra_hms  = np.array(col("ra_hms", default=""), dtype=str)
     dec_dms = np.array(col("dec_dms", default=""), dtype=str)
 
-    # Optional metrics
+    # Optional metrics & DM (default 0.0 pc/cm^3)
+    dms          = np.array(col("dm", default=0.0), dtype=float)
+    dms          = np.nan_to_num(dms, nan=0.0)
     snr          = np.array(col("snr"), dtype=float)
     width_samples= np.array(col("width_samples", default=np.int64(-1)), dtype=np.int64)
 
@@ -397,7 +399,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
 
     t0_idx       = np.array(col("t0_idx", default=np.int64(-1)), dtype=np.int64)
     t1_idx_excl  = np.array(col("t1_idx_excl", default=np.int64(-1)), dtype=np.int64)
-    scan_id      = np.array(col("scan_id", default=np.int64(-1)), dtype=np.int64)
+    scan_id      = np.array([str(s) if s not in (None, -1, "-1", np.nan) else "" for s in col("scan_id", default="")], dtype=str)
     center_idx   = np.array(col("center_idx", default=np.int64(-1)), dtype=np.int64)
 
     # Field name (string)
@@ -416,6 +418,7 @@ def candidates_to_astropy_table(annotated: List[Dict[str, Any]]) -> Table:
     t["dec_deg"] = dec_deg * u.deg
     t["ra_hms"]  = ra_hms
     t["dec_dms"] = dec_dms
+    t["dm"]      = dms * (u.pc / (u.cm**3))
     t["snr"]     = snr
     t["width_samples"] = width_samples
     t["time_start"]  = time_start * u.s
@@ -553,7 +556,7 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
         return Table(names=[
             "srcname","x","y","l","m",
             "ra_rad","dec_rad","ra_deg","dec_deg","ra_hms","dec_dms",
-            "snr","f_hz","period_s","nharm_used","algo","phase_center_field"
+            "dm","snr","f_hz","period_s","nharm_used","algo","phase_center_field"
         ])
 
     def col(key, default=np.nan):
@@ -572,6 +575,8 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
     srcname = np.array(col("srcname", ""), dtype=str)
     field_name = np.array(col("phase_center_field", ""), dtype=str)
 
+    dms = np.array(col("dm", 0.0), dtype=float)
+    dms = np.nan_to_num(dms, nan=0.0)
     snr = np.array(col("snr"), dtype=float)
     f_hz = np.array(col("f_hz"), dtype=float)
     period_s = np.array(col("period_s"), dtype=float)
@@ -590,6 +595,7 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
     t["dec_deg"] = dec_deg * u.deg
     t["ra_hms"] = ra_hms
     t["dec_dms"] = dec_dms
+    t["dm"] = dms * (u.pc / (u.cm**3))
     t["snr"] = snr
     t["f_hz"] = f_hz * u.Hz
     t["period_s"] = period_s * u.s
@@ -988,8 +994,24 @@ def save_candidate_summary(
     scan  = meta.get("scan_id", "") if isinstance(meta, dict) else ""
     beam  = meta.get("beam", "") if isinstance(meta, dict) else ""
 
+    # Ensure scan is formatted as YYYYMMDDHHMMSS if possible
+    cand_scan = str(candidate.get("scan_id", "") or "")
+    if cand_scan and not scan:
+        scan = cand_scan
+    # If scan is missing or malformed (not 14 digits and not combined)
+    if not scan or (scan.isdigit() and len(scan) != 14):
+        t_ref = candidate.get("time_start") or candidate.get("time_center") or times[0]
+        if t_ref is not None and np.isfinite(t_ref):
+            try:
+                from astropy.time import Time
+                scan = Time(float(t_ref) / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
+            except Exception:
+                pass
+
     snr_val = candidate.get("snr", np.nan)
     snr_str = f"{float(snr_val):.2f}" if np.isfinite(snr_val) else "—"
+    cand_dm = float(candidate.get("dm", 0.0) if candidate.get("dm") is not None and not np.isnan(float(candidate.get("dm", 0.0))) else 0.0)
+    dm_str = f"{cand_dm:.2f} pc/cm³"
     width_str = f"{w:d}" if (method.lower() == "boxcar") else "—"
 
     # CASA and wsclean time/index strings for follow-up imaging
@@ -1021,6 +1043,7 @@ def save_candidate_summary(
         f"Name: {srcname}\n"
         f"Field: {field}\n"
         f"S/N: {snr_str}\n"
+        f"DM: {dm_str}\n"
         f"SBID: {sbid}\n"
         f"Beam: {beam}\n"        
         f"Scan: {scan}\n"
@@ -1383,11 +1406,11 @@ def _stack_tables_or_empty(tables):
     if len(tables) == 0:
         # Create a minimal empty table with common columns used in pipeline
         return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
-                            "ra_hms","dec_dms","snr","std","width_samples",
+                            "ra_hms","dec_dms","dm","snr","std","width_samples",
                             "time_start","time_end","time_center","duration","t0_idx","t1_idx_excl",
                             "center_idx","phase_center_field","chunk_id","algo"],
                      dtype=[int,int,float,float,float,float,float,float,
-                            "U20","U20",float,float,int,
+                            "U20","U20",float,float,float,int,
                             float,float,float,float,int,int,
                             int,"U64",int,"U16"])
     # Use outer join to be resilient to column differences across chunks
@@ -1395,6 +1418,10 @@ def _stack_tables_or_empty(tables):
     # Fill masked values (NA) with sensible defaults for CSV/VOT output
     T.fill_value = np.nan
     T = T.filled()
+    if "dm" in T.colnames:
+        T["dm"] = np.nan_to_num(np.array(T["dm"], dtype=float), nan=0.0)
+    else:
+        T["dm"] = np.zeros(len(T), dtype=float)
     return T
 
 
@@ -1408,25 +1435,6 @@ def _read_csv_tables(paths):
         except Exception as e:
             print(f"[Consolidation] Skipping '{p}' (read error: {e})")
     return tables
-
-def _stack_tables_or_empty(tables):
-    """Vstack a list of tables (outer join), return a filled table or empty schema."""
-    if len(tables) == 0:
-        # Create a minimal empty table with common columns used in pipeline
-        return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
-                            "ra_hms","dec_dms","snr","std","width_samples",
-                            "time_start","time_end","time_center","duration","t0_idx","t1_idx_excl",
-                            "center_idx","phase_center_field","chunk_id","algo"],
-                     dtype=[int,int,float,float,float,float,float,float,
-                            "U20","U20",float,float,int,
-                            float,float,float,float,int,int,
-                            int,"U64",int,"U16"])
-    # Use outer join to be resilient to column differences across chunks
-    T = vstack(tables, join_type="outer", metadata_conflicts="silent")
-    # Fill masked values (NA) with sensible defaults for CSV/VOT output
-    T.fill_value = np.nan
-    T = T.filled()
-    return T
 
 
 def _load_psrcat_csv(psrcat_csv_path: str) -> Table:
@@ -1529,6 +1537,7 @@ def parse_candidate_filename(path: str, *, require: str | None = None) -> dict:
         "beam": "",
         "scan_id": "",
         "kind": "",
+        "dm": 0.0,
         "is_all": False,
         "is_super": False,
     }
@@ -1545,12 +1554,21 @@ def parse_candidate_filename(path: str, *, require: str | None = None) -> dict:
     if m_beam:
         info["beam"] = m_beam.group(1)
 
-    m_scan = re.search(r'(\d{14})', fname)
+    m_dm = re.search(r'_dm([\d.]+)', fname)
+    if m_dm:
+        try:
+            info["dm"] = float(m_dm.group(1))
+        except Exception:
+            pass
+
+    m_scan = re.search(r'(?<!\d)(\d{14})(?!\d)', fname)
+    if not m_scan:
+        m_scan = re.search(r'(?<!\d)(\d{14})(?!\d)', os.path.abspath(path))
     if m_scan:
         info["scan_id"] = m_scan.group(1)
     else:
         # Catch "combined" scan directories (e.g. cont_combined, native_combined)
-        m_combined = re.search(r'(\w+_combined)', fname)
+        m_combined = re.search(r'(\w+_combined)', fname) or re.search(r'(\w+_combined)', os.path.abspath(path))
         if m_combined:
             info["scan_id"] = m_combined.group(1)
 
@@ -1841,7 +1859,24 @@ def aggregate_beam_candidate_tables(
         meta = parse_candidate_filename(p, require="all")
         field_name = meta["field"]
         sbid = meta["sbid"]
-        scan_id = meta.get("scan_id", 1)
+        scan_id = meta.get("scan_id", "")
+        if not scan_id or (str(scan_id).isdigit() and len(str(scan_id)) != 14):
+            try:
+                t_tmp = Table.read(p, format="votable")
+                if "scan_id" in t_tmp.colnames and len(t_tmp) > 0:
+                    val = str(t_tmp["scan_id"][0]).strip()
+                    if val and val not in ("-1", "0", ""):
+                        if len(val) == 14 and val.isdigit():
+                            scan_id = val
+                        elif "time_start" in t_tmp.colnames or "time_center" in t_tmp.colnames:
+                            t_col = "time_start" if "time_start" in t_tmp.colnames else "time_center"
+                            t_val = float(t_tmp[t_col][0])
+                            from astropy.time import Time
+                            scan_id = Time(t_val / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
+            except Exception:
+                pass
+        if not scan_id:
+            scan_id = 1
         if field_name and sbid and scan_id:
             out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.csv")
             out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.vot")
@@ -1859,22 +1894,43 @@ def aggregate_beam_candidate_tables(
         field_name = meta["field"]
         sbid = meta["sbid"]
         beam_id = meta["beam"]
-        scan_id = meta.get("scan_id", 1)
+        scan_id = meta.get("scan_id", "")
+
         for col in ("time_center", "ra_deg", "dec_deg", "snr"):
             if col not in t.colnames:
                 raise ValueError(f"Missing required column '{col}' in {p}")
         for r in t:
             d = {name: r[name] for name in t.colnames}
             d["beam_id"] = beam_id
-            d["scan_id"] = scan_id
             d["field"]   = field_name
             d["sbid"]    = sbid
+            row_dm = r.get("dm", 0.0) if "dm" in t.colnames else 0.0
+            d["dm"] = float(row_dm) if row_dm is not None and not np.isnan(float(row_dm)) else 0.0
+            row_scan = str(r.get("scan_id", "")).strip()
+            if scan_id and len(str(scan_id)) == 14:
+                d["scan_id"] = str(scan_id)
+            elif row_scan and len(row_scan) == 14:
+                d["scan_id"] = row_scan
+            elif scan_id:
+                d["scan_id"] = str(scan_id)
+            elif row_scan and row_scan not in ("-1", "0", ""):
+                t_cand = r.get("time_start", r.get("time_center", np.nan))
+                if np.isfinite(t_cand):
+                    try:
+                        from astropy.time import Time
+                        d["scan_id"] = Time(float(t_cand) / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
+                    except Exception:
+                        d["scan_id"] = row_scan
+                else:
+                    d["scan_id"] = row_scan
+            else:
+                d["scan_id"] = 1
             rows.append(d)
 
     # Empty case
     if len(rows) == 0:
         names = [
-            'event_id', 'time_center', 'ra_deg', 'dec_deg', 'max_snr',
+            'event_id', 'time_center', 'ra_deg', 'dec_deg', 'dm', 'max_snr',
             'max_snr_time_center', 'max_snr_beam'
         ]
         if kind == 'boxcar':
@@ -1921,6 +1977,7 @@ def aggregate_beam_candidate_tables(
             ra_hms, dec_dms, srcname = _sexagesimal_from_deg(float(det["ra_deg"]), float(det["dec_deg"]))
             w = det.get('width_samples', None)
             w_str = str(int(w)) if w is not None else ''
+            det_dm = float(det.get('dm', 0.0) if det.get('dm') is not None and not np.isnan(float(det.get('dm', 0.0))) else 0.0)
             ev = {
                 'srcname': srcname,
                 'time_center': float(det['time_center']),
@@ -1928,6 +1985,7 @@ def aggregate_beam_candidate_tables(
                 'dec_deg': float(det['dec_deg']),
                 'ra_hms': str(ra_hms),
                 'dec_dms': str(dec_dms),
+                'dm': det_dm,
                 'max_snr': float(det['snr']),
                 'beam_ids': ','.join([b for b in beams if b]),
                 'scan_ids': ','.join([s for s in scans if s]),
@@ -1939,6 +1997,7 @@ def aggregate_beam_candidate_tables(
                 'max_snr_time_center': float(det['time_center']),
                 'beam_all': str(det.get('beam_id', '')),
                 'snr_all': f"{float(det['snr']):.2f}",
+                'dm_all': f"{det_dm:.2f}",
             }
             if kind == 'boxcar':
                 ev['width_samples'] = w_str
@@ -1961,6 +2020,7 @@ def aggregate_beam_candidate_tables(
             beams_unique = sorted({b for b in beams_all_lst if b})
             scans = sorted({r.get('scan_id', '') for r in sub_sorted})
             ra_hms, dec_dms, srcname = _sexagesimal_from_deg(float(best["ra_deg"]), float(best["dec_deg"]))
+            best_dm = float(best.get('dm', 0.0) if best.get('dm') is not None and not np.isnan(float(best.get('dm', 0.0))) else 0.0)
             ev = {
                 'srcname': srcname,
                 'time_center': float(best['time_center']),
@@ -1968,6 +2028,7 @@ def aggregate_beam_candidate_tables(
                 'dec_deg': float(best['dec_deg']),
                 'ra_hms': str(ra_hms),
                 'dec_dms': str(dec_dms),
+                'dm': best_dm,
                 'max_snr': float(best['snr']),
                 'beam_ids': ','.join(beams_unique),
                 'scan_ids': ','.join([s for s in scans if s]),
@@ -1979,6 +2040,7 @@ def aggregate_beam_candidate_tables(
                 'max_snr_time_center': float(best['time_center']),
                 'beam_all': ','.join(beams_all_lst),
                 'snr_all': ','.join([f"{float(r.get('snr', 0.0)):.2f}" for r in sub_sorted]),
+                'dm_all': ','.join([f"{float(r.get('dm', 0.0) if r.get('dm') is not None and not np.isnan(float(r.get('dm', 0.0))) else 0.0):.2f}" for r in sub_sorted]),
             }
             if kind == 'boxcar':
                 widths_unique = sorted({int(r.get('width_samples', -1)) for r in sub_sorted
@@ -1998,13 +2060,13 @@ def aggregate_beam_candidate_tables(
     # Build event table (columns preserved)
     colnames = [
         'event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
-        'max_snr', 'max_snr_time_center', 'max_snr_beam'
+        'dm', 'max_snr', 'max_snr_time_center', 'max_snr_beam'
     ]
     if kind == 'boxcar':
         colnames.append('max_snr_width')
         colnames.append('width_samples')
         colnames.append('width_all')
-    colnames += ['beam_ids', 'beam_all', 'snr_all', 'scan_ids', 'n_beams', 'n_detections']
+    colnames += ['beam_ids', 'beam_all', 'snr_all', 'dm_all', 'scan_ids', 'n_beams', 'n_detections']
     event_tab = Table(rows=[[ev.get(c) for c in colnames] for ev in events], names=colnames)
     if out_csv: 
         event_tab.write(out_csv, format='csv', overwrite=True)
@@ -2032,12 +2094,14 @@ def aggregate_beam_candidate_tables(
         for r in sub:
             beams_union |= set(_split_list_str(r.get("beam_ids","")))
             scans_union |= set(_split_list_str(r.get("scan_ids","")))
+        best_dm = float(best.get("dm", 0.0) if best.get("dm") is not None and not np.isnan(float(best.get("dm", 0.0))) else 0.0)
         row = {
             "srcname": best["srcname"],
             "ra_deg": float(best["ra_deg"]),
             "dec_deg": float(best["dec_deg"]),
             "ra_hms": best["ra_hms"],
             "dec_dms": best["dec_dms"],
+            "dm": best_dm,
             "n_events": len(sub),
             "n_detections_total": int(np.nansum([float(r.get("n_detections", 1)) for r in sub])),
             "beams_all": ",".join(sorted([b for b in beams_union if b])),
@@ -2047,6 +2111,10 @@ def aggregate_beam_candidate_tables(
             "max_snr_event_beams": best.get("beam_ids", ""),
             "max_snr_beam": str(best.get("max_snr_beam", "")),            
         }
+        dms_union = set()
+        for r in sub:
+            dms_union |= set(_split_list_str(r.get("dm_all", "") or str(r.get("dm", ""))))
+        row["dm_all"] = ",".join(sorted([d for d in dms_union if d]))
         if kind == "boxcar":
             w_union = set()
             for r in sub:
@@ -2071,7 +2139,7 @@ def aggregate_beam_candidate_tables(
         r["source_id"] = i
 
     super_cols = [
-        "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+        "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms","dm","dm_all",
         "n_events","n_detections_total","beams_all","scans_all",
         "max_snr","max_snr_time_center","max_snr_event_beams",
     ]
@@ -2695,7 +2763,7 @@ def aggregate_observation_from_super_summaries(
     # Empty inputs -> write empty outputs
     if len(files) == 0:
         empty_cols = [
-            "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+            "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms","dm",
             "max_snr","max_snr_time_center","max_snr_beam","n_scans",
             "scan_ids","beams_all",
         ]
@@ -2722,14 +2790,20 @@ def aggregate_observation_from_super_summaries(
         "max_snr_event_beams","max_snr_event_widths",
         "max_snr_beam",
     }
-    optional_numbers = {"max_snr_width", "max_snr_time_center"}
+    optional_numbers = {"max_snr_width", "max_snr_time_center", "dm"}
 
     for p in files:
         # FIX: require='super' for super-summary files
         meta = parse_candidate_filename(p, require='super')
         f_field = meta['field'] 
         f_sbid = meta['sbid']
-        f_scan = meta.get("scan_id", 1)
+        f_scan = meta.get("scan_id", "")
+        if not f_scan or (str(f_scan).isdigit() and len(str(f_scan)) != 14):
+            m_path_scan = re.search(r'(?<!\d)(\d{14})(?!\d)', os.path.abspath(p))
+            if m_path_scan:
+                f_scan = m_path_scan.group(1)
+            else:
+                f_scan = f_scan or 1
         f_kind = meta['kind']
         if f_kind != kind:
             continue
@@ -2752,13 +2826,25 @@ def aggregate_observation_from_super_summaries(
         for r in tab:
             d = {name: r[name] if name in tab.colnames else None
                  for name in itertools.chain(required, optional_strings, optional_numbers)}
-            d["scan_id"] = f_scan
+            row_dm = r.get("dm", 0.0) if "dm" in tab.colnames else 0.0
+            d["dm"] = float(row_dm) if row_dm is not None and not np.isnan(float(row_dm)) else 0.0
+            r_scan = str(r.get("scan_id", "")).strip() if "scan_id" in tab.colnames else ""
+            if len(str(f_scan)) == 14:
+                d["scan_id"] = str(f_scan)
+            elif len(r_scan) == 14:
+                d["scan_id"] = r_scan
+            elif f_scan:
+                d["scan_id"] = str(f_scan)
+            elif r_scan:
+                d["scan_id"] = r_scan
+            else:
+                d["scan_id"] = 1
             rows.append(d)
 
     if len(rows) == 0:
         print("[ObsSuper] No valid rows after reading inputs; writing empty outputs.")
         empty_cols = [
-            "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+            "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms","dm","dm_all",
             "max_snr","max_snr_time_center","max_snr_beam","n_scans",
             "scan_ids","beams_all",
         ]
@@ -2791,6 +2877,7 @@ def aggregate_observation_from_super_summaries(
         best_snr = float(best.get("max_snr", np.nan))
         best_time = float(best.get("max_snr_time_center", np.nan)) if best.get("max_snr_time_center", None) is not None else np.nan
         best_scan = str(best.get("scan_id", ""))
+        best_dm = float(best.get("dm", 0.0) if best.get("dm") is not None and not np.isnan(float(best.get("dm", 0.0))) else 0.0)
 
         # Fill sexagesimal/name if missing
         ra_hms = str(best.get("ra_hms", "") or "")
@@ -2807,12 +2894,18 @@ def aggregate_observation_from_super_summaries(
         for r in sub:
             beams_union |= set(_split_list_str(r.get("beams_all", "")))
 
+        dms_union = set()
+        for r in sub:
+            dms_union |= set(_split_list_str(r.get("dm_all", "") or str(r.get("dm", ""))))
+
         row_out = {
             "srcname": srcname,
             "ra_deg": best_ra,
             "dec_deg": best_dec,
             "ra_hms": ra_hms,
             "dec_dms": dec_dms,
+            "dm": best_dm,
+            "dm_all": ",".join(sorted([d for d in dms_union if d])),
             "max_snr": best_snr,
             "max_snr_time_center": best_time,
             "max_snr_beam": str(best.get("max_snr_beam", "")) if best.get("max_snr_beam", "") else "",
@@ -2850,7 +2943,7 @@ def aggregate_observation_from_super_summaries(
         d["source_id"] = i
 
     cols = [
-        "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms",
+        "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms","dm","dm_all",
         "max_snr","max_snr_time_center","max_snr_beam",
         "max_snr_scan_id",
         "n_scans","scan_ids","beams_all",

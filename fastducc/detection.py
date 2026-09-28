@@ -3,8 +3,8 @@ import numpy as np
 
 try:
     import ducc0
-except Exception as e:
-    raise RuntimeError('ducc0 is required') from e
+except Exception:
+    ducc0 = None
 
 from fastducc import kernels
 
@@ -24,6 +24,7 @@ def boxcar_search_time(
     clip_sigma: float = 3.0,
     use_local_threshold: bool = True,
     local_window_size: int = 64,
+    dm: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[int, np.ndarray]]]:
     """
     Numba-accelerated SNR computations.
@@ -179,6 +180,7 @@ def boxcar_search_time(
                 "y": int(ys[i]),
                 "x": int(xs[i]),
                 "width_samples": int(w),
+                "dm": float(dm),
                 "snr": float(snr[t0, ys[i], xs[i]]),
                 # value_sum is useful only for spatial_per_window
                 "value_sum": float(snr[t0, ys[i], xs[i]]) if std_mode != "spatial_per_window" else float(
@@ -208,6 +210,7 @@ def variance_search(
     clip_sigma: float = 3.0,
     use_local_threshold: bool = True,
     local_window_size: int = 64,
+    dm: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, np.ndarray]]]:
     """
     Detect variability by the per-pixel standard deviation across time.
@@ -274,6 +277,7 @@ def variance_search(
         det = {
             "y": int(y),
             "x": int(x),
+            "dm": float(dm),
             "snr": float(s),
             "std": float(std_map[y, x]),
             # placeholders for API consistency (unused in variance search)
@@ -300,7 +304,8 @@ def variance_search_welford(
     clip_sigma: float = 3.0,
     subtract_mean_of_std_map: bool = True,    # if True, SNR = (std - mean(std)) / sigma
     use_local_threshold: bool = True,
-    local_window_size: int = 64
+    local_window_size: int = 64,
+    dm: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
     """
     Detect variability from a precomputed per-pixel standard deviation map (Welford result).
@@ -368,6 +373,7 @@ def variance_search_welford(
         det = {
             "y": int(y),
             "x": int(x),
+            "dm": float(dm),
             "snr": float(s),
             "std": float(std_map64[y, x]),
             # placeholders to satisfy downstream code
