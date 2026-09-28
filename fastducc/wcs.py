@@ -6,8 +6,8 @@ from astropy.wcs import WCS
 
 try:
     import ducc0
-except Exception:
-    ducc0 = None
+except Exception as e:
+    raise RuntimeError('ducc0 is required') from e
 
 from fastducc import ms_utils
 

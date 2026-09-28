@@ -26,8 +26,8 @@ except Exception:
 
 try:
     import ducc0
-except Exception:
-    ducc0 = None
+except Exception as e:
+    raise RuntimeError('ducc0 is required') from e
 
 from fastducc import wcs as ducc_wcs
 from fastducc.filters import is_zero_flux_candidate
