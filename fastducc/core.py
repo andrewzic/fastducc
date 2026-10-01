@@ -342,7 +342,8 @@ def finalise_welford_parallel(
         Final global standard deviation map, shape (Ny, Nx), float64.
     """
     dm_val = float(dm) if dm is not None else float(getattr(cfg, "current_dm", 0.0))
-    dm_suffix = f"_dm{dm_val:06.2f}" if dm_val != 0.0 else ""
+    is_search = getattr(cfg, "is_dm_search", False) or (dm_val != 0.0)
+    dm_suffix = f"_dm{dm_val:06.2f}" if is_search else ""
 
     # --- 1) Reduce per-chunk aggregates for this dm into one global aggregate ---
     Ny, Nx = cfg.npix_y, cfg.npix_x
@@ -422,7 +423,9 @@ def finalise_welford_parallel(
     hdr["PC2_1"]  = 0.0 
     hdr["PC2_2"] = 1.0
 
-    full_std_fits = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}{dm_suffix}_std_map_full.fits")
+    scan_tag = f"_scan_{cfg.scan_id}" if getattr(cfg, "scan_id", None) else ""
+    full_std_fits = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}{scan_tag}{dm_suffix}_std_map_full.fits")
+    hdr["DM"] = dm_val
     fits.writeto(full_std_fits, data=std_map_full.astype(np.float32), header=hdr, overwrite=True)
     print(f"[Final] wrote full std-map (DM={dm_val:.2f}) -> {full_std_fits}")
 
@@ -480,7 +483,7 @@ def finalise_welford_parallel(
                     cand["scan_id"] = sid
                     cand["dm"] = dm_val
                 
-                var_root = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}{dm_suffix}_scan_{sid}_var")
+                var_root = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}_scan_{sid}{dm_suffix}_var")
                 t_var = candidates.candidates_to_astropy_table(annotated_var)
                 candidates.save_candidates_table(
                     t_var,
@@ -522,7 +525,7 @@ def finalise_welford_parallel(
             for cand in annotated_var:
                 cand["dm"] = dm_val
 
-            var_root = f"{cfg.all_prefix_root}{dm_suffix}_var"
+            var_root = f"{cfg.all_prefix_root}{scan_tag}{dm_suffix}_var"
             t_var = candidates.candidates_to_astropy_table(annotated_var)
             candidates.save_candidates_table(t_var,
                                              csv_path=f"{var_root}_candidates.csv",
@@ -585,7 +588,8 @@ def finalise_welford_serial(cfg: Config, wf_state: WelfordState, dm: float | Non
 def consolidate_catalogues(cfg: Config):
     dm_val = float(getattr(cfg, "current_dm", 0.0))
     scan_tag = f"_scan_{cfg.scan_id}" if getattr(cfg, "scan_id", None) else ""
-    if dm_val != 0.0:
+    is_search = getattr(cfg, "is_dm_search", False) or (dm_val != 0.0)
+    if is_search:
         dm_tag = f"_dm{dm_val:06.2f}"
         ms_base_tag = f"{cfg.ms_base}{scan_tag}{dm_tag}"
         var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{scan_tag}*{dm_tag}*_var_candidates.csv")
@@ -658,7 +662,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
             exact_uvw=getattr(cfg, "exact_uvw", True),
         )
 
-        dm_suffix = f"_dm{dm_val:06.2f}" if dm_val != 0.0 else ""
+        is_search = getattr(cfg, "is_dm_search", False) or (dm_val != 0.0)
+        dm_suffix = f"_dm{dm_val:06.2f}" if is_search else ""
         chunk_root = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_chunk_{start:06d}")
 
         # ---------------------------------------------------------------------
@@ -736,12 +741,14 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     if os.path.exists(vot_path):
                         annotated_var = candidates.astropy_table_to_candidates(vot_path)
                     else:
-                        vot_path = os.path.join(candidates_dir, f"{ms_base}_variance_all.vot")
+                        vot_path = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_variance_all.vot")
+                        if not os.path.exists(vot_path):
+                            vot_path = os.path.join(candidates_dir, f"{ms_base}_variance_all.vot")
                         if os.path.exists(vot_path):
                             annotated_var = candidates.astropy_table_to_candidates(vot_path)
                         else:
                             annotated_var = []
-                            print(f"[Warning] No candidates found for plotting: no vot files at {var_root}_candidates.vot or {ms_base}_variance_all.vot")
+                            print(f"[Warning] No candidates found for plotting: no vot files at {var_root}_candidates.vot or {vot_path}")
 
                 for i, cand in enumerate(annotated_var):
                     srcname = cand["srcname"]
@@ -835,12 +842,14 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 if os.path.exists(vot_path):
                     annotated = candidates.astropy_table_to_candidates(vot_path)
                 else:
-                    vot_path = os.path.join(candidates_dir, f"{ms_base}_boxcar_all.vot")
+                    vot_path = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_boxcar_all.vot")
+                    if not os.path.exists(vot_path):
+                        vot_path = os.path.join(candidates_dir, f"{ms_base}_boxcar_all.vot")
                     if os.path.exists(vot_path):
                         annotated = candidates.astropy_table_to_candidates(vot_path)
                     else:
                         annotated = []
-                        print(f"[Warning] No candidates found for plotting: no vot files at {box_root}_candidates.vot or {ms_base}_boxcar_all.vot")
+                        print(f"[Warning] No candidates found for plotting: no vot files at {box_root}_candidates.vot or {vot_path}")
             else:
                 annotated = []
 

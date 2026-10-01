@@ -1942,6 +1942,9 @@ def generate_obs_variance_candidate_products(
         ra_hms = str(r.get("ra_hms", ""))
         dec_dms = str(r.get("dec_dms", ""))
 
+        cand_dm = float(r.get("dm", meta.get("dm", 0.0)) if r.get("dm", None) is not None and not np.isnan(float(r.get("dm", 0.0))) else meta.get("dm", 0.0))
+        dm_str = f"{cand_dm:.2f} pc/cm³"
+
         out_prefix = os.path.join(candidates_dir, f"{ms_base}_var_cand_{srcname}")
         out_cut = f"{out_prefix}_cutout.fits"
         out_ff = f"{out_prefix}_fullframe.fits"
@@ -1953,6 +1956,7 @@ def generate_obs_variance_candidate_products(
             hdr_ff = std_hdr.copy()
             hdr_ff["OBJRA"] = ra_hms
             hdr_ff["OBJDEC"] = dec_dms
+            hdr_ff["DM"] = cand_dm
             hdr_ff["COMMENT"] = "Fullframe detection image from std_map_full"
             fits.writeto(out_ff, std_data, hdr_ff, overwrite=True)
             generated.append(out_ff)
@@ -1966,6 +1970,7 @@ def generate_obs_variance_candidate_products(
                 hdr_cut["BUNIT"] = std_hdr.get("BUNIT", "JY/BEAM")
                 hdr_cut["OBJRA"] = ra_hms
                 hdr_cut["OBJDEC"] = dec_dms
+                hdr_cut["DM"] = cand_dm
                 hdr_cut["COMMENT"] = "Cutout detection image from std_map_full"
                 fits.writeto(out_cut, cutout_obj.data.astype(np.float32), hdr_cut, overwrite=True)
                 generated.append(out_cut)
@@ -2029,6 +2034,7 @@ def generate_obs_variance_candidate_products(
                 f"Name: {srcname}\n"
                 f"Field: {field_str or '—'}\n"
                 f"S/N: {snr_val:.2f}\n"
+                f"DM: {dm_str}\n"
                 f"SBID: {sbid_str or '—'}\n"
                 f"Beam: {beam_str or '—'}\n"
                 f"Coord (J2000): {ra_hms} {dec_dms}\n"
@@ -2146,16 +2152,24 @@ def aggregate_beam_candidate_tables(
         beam_id = meta["beam"]
         scan_id = meta.get("scan_id", "")
 
+        file_dm = meta.get("dm", 0.0)
+
         for col in ("time_center", "ra_deg", "dec_deg", "snr"):
             if col not in t.colnames:
                 raise ValueError(f"Missing required column '{col}' in {p}")
         for r in t:
-            d = {name: r[name] for name in t.colnames}
+            d = {name: _row_value_to_python(r[name]) for name in t.colnames}
             d["beam_id"] = beam_id
             d["field"]   = field_name
             d["sbid"]    = sbid
-            row_dm = r.get("dm", 0.0) if "dm" in t.colnames else 0.0
-            d["dm"] = float(row_dm) if row_dm is not None and not np.isnan(float(row_dm)) else 0.0
+            row_dm = d.get("dm", None)
+            if row_dm is not None and not (isinstance(row_dm, float) and np.isnan(row_dm)):
+                try:
+                    d["dm"] = float(getattr(row_dm, "value", row_dm))
+                except Exception:
+                    d["dm"] = float(file_dm if file_dm is not None else 0.0)
+            else:
+                d["dm"] = float(file_dm if file_dm is not None else 0.0)
             row_scan = str(r.get("scan_id", "")).strip()
             if scan_id and len(str(scan_id)) == 14:
                 d["scan_id"] = str(scan_id)
@@ -2781,11 +2795,13 @@ def organize_candidate_outputs(
                         if "ra_deg" in t_comp.colnames and "dec_deg" in t_comp.colnames:
                             meta_comp = parse_candidate_filename(item_path)
                             for r_comp in t_comp:
-                                d_comp = _sanitize_row_dict({col: r_comp[col] for col in t_comp.colnames})
+                                d_comp = _sanitize_row_dict({col: _row_value_to_python(r_comp[col]) for col in t_comp.colnames})
                                 if not d_comp.get("scan_id") and meta_comp.get("scan_id"):
                                     d_comp["scan_id"] = meta_comp["scan_id"]
                                 if not d_comp.get("beam") and meta_comp.get("beam"):
                                     d_comp["beam"] = meta_comp["beam"]
+                                if ("dm" not in d_comp or d_comp["dm"] is None or (isinstance(d_comp["dm"], float) and np.isnan(d_comp["dm"]))) and meta_comp.get("dm") is not None:
+                                    d_comp["dm"] = meta_comp["dm"]
                                 all_comp_rows.append(d_comp)
                     except Exception:
                         pass
@@ -3081,10 +3097,17 @@ def aggregate_observation_from_super_summaries(
             continue
 
         for r in tab:
-            d = {name: r[name] if name in tab.colnames else None
+            d = {name: _row_value_to_python(r[name]) if name in tab.colnames else None
                  for name in itertools.chain(required, optional_strings, optional_numbers)}
-            row_dm = r.get("dm", 0.0) if "dm" in tab.colnames else 0.0
-            d["dm"] = float(row_dm) if row_dm is not None and not np.isnan(float(row_dm)) else 0.0
+            row_dm = d.get("dm", None)
+            meta_dm = meta.get("dm", 0.0)
+            if row_dm is not None and not (isinstance(row_dm, float) and np.isnan(row_dm)):
+                try:
+                    d["dm"] = float(getattr(row_dm, "value", row_dm))
+                except Exception:
+                    d["dm"] = float(meta_dm if meta_dm is not None else 0.0)
+            else:
+                d["dm"] = float(meta_dm if meta_dm is not None else 0.0)
             r_scan = str(r.get("scan_id", "")).strip() if "scan_id" in tab.colnames else ""
             if len(str(f_scan)) == 14:
                 d["scan_id"] = str(f_scan)

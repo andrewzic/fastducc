@@ -213,9 +213,9 @@ def build_cli():
     # --- SLURM-only cluster params ---
     parser.add_argument('--slurm-partition', default=None, help='SLURM partition/queue')
     parser.add_argument('--slurm-account',  default=None, help='SLURM account/project')
-    parser.add_argument('--slurm-cores-per-worker', type=int, default=1)
-    parser.add_argument('--slurm-mem', default='8GB', help='Memory per worker (e.g., 8GB)')
-    parser.add_argument('--slurm-walltime', default='01:00:00')
+    parser.add_argument('--slurm-cores-per-worker', type=int, default=4)
+    parser.add_argument('--slurm-mem', default='32GB', help='Memory per worker (e.g., 32GB)')
+    parser.add_argument('--slurm-walltime', default='02:30:00')
     parser.add_argument('--slurm-job-extra', nargs='*', default=[],
                         help='Extra SLURM directives, e.g. ["--exclusive"]')
     parser.add_argument('--slurm-interface', default=None,
@@ -344,12 +344,13 @@ def make_config(args, paths) -> Config:
         current_dm = 0.0
     collapse_channels = getattr(args, "collapse_channels", False)
     nsubbands = getattr(args, "nsubbands", 1)
+    nthreads = args.nthreads if args.nthreads > 0 else (args.slurm_cores_per_worker if getattr(args, "parallel_mode", "") == 'dask-slurm' else 0)
     return Config(
         msname=args.msname,
         npix_x=args.npix_x, npix_y=args.npix_y,
         pix_rad=pix_rad, ra0_rad=ra0_rad, dec0_rad=dec0_rad,
         epsilon=args.epsilon, do_wgridding=args.do_wgridding,
-        nthreads=args.nthreads, verbosity=args.verbosity,
+        nthreads=nthreads, verbosity=args.verbosity,
         corr_mode=args.corr_mode, basis=args.basis, single_pol=args.single_pol,
         data_column=args.data_column,
         enable_var=args.enable_var, enable_boxcar=args.enable_boxcar,
@@ -460,6 +461,7 @@ def run_pipeline(args):
         dm_trials = [0.0]
 
     cfg.dm_trials = dm_trials
+    cfg.is_dm_search = (args.dm_max > args.dm_min) or (args.dm_list is not None and len(args.dm_list) > 1) or (len(dm_trials) > 1)
 
     # MAKE CHUNKS HAVE OVERLAP TO ACCOUNT FOR DISPERSIVE DELAYS
     # for DM = 1000 and 0.6-1GHz band, DM delay is ~7 s.
@@ -591,7 +593,7 @@ def run_pipeline(args):
             "module load python-scientific/3.11.5-foss-2023b 2>/dev/null || true",
             "unset PYTHONPATH",
             f"source {os.path.dirname(sys.executable)}/activate 2>/dev/null || true",
-            "export OMP_NUM_THREADS=1",
+            f"export OMP_NUM_THREADS={args.slurm_cores_per_worker}",
             "export OPENBLAS_NUM_THREADS=1"
         ]
 
@@ -611,14 +613,16 @@ def run_pipeline(args):
             worker_extra_args=["--nthreads", "1", "--memory-limit", "0"],
         )
         log_memory("After creating SLURMCluster")
-        # scale to number of workers (or adapt if dask_workers==0)
+        # scale to number of workers: scale to match expected number of time chunks if 0 or not specified
         if args.dask_workers and args.dask_workers > 0:
             cluster.scale(args.dask_workers)
+            print(f"[Dask-SLURM] Scaled cluster to {args.dask_workers} worker(s).", flush=True)
             log_memory(f"After cluster.scale({args.dask_workers})")
         else:
-            # adaptively allocate between 1 and len(chunk_bounds) workers
-            cluster.adapt(minimum=1, maximum=max(1, len(chunk_bounds)))
-            log_memory("After cluster.adapt")
+            n_workers = max(1, len(chunk_bounds))
+            cluster.scale(n_workers)
+            print(f"[Dask-SLURM] Scaled cluster to {n_workers} worker(s) (matching {len(chunk_bounds)} time chunks).", flush=True)
+            log_memory(f"After cluster.scale({n_workers})")
 
         # Connect the client and run
         log_memory("Before Client(cluster) context creation")

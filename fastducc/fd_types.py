@@ -52,6 +52,7 @@ class Config:
     nsubbands: int = 1
     exact_uvw: bool = True
     scan_id: Optional[str] = None
+    is_dm_search: bool = False
 
 @dataclass
 class WelfordState:
