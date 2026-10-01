@@ -638,6 +638,86 @@ def save_periodicity_candidates_table(table: Table, csv_path: str, vot_path: str
 
     
 
+def compute_candidate_local_rms(
+    cube: np.ndarray,
+    candidate: Dict[str, Any],
+    *,
+    window_size: int = 64,
+    inner_radius: float = 3.0,
+    clip_sigma: float = 3.0,
+    valid_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Compute per-time-slice local off-source RMS noise around a candidate.
+
+    Extracts a local spatial subcube (window_size x window_size) centered at (y, x),
+    masks out the candidate core within inner_radius to ensure the estimate is off-source,
+    and calculates iterative sigma-clipped RMS per time slice using kernels._clipped_rms_2d_per_time.
+
+    Parameters
+    ----------
+    cube : (T, Ny, Nx) ndarray
+        Image cube.
+    candidate : dict
+        Candidate record containing 'y' and 'x' coordinates.
+    window_size : int, default 64
+        Local window box width/height in pixels.
+    inner_radius : float, default 3.0
+        Inner radius in pixels around (y, x) to exclude (off-source masking).
+    clip_sigma : float, default 3.0
+        Clipping threshold multiplier.
+    valid_mask : (Ny, Nx) ndarray, optional
+        Optional boolean mask of valid pixels.
+
+    Returns
+    -------
+    rms : (T,) ndarray of float64
+        Per-time-slice local off-source RMS estimates.
+    """
+    T, Ny, Nx = cube.shape
+    y = int(candidate["y"])
+    x = int(candidate["x"])
+
+    hw = max(4, int(window_size)) // 2
+    y0 = max(0, y - hw)
+    y1 = min(Ny, y + hw)
+    x0 = max(0, x - hw)
+    x1 = min(Nx, x + hw)
+    H = y1 - y0
+    W = x1 - x0
+
+    subcube = np.ascontiguousarray(cube[:, y0:y1, x0:x1], dtype=np.float64)
+
+    cy = y - y0
+    cx = x - x0
+    loc_mask = np.ones((H, W), dtype=bool)
+    if valid_mask is not None:
+        loc_mask &= valid_mask[y0:y1, x0:x1]
+
+    if inner_radius > 0:
+        yy, xx = np.ogrid[:H, :W]
+        dist_sq = (yy - cy) ** 2 + (xx - cx) ** 2
+        off_source = dist_sq > (inner_radius ** 2)
+        if np.count_nonzero(loc_mask & off_source) >= 8:
+            loc_mask &= off_source
+        elif np.count_nonzero(loc_mask) > 1:
+            loc_mask[cy, cx] = False
+
+    if np.count_nonzero(loc_mask) == 0:
+        loc_mask = np.ones((H, W), dtype=bool)
+
+    rms = kernels._clipped_rms_2d_per_time(subcube, loc_mask, float(clip_sigma))
+    bad = (~np.isfinite(rms)) | (rms <= 0.0)
+    if np.any(bad):
+        good_vals = rms[~bad]
+        default_rms = float(np.median(good_vals)) if good_vals.size > 0 else 1.0
+        if not np.isfinite(default_rms) or default_rms <= 0.0:
+            default_rms = 1.0
+        rms[bad] = default_rms
+
+    return rms
+
+
 def save_candidate_lightcurves(
     times: np.ndarray,
     cube: np.ndarray,
@@ -646,9 +726,12 @@ def save_candidate_lightcurves(
     *,
     save_format: str = "npz",        # "npz" or "ascii"
     center_policy: str = "right",    # "right" uses w//2; "left" uses (w-1)//2
+    local_window_size: int = 64,
+    rms_full: Optional[np.ndarray] = None,
 ) -> Dict[str, str]:
     """
-    Extract and save full-resolution and boxcar-smoothed light curves for a candidate.
+    Extract and save full-resolution and boxcar-smoothed light curves for a candidate,
+    including per-frame local off-source RMS errorbars.
     Returns dict of file paths.
     """
     
@@ -684,13 +767,23 @@ def save_candidate_lightcurves(
     # --- Full-res light curve at the candidate pixel ---
     lc_full = cube[:, y, x].astype(np.float64, copy=False)
 
-    # --- Boxcar-smoothed light curve ---
+    # --- Per-frame local off-source RMS noise ---
+    if rms_full is None:
+        rms_full = compute_candidate_local_rms(cube, candidate, window_size=local_window_size)
+    else:
+        rms_full = np.asarray(rms_full, dtype=np.float64)
+
+    # --- Boxcar-smoothed light curve & error propagation ---
     lc_sm, T_eff = kernels._compute_boxcar_1d(lc_full, w)
     if T_eff > 0:
         times_sm = times[offset:offset + T_eff]
         k_center = max(0, min(t0_idx, T_eff - 1))  # smoothed index of detection window start
+        csum_var = np.zeros(T + 1, dtype=np.float64)
+        csum_var[1:] = np.cumsum(rms_full ** 2)
+        rms_sm = np.sqrt(np.maximum(0.0, csum_var[w:] - csum_var[:-w])) / float(w)
     else:
         times_sm = np.empty((0,), dtype=times.dtype)
+        rms_sm = np.empty((0,), dtype=np.float64)
         k_center = 0
 
     # --- Save light curves ---
@@ -698,18 +791,18 @@ def save_candidate_lightcurves(
     out_box  = f"{out_prefix}_lc_boxcar_w{w}.{ 'npz' if save_format=='npz' else 'txt' }"
 
     if save_format == "npz":
-        np.savez(out_full, time=times, flux=lc_full)
-        np.savez(out_box, time=times_sm, flux=lc_sm, width=w)
+        np.savez(out_full, time=times, flux=lc_full, flux_err=rms_full, error=rms_full)
+        np.savez(out_box, time=times_sm, flux=lc_sm, flux_err=rms_sm, error=rms_sm, width=w)
     else:
-        # ASCII: two columns "time flux" with header
+        # ASCII: three columns "time flux flux_err" with header
         with open(out_full, "w") as f:
-            f.write("# time  flux(full_res)\n")
-            for t, v in zip(times, lc_full):
-                f.write(f"{t:.9f} {v:.9e}\n")
+            f.write("# time  flux(full_res)  flux_err\n")
+            for t, v, e in zip(times, lc_full, rms_full):
+                f.write(f"{t:.9f} {v:.9e} {e:.9e}\n")
         with open(out_box, "w") as f:
-            f.write(f"# time  flux(boxcar_mean_w={w})\n")
-            for t, v in zip(times_sm, lc_sm):
-                f.write(f"{t:.9f} {v:.9e}\n")
+            f.write(f"# time  flux(boxcar_mean_w={w})  flux_err\n")
+            for t, v, e in zip(times_sm, lc_sm, rms_sm):
+                f.write(f"{t:.9f} {v:.9e} {e:.9e}\n")
 
     return out_full
 
@@ -737,6 +830,8 @@ def save_candidate_summary(
     method: str = "boxcar",
     # Variance-specific: EMA high-pass cutoff used during Welford accumulation
     var_highpass_cutoff_sec: float = 0.0,
+    local_window_size: int = 64,
+    rms_full: Optional[np.ndarray] = None,
 ) -> Dict[str, str]:
     """
     Build a prepfold-like *single* candidate page:
@@ -785,6 +880,12 @@ def save_candidate_summary(
     lc_full = cube[:, y, x].astype(np.float64, copy=False)
     lc_sm, T_eff = kernels._compute_boxcar_1d(lc_full, w)
     times_sm = times[offset:offset + T_eff] if T_eff > 0 else np.empty((0,), dtype=times.dtype)
+
+    # --- Per-frame local off-source RMS noise ---
+    if rms_full is None:
+        rms_full = compute_candidate_local_rms(cube, candidate, window_size=local_window_size)
+    else:
+        rms_full = np.asarray(rms_full, dtype=np.float64)
 
     imjd = int(times[0] / 86400.0)  # integer MJD of the first time sample
     mjd = times / 86400.0  # MJD times
@@ -1100,16 +1201,20 @@ def save_candidate_summary(
             alpha = 1.0 - np.exp(-dt / var_highpass_cutoff_sec)
             ema = ema * (1.0 - alpha) + lc_full[ii] * alpha
             lc_filtered[ii] = lc_full[ii] - ema
-        ax_lc.plot(rel_times_start, lc_full, color="lightsteelblue", lw=1.0, alpha=0.7, label="Raw")
+        ax_lc.errorbar(rel_times_start, lc_full, yerr=rms_full, fmt="none",
+                       ecolor="grey", elinewidth=0.8, capsize=0, alpha=0.6, zorder=1)
+        ax_lc.plot(rel_times_start, lc_full, color="lightsteelblue", lw=1.0, alpha=0.7, label="Raw", zorder=2)
         ax_lc.plot(rel_times_start, lc_filtered, color="tab:green", lw=1.4,
-                   label=f"EMA highpass (τ={var_highpass_cutoff_sec:.0f}s)")
+                   label=f"EMA highpass (τ={var_highpass_cutoff_sec:.0f}s)", zorder=3)
     else:
         # Boxcar: raw + smoothed
-        ax_lc.plot(rel_times_start, lc_full, color="tab:blue", lw=1.4, label="Raw")
+        ax_lc.errorbar(rel_times_start, lc_full, yerr=rms_full, fmt="none",
+                       ecolor="grey", elinewidth=0.8, capsize=0, alpha=0.6, zorder=1)
+        ax_lc.plot(rel_times_start, lc_full, color="tab:blue", lw=1.4, label="Raw", zorder=2)
         if T_eff > 0:
-            ax_lc.plot(rel_times_start_sm, lc_sm, color="tab:green", lw=1.6, label=f"Boxcar (w={w})")
+            ax_lc.plot(rel_times_start_sm, lc_sm, color="tab:green", lw=1.6, label=f"Boxcar (w={w})", zorder=3)
             k_center = max(0, min(t0_idx, T_eff - 1))
-            ax_lc.axvline(rel_times_start_sm[k_center], color="crimson", ls="--", lw=1.0)
+            ax_lc.axvline(rel_times_start_sm[k_center], color="crimson", ls="--", lw=1.0, zorder=4)
         else:
             ax_lc.text(0.02, 0.92, f"w={w} > T; smoothed LC N/A",
                        transform=ax_lc.transAxes, ha="left", va="top", color="crimson")
@@ -2020,7 +2125,22 @@ def generate_obs_variance_candidate_products(
             ax_lc = fig.add_subplot(gs[1, 0:2])
             val_at_pix = float(std_data[y, x])
             t_plot = np.linspace(0, 5400, 100)
-            ax_lc.plot(t_plot, np.full_like(t_plot, val_at_pix), color="tab:blue", lw=1.5, label="Obs-level Std (Integrated)")
+
+            # Local off-source RMS of std_map around candidate
+            hw = spatial_size // 2
+            y0, y1 = max(0, y - hw), min(std_data.shape[0], y + hw)
+            x0, x1 = max(0, x - hw), min(std_data.shape[1], x + hw)
+            loc_std = std_data[y0:y1, x0:x1]
+            cy, cx = y - y0, x - x0
+            mask_off = np.ones_like(loc_std, dtype=bool)
+            mask_off[cy, cx] = False
+            valid_loc = loc_std[mask_off & np.isfinite(loc_std)]
+            err_val = float(np.median(np.abs(valid_loc - np.median(valid_loc))) * 1.4826) if valid_loc.size > 0 else 0.0
+            err_arr = np.full_like(t_plot, err_val)
+
+            ax_lc.errorbar(t_plot, np.full_like(t_plot, val_at_pix), yerr=err_arr, fmt="none",
+                           ecolor="grey", elinewidth=0.8, capsize=0, alpha=0.6, zorder=1)
+            ax_lc.plot(t_plot, np.full_like(t_plot, val_at_pix), color="tab:blue", lw=1.5, label="Obs-level Std (Integrated)", zorder=2)
             ax_lc.set_xlabel("Time (s)")
             ax_lc.set_ylabel("Std (Jy/beam)")
             ax_lc.set_title(f"Variance Detection (time_center={t_center:.1f}, S/N={snr_val:.2f})")
@@ -2051,7 +2171,7 @@ def generate_obs_variance_candidate_products(
         if not os.path.exists(out_lc):
             time_arr = np.linspace(0, 5400, 100)
             flux_arr = np.full_like(time_arr, float(std_data[y, x]))
-            np.savez(out_lc, time=time_arr, flux=flux_arr)
+            np.savez(out_lc, time=time_arr, flux=flux_arr, flux_err=err_arr, error=err_arr)
             generated.append(out_lc)
 
     if generated:
