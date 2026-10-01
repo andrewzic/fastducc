@@ -1,9 +1,14 @@
 import argparse
+import logging
 import os
 import sys
+import time
 import numpy as np
 
-from dask.distributed import Client, LocalCluster
+logger = logging.getLogger(__name__)
+
+from dask.distributed import Client, LocalCluster, as_completed
+
 from dask_jobqueue import SLURMCluster
 
 from casacore.tables import table
@@ -175,6 +180,12 @@ def build_cli():
     parser.set_defaults(collapse_channels=False)
     parser.add_argument('--nsubbands', type=int, default=1,
                         help='Number of subbands to divide the bandwidth into before imaging (default: 1).')
+    parser.add_argument('--dm-list', type=float, nargs='+', default=None,
+                        help='Explicit list of trial DMs (pc cm^-3), e.g. --dm-list 0.0 100.0 160.0 186.4 210.0')
+    parser.add_argument('--scan-id', '--scan', dest='scan_id', default=None,
+                        help='Filter chunk processing to a specific scan ID (e.g. 20251015085704)')
+    parser.add_argument('--max-chunks', type=int, default=0,
+                        help='Limit the number of chunks to process (0 = all)')
     parser.add_argument('--exact-uvw', dest='exact_uvw', action='store_true',
                         help='Calculate exact per-channel UVW coordinates accounting for dispersion delay (default: True).')
     parser.add_argument('--no-exact-uvw', dest='exact_uvw', action='store_false',
@@ -256,7 +267,7 @@ def build_cli_aggregate_obs(argv=None):
     p.add_argument("--no-organize", action="store_false", dest="organize",
                    help="Disable candidate output directory tree organization")
     p.add_argument("--link-mode", choices=["symlink", "copy"], default="symlink",
-                   help="How to place artefact files into candidate directories: relative symlink or copy (default: symlink)")
+                   help="How to place artefact files into candidate directories: absolute symlink or copy (default: symlink)")
     p.add_argument("--organize-structure", choices=["categorized", "flat"], default="categorized",
                    help="Directory tree structure for candidate subfolders (default: categorized)")
     return p.parse_args(argv)
@@ -328,6 +339,7 @@ def build_cli_periodicity(argv=None):
 def make_config(args, paths) -> Config:
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = paths
     ra0_rad, dec0_rad, _ = ms_utils.get_phase_center(args.msname, field_name=None)
+    pix_rad = args.pixsize_arcsec / 206265.0
     current_dm = getattr(args, "dm", 0.0)
     if current_dm is None:
         current_dm = 0.0
@@ -366,6 +378,7 @@ def make_config(args, paths) -> Config:
         collapse_channels=collapse_channels,
         nsubbands=nsubbands,
         exact_uvw=getattr(args, "exact_uvw", True),
+        scan_id=getattr(args, "scan_id", None),
     )
 
 def main_serial(args):
@@ -427,10 +440,13 @@ def run_pipeline(args):
     print(f"Found time resolution {dt}s")
 
     # Determine DM trial grid
-    if args.dm is not None:
+    if args.dm_list is not None and len(args.dm_list) > 0:
+        dm_trials = [float(d) for d in args.dm_list]
+        print(f"Explicit DM Trial List: {len(dm_trials)} trial DMs: {dm_trials}")
+    elif args.dm is not None:
         dm_trials = [float(args.dm)]
     elif args.dm_max > args.dm_min:
-        _, channel_freqs, _ = ms_utils.get_spw_info(cfg.msname)
+        _, channel_freqs, _ = ms_utils.get_channel_lambdas(cfg.msname)
         plan = dedisp.DedispersionPlan(
             freqs_hz=channel_freqs,
             tsamp_s=dt,
@@ -453,7 +469,7 @@ def run_pipeline(args):
     buffer_overlap_samps = int(buffer_overlap / dt)
     max_dm = max(dm_trials)
     if max_dm > 0.0:
-        _, channel_freqs, _ = ms_utils.get_spw_info(cfg.msname)
+        _, channel_freqs, _ = ms_utils.get_channel_lambdas(cfg.msname)
         max_delay_samps = dedisp.get_dm_samps(channel_freqs, max_dm, dt)
         if max_delay_samps + 1 > buffer_overlap_samps:
             buffer_overlap_samps = max_delay_samps + 1
@@ -482,6 +498,24 @@ def run_pipeline(args):
             scan_per_time_idx=scan_per_time_idx,
         ))
 
+    # Filter by scan_id or max_chunks if requested
+    if args.scan_id:
+        filtered = [
+            (b, s) for b, s in zip(chunk_bounds, chunk_scan_ids)
+            if str(args.scan_id) in str(s)
+        ]
+        if len(filtered) == 0:
+            print(f"WARNING: No chunks matched scan_id '{args.scan_id}'. Available scans: {set(chunk_scan_ids)}")
+        else:
+            chunk_bounds = [b for b, s in filtered]
+            chunk_scan_ids = [s for b, s in filtered]
+            print(f"Filtered to {len(chunk_bounds)} chunks matching scan '{args.scan_id}'.")
+
+    if args.max_chunks > 0 and len(chunk_bounds) > args.max_chunks:
+        chunk_bounds = chunk_bounds[:args.max_chunks]
+        chunk_scan_ids = chunk_scan_ids[:args.max_chunks]
+        print(f"Limited to first {len(chunk_bounds)} chunks.")
+
     def _process_dm_chunks(trial_dm: float, client=None):
         cfg.current_dm = trial_dm
         print(f"\n{'='*70}\n[DM Trial] Processing DM = {trial_dm:.2f} pc cm^-3\n{'='*70}")
@@ -502,7 +536,20 @@ def run_pipeline(args):
             # Dask parallel workers execution
             futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
                        for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
-            return client.gather(futures)
+            total = len(futures)
+            print(f"[Dask] Submitted {total} chunk tasks for DM={trial_dm:.2f}. Monitoring progress...")
+            completed = 0
+            t_start = time.time()
+            fut_to_idx = {f: i for i, f in enumerate(futures)}
+            results = [None] * total
+            for f in as_completed(futures):
+                idx = fut_to_idx[f]
+                results[idx] = f.result()
+                completed += 1
+                elapsed = time.time() - t_start
+                (s, e), sid = chunk_bounds[idx], chunk_scan_ids[idx]
+                print(f"[Dask Progress] [{completed}/{total}] Chunk {s}..{e} (scan {sid}) finished ({elapsed:.1f}s elapsed)")
+            return results
 
     if args.parallel_mode == 'serial':
         for trial_dm in dm_trials:
@@ -578,6 +625,13 @@ def run_pipeline(args):
         log_memory("Before Client(cluster) context creation")
         with Client(cluster) as client:
             log_memory("After Client(cluster) context creation")
+            n_init = len(client.scheduler_info()["workers"])
+            print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready. Waiting for workers...")
+            try:
+                client.wait_for_workers(1, timeout=120)
+            except Exception as e:
+                logger.warning(f"Timeout waiting for workers: {e}")
+            print(f"[Dask-SLURM] {len(client.scheduler_info()['workers'])} worker(s) online. Proceeding with DM trials.")
             for trial_dm in dm_trials:
                 agg_list = _process_dm_chunks(trial_dm, client=client)
                 log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
@@ -588,23 +642,21 @@ def run_pipeline(args):
         # Graceful stop after the client context exits
         try:
             cluster.scale(0)  # retire workers first
-        finally:
+        except BaseException as e:
+            logger.warning(f"Error scaling cluster down: {e}")
+        try:
             cluster.close()
+        except BaseException as e:
+            logger.warning(f"Error closing cluster: {e}")
         log_memory("After SLURMCluster closed")
 
     else:
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
 
     # Consolidate per-chunk catalogues into candidates/
-    var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
-    box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
-    candidates.consolidate_chunk_catalogues(
-        ms_base=cfg.ms_base,
-        out_dir=cfg.candidates_dir,
-        var_csv_pattern=var_pattern,
-        box_csv_pattern=box_pattern,
-        remove_chunk_catalogues=True
-    )
+    for trial_dm in dm_trials:
+        cfg.current_dm = trial_dm
+        fd_core.consolidate_catalogues(cfg)
     log_memory("After consolidate_chunk_catalogues (Finished)")
 
 

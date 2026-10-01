@@ -1,4 +1,5 @@
 [console_scripts]
 ducc-continuum-img = fastducc.ducc_continuum_img:main
 fastducc = fastducc.cli:main
+fastducc-periodicity = fastducc.nufft_periodicity:run_periodicity
 fastducc-run = fastducc.fastducc_run:main

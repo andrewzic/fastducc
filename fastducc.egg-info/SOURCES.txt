@@ -6,6 +6,7 @@ fastducc/catalogues.py
 fastducc/cli.py
 fastducc/constants.py
 fastducc/core.py
+fastducc/dedisp.py
 fastducc/detection.py
 fastducc/ducc_continuum_img.py
 fastducc/fastducc_run.py
