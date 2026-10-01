@@ -51,6 +51,7 @@ class Config:
     collapse_channels: bool = False
     nsubbands: int = 1
     exact_uvw: bool = True
+    scan_id: Optional[str] = None
 
 @dataclass
 class WelfordState:
