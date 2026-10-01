@@ -328,6 +328,7 @@ def build_cli_periodicity(argv=None):
 def make_config(args, paths) -> Config:
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = paths
     ra0_rad, dec0_rad, _ = ms_utils.get_phase_center(args.msname, field_name=None)
+    pix_rad = np.deg2rad(args.pixsize_arcsec / 3600.0)
     current_dm = getattr(args, "dm", 0.0)
     if current_dm is None:
         current_dm = 0.0
@@ -482,21 +483,20 @@ def run_pipeline(args):
             scan_per_time_idx=scan_per_time_idx,
         ))
 
-    def _process_dm_chunks(trial_dm: float, client=None):
-        cfg.current_dm = trial_dm
-        print(f"\n{'='*70}\n[DM Trial] Processing DM = {trial_dm:.2f} pc cm^-3\n{'='*70}")
+    def _process_chunks(client=None):
+        print(f"\n{'='*70}\nProcessing {len(chunk_bounds)} chunk(s) across {len(dm_trials)} DM trial(s) ({dm_trials[0]:.2f}..{dm_trials[-1]:.2f} pc cm^-3)\n{'='*70}")
         if client is None:
             # Serial execution
             agg_list = []
             for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
-                print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) | DM = {trial_dm:.2f}")
+                print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...")
                 chunk_times = unique_times[start:end+1]
                 res = fd_core.process_chunk_task(
                     cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
                 )
-                times, cube, c, m, M2 = res[0], res[1], res[2], res[3], res[4]
-                sid = res[5] if len(res) > 5 else scan_id_str
-                agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, c, m, M2, sid))
+                times, cube, welford_data = res[0], res[1], res[2]
+                sid = res[3] if len(res) > 3 else scan_id_str
+                agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, welford_data, sid))
             return agg_list
         else:
             # Dask parallel workers execution
@@ -505,11 +505,12 @@ def run_pipeline(args):
             return client.gather(futures)
 
     if args.parallel_mode == 'serial':
-        for trial_dm in dm_trials:
-            agg_list = _process_dm_chunks(trial_dm)
-            log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
-            _ = fd_core.finalise_welford_parallel(cfg, agg_list)
-            log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
+        agg_list = _process_chunks()
+        if cfg.enable_var:
+            for trial_dm in dm_trials:
+                log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
+                _ = fd_core.finalise_welford_parallel(cfg, agg_list, dm=trial_dm)
+                log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
 
     elif args.parallel_mode == 'dask-local':
         n_workers = args.dask_workers if args.dask_workers > 0 else None
@@ -519,11 +520,12 @@ def run_pipeline(args):
             processes=(args.dask_scheduler == 'processes')
         )
         with Client(cluster) as client:
-            for trial_dm in dm_trials:
-                agg_list = _process_dm_chunks(trial_dm, client=client)
-                log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
-                _ = fd_core.finalise_welford_parallel(cfg, agg_list)
-                log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
+            agg_list = _process_chunks(client=client)
+            if cfg.enable_var:
+                for trial_dm in dm_trials:
+                    log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
+                    _ = fd_core.finalise_welford_parallel(cfg, agg_list, dm=trial_dm)
+                    log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
         cluster.close()
 
     elif args.parallel_mode == 'dask-slurm':
@@ -578,11 +580,12 @@ def run_pipeline(args):
         log_memory("Before Client(cluster) context creation")
         with Client(cluster) as client:
             log_memory("After Client(cluster) context creation")
-            for trial_dm in dm_trials:
-                agg_list = _process_dm_chunks(trial_dm, client=client)
-                log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
-                _ = fd_core.finalise_welford_parallel(cfg, agg_list)
-                log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
+            agg_list = _process_chunks(client=client)
+            if cfg.enable_var:
+                for trial_dm in dm_trials:
+                    log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
+                    _ = fd_core.finalise_welford_parallel(cfg, agg_list, dm=trial_dm)
+                    log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
 
         log_memory("After Client closed")
         # Graceful stop after the client context exits
@@ -596,7 +599,7 @@ def run_pipeline(args):
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")
 
     # Consolidate per-chunk catalogues into candidates/
-    var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_var_candidates.csv")
+    var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_var_candidates.csv")
     box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
     candidates.consolidate_chunk_catalogues(
         ms_base=cfg.ms_base,
