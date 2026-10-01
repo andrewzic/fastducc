@@ -663,7 +663,6 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
             vis_3d=vis_3d,
             wgt_3d=wgt_3d,
             uvw_3d=uvw_3d,
-            u_times=times,
             chan_freq=chan_freq,
             dt=dt,
             npix_x=cfg.npix_x,

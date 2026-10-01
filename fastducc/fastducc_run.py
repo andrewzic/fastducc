@@ -631,7 +631,7 @@ def run_pipeline(args):
             n_init = len(client.scheduler_info()["workers"])
             print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready. Waiting for workers...")
             try:
-                client.wait_for_workers(1, timeout=120)
+                client.wait_for_workers(1, timeout=300)
             except Exception as e:
                 logger.warning(f"Timeout waiting for workers: {e}")
             print(f"[Dask-SLURM] {len(client.scheduler_info()['workers'])} worker(s) online. Proceeding with DM trials.")
