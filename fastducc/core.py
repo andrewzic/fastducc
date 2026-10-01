@@ -95,10 +95,15 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
         srcname = cand["srcname"]
         # Lightcurves figure (top panels use std-map images)
         if cfg.save_var_lightcurves:
+            rms_full = candidates.compute_candidate_local_rms(
+                cube, cand, window_size=getattr(cfg, "local_window_size", 64),
+                clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+            )
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{var_root}_cand_{srcname}_lc",
                 save_format="npz",
+                rms_full=rms_full,
             )
             _ = candidates.save_candidate_summary(
                 times=times, cube=cube, candidate=cand,
@@ -115,6 +120,7 @@ def process_variance_cube_chunk(cfg: Config, times, cube, wf: WelfordState, star
                 continuum_dir=getattr(cfg, "continuum_dir", None),
                 method="variance",
                 var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
+                rms_full=rms_full,
             )
 
         # Snippet products from std-map (time length = 1)
@@ -186,10 +192,15 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
         w = max(1, int(cand.get("width_samples", 1)))
         # Lightcurves figure
         if cfg.save_box_lightcurves:
+            rms_full = candidates.compute_candidate_local_rms(
+                cube, cand, window_size=getattr(cfg, "local_window_size", 64),
+                clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+            )
             _ = candidates.save_candidate_lightcurves(
                 times=times, cube=cube, candidate=cand,
                 out_prefix=f"{box_root}_cand_{srcname}_w{w}_lc",
                 save_format="npz",
+                rms_full=rms_full,
             )
             _ = candidates.save_candidate_summary(
                 times=times, cube=cube, candidate=cand,
@@ -203,6 +214,7 @@ def process_boxcar_chunk(cfg: Config, times, cube, start_idx: int):
                 std_map=None, use_std_images=False,
                 continuum_dir=getattr(cfg, "continuum_dir", None),
                 method="boxcar",
+                rms_full=rms_full,
             )
 
         # Extract smoothed snippet
@@ -531,10 +543,15 @@ def finalise_welford_parallel(
             for i, cand in enumerate(annotated_var):
                 srcname = cand["srcname"]
                 if cfg.save_full_var_lightcurves and all_cube is not None:
+                    rms_full = candidates.compute_candidate_local_rms(
+                        all_cube, cand, window_size=getattr(cfg, "local_window_size", 64),
+                        clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+                    )
                     _ = candidates.save_candidate_lightcurves(
                         times=all_times, cube=all_cube, candidate=cand,
                         out_prefix=f"{var_root}_cand_{srcname}_lc",
                         save_format="npz",
+                        rms_full=rms_full,
                     )
                     candidates.save_candidate_summary(
                         all_times, all_cube, cand,
@@ -548,6 +565,7 @@ def finalise_welford_parallel(
                         continuum_dir=getattr(cfg, "continuum_dir", None),
                         method="variance",
                         var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
+                        rms_full=rms_full,
                     )
                 if cfg.save_var_snippets:
                     std_snip = candidates.make_stdmap_snippet(std_map_full, cand, spatial_size=50)
@@ -747,10 +765,15 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     srcname = cand["srcname"]
                     if cfg.save_var_lightcurves:
                         if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
+                            rms_full = candidates.compute_candidate_local_rms(
+                                cube, cand, window_size=getattr(cfg, "local_window_size", 64),
+                                clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+                            )
                             candidates.save_candidate_lightcurves(
                                 times, cube, cand,
                                 out_prefix=f"{var_root}_cand_{srcname}_lc",
                                 save_format="npz",
+                                rms_full=rms_full,
                             )
                             _ = candidates.save_candidate_summary(
                                 times=times, cube=cube, candidate=cand,
@@ -765,6 +788,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                                 continuum_dir=getattr(cfg, "continuum_dir", None),
                                 method="variance",
                                 var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
+                                rms_full=rms_full,
                             )
                         else:
                             print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
@@ -849,10 +873,15 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 w = max(1, int(cand.get("width_samples", 1)))
                 if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
                     if cfg.save_box_lightcurves:
+                        rms_full = candidates.compute_candidate_local_rms(
+                            cube, cand, window_size=getattr(cfg, "local_window_size", 64),
+                            clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+                        )
                         candidates.save_candidate_lightcurves(
                             times, cube, cand,
                             out_prefix=f"{box_root}_cand_{srcname}_w{w}_lc",
                             save_format="npz",
+                            rms_full=rms_full,
                         )
                         _ = candidates.save_candidate_summary(
                             times=times, cube=cube, candidate=cand,
@@ -866,6 +895,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                             std_map=None, use_std_images=False,
                             continuum_dir=getattr(cfg, "continuum_dir", None),
                             method="boxcar",
+                            rms_full=rms_full,
                         )
                     if cfg.save_box_snippets:
                         snippets = candidates.extract_candidate_snippets(
