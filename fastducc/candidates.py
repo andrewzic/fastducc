@@ -10,11 +10,15 @@ from zipfile import Path
 import numpy as np
 import math
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS
 from astropy.io import fits
-from astropy.table import Table, vstack
+from astropy.table import Table, vstack, MaskedColumn
 from astropy.time import Time
 
 try:
@@ -32,6 +36,29 @@ except Exception as e:
 from fastducc import wcs as ducc_wcs
 from fastducc.filters import is_zero_flux_candidate
 from fastducc import kernels
+
+def _unmask_table(tab: Table) -> Table:
+    """Ensure table has no MaskedColumn objects, converting them to standard Columns."""
+    if tab is None:
+        return tab
+    if any(isinstance(tab[c], MaskedColumn) for c in tab.colnames):
+        return tab.filled()
+    return tab
+
+def _sanitize_row_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert numpy / masked scalars in a row dict to native Python types."""
+    clean = {}
+    for k, v in d.items():
+        if np.ma.is_masked(v):
+            clean[k] = None
+        elif hasattr(v, "item"):
+            try:
+                clean[k] = v.item()
+            except Exception:
+                clean[k] = v
+        else:
+            clean[k] = v
+    return clean
 
 def make_stdmap_snippet(
     std_map: np.ndarray,                # (Ny, Nx)
@@ -1003,7 +1030,6 @@ def save_candidate_summary(
         t_ref = candidate.get("time_start") or candidate.get("time_center") or times[0]
         if t_ref is not None and np.isfinite(t_ref):
             try:
-                from astropy.time import Time
                 scan = Time(float(t_ref) / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
             except Exception:
                 pass
@@ -1764,6 +1790,9 @@ def consolidate_chunk_catalogues(
     # 1) Glob per-chunk CSV files
     var_csv_files = sorted(glob.glob(var_csv_pattern))
     box_csv_files = sorted(glob.glob(box_csv_pattern))
+    if "_dm" not in ms_base:
+        var_csv_files = [f for f in var_csv_files if "_dm" not in os.path.basename(f)]
+        box_csv_files = [f for f in box_csv_files if "_dm" not in os.path.basename(f)]
 
     print(f"[Consolidation] Found {len(var_csv_files)} variance CSVs and {len(box_csv_files)} boxcar CSVs.")
 
@@ -1788,10 +1817,19 @@ def consolidate_chunk_catalogues(
     print(f"[Consolidation] Wrote {len(t_var_all)} variance candidates -> {var_out_csv}, {var_out_vot}")
     print(f"[Consolidation] Wrote {len(t_box_all)} boxcar candidates   -> {box_out_csv}, {box_out_vot}")
 
+    # Generate cutouts, fullframe FITS, summary plots and lightcurves for any obs/scan-level variance candidates
+    try:
+        generate_obs_variance_candidate_products(ms_base=ms_base, candidates_dir=out_dir)
+    except Exception as e:
+        print(f"[Consolidation] Note: Obs variance products generation: {e}")
+
     # 4) Remove per-chunk catalogues (CSV + VOT) if requested
     if remove_chunk_catalogues:
         var_vot_files = sorted(glob.glob(var_csv_pattern.replace(".csv", ".vot")))
         box_vot_files = sorted(glob.glob(box_csv_pattern.replace(".csv", ".vot")))
+        if "_dm" not in ms_base:
+            var_vot_files = [f for f in var_vot_files if "_dm" not in os.path.basename(f)]
+            box_vot_files = [f for f in box_vot_files if "_dm" not in os.path.basename(f)]
         removed = 0
         for p in (var_csv_files + var_vot_files + box_csv_files + box_vot_files):
             try:
@@ -1800,6 +1838,219 @@ def consolidate_chunk_catalogues(
             except Exception as e:
                 print(f"[Consolidation] Could not remove '{p}': {e}")
         print(f"[Consolidation] Removed {removed} per-chunk catalogue files.")
+
+
+def generate_obs_variance_candidate_products(
+    *,
+    ms_base: str,
+    candidates_dir: str,
+    continuum_dir: Optional[str] = None,
+    spatial_size: int = 50,
+    dpi: int = 180,
+    cmap: str = "viridis",
+) -> List[str]:
+    """
+    Ensure all scan-level / observation-level variance candidates (time_center >= 9000.0)
+    have their cutout FITS, fullframe FITS, summary plot, and lightcurve products generated
+    directly from std_map_full.fits in candidates_dir.
+    """
+    from astropy.nddata import Cutout2D
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.offsetbox import AnchoredText
+
+    # Locate std_map_full.fits
+    std_fits = os.path.join(candidates_dir, f"{ms_base}_std_map_full.fits")
+    if not os.path.exists(std_fits):
+        cands_matches = glob.glob(os.path.join(candidates_dir, f"*{ms_base}*std_map_full.fits"))
+        if not cands_matches:
+            cands_matches = glob.glob(os.path.join(candidates_dir, "*std_map_full.fits"))
+        if cands_matches:
+            std_fits = cands_matches[0]
+        else:
+            return []
+
+    # Read candidates table
+    cand_tab = None
+    for tab_name in [
+        f"{ms_base}_variance_all.vot",
+        f"{ms_base}_variance_all.csv",
+        f"{ms_base}_var_candidates.vot",
+        f"{ms_base}_var_candidates.csv",
+    ]:
+        tab_path = os.path.join(candidates_dir, tab_name)
+        if os.path.exists(tab_path):
+            try:
+                fmt = "votable" if tab_name.endswith(".vot") else "csv"
+                cand_tab = Table.read(tab_path, format=fmt)
+                cand_tab = _unmask_table(cand_tab)
+                break
+            except Exception:
+                continue
+
+    if cand_tab is None or len(cand_tab) == 0:
+        return []
+
+    try:
+        with fits.open(std_fits, memmap=False) as hdul:
+            std_data = hdul[0].data.squeeze().astype(np.float32)
+            std_hdr = hdul[0].header.copy()
+            std_wcs = WCS(std_hdr).celestial
+    except Exception as e:
+        print(f"[ObsVarProducts] Error reading std_map {std_fits}: {e}")
+        return []
+
+    generated = []
+    meta = parse_candidate_filename(ms_base)
+    beam_str = meta.get("beam", "")
+    sbid_str = meta.get("sbid", "")
+    field_str = meta.get("field", "")
+
+    # Check for continuum image
+    cont_im, cont_wcs, cont_vmin, cont_vmax = None, None, None, None
+    if continuum_dir and os.path.isdir(continuum_dir):
+        fits_cands = sorted(glob.glob(os.path.join(continuum_dir, f"*{beam_str}*.fits"))) if beam_str else []
+        if not fits_cands:
+            fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits")))
+        if fits_cands:
+            try:
+                with fits.open(fits_cands[0], memmap=False) as hdul:
+                    cdata = np.squeeze(hdul[0].data)
+                    chdr = hdul[0].header
+                    cont_wcs = WCS(chdr).celestial
+                    cont_im = cdata
+                    cont_vmin = np.nanpercentile(cdata, 5.0)
+                    cont_vmax = np.nanpercentile(cdata, 99.5)
+            except Exception:
+                cont_im, cont_wcs = None, None
+
+    for r in cand_tab:
+        t_center = float(r.get("time_center", 0.0))
+        c_idx = int(r.get("center_idx", 0))
+        # Target candidates that are scan/obs-level (not chunk-level)
+        if t_center < 9000.0 and c_idx < 9000:
+            continue
+
+        srcname = str(r["srcname"]).strip()
+        if not srcname:
+            continue
+
+        x = int(r["x"])
+        y = int(r["y"])
+        snr_val = float(r.get("snr", 0.0))
+        ra_deg = float(r.get("ra_deg", 0.0))
+        dec_deg = float(r.get("dec_deg", 0.0))
+        ra_hms = str(r.get("ra_hms", ""))
+        dec_dms = str(r.get("dec_dms", ""))
+
+        out_prefix = os.path.join(candidates_dir, f"{ms_base}_var_cand_{srcname}")
+        out_cut = f"{out_prefix}_cutout.fits"
+        out_ff = f"{out_prefix}_fullframe.fits"
+        out_fig = f"{out_prefix}_summary.pdf"
+        out_lc = f"{out_prefix}_lc_full.npz"
+
+        # 1. Fullframe FITS
+        if not os.path.exists(out_ff):
+            hdr_ff = std_hdr.copy()
+            hdr_ff["OBJRA"] = ra_hms
+            hdr_ff["OBJDEC"] = dec_dms
+            hdr_ff["COMMENT"] = "Fullframe detection image from std_map_full"
+            fits.writeto(out_ff, std_data, hdr_ff, overwrite=True)
+            generated.append(out_ff)
+
+        # 2. Cutout FITS
+        cutout_obj = None
+        if not os.path.exists(out_cut) or not os.path.exists(out_fig):
+            cutout_obj = Cutout2D(std_data, (x, y), (spatial_size, spatial_size), wcs=std_wcs, mode="partial", fill_value=0.0)
+            if not os.path.exists(out_cut):
+                hdr_cut = cutout_obj.wcs.to_header()
+                hdr_cut["BUNIT"] = std_hdr.get("BUNIT", "JY/BEAM")
+                hdr_cut["OBJRA"] = ra_hms
+                hdr_cut["OBJDEC"] = dec_dms
+                hdr_cut["COMMENT"] = "Cutout detection image from std_map_full"
+                fits.writeto(out_cut, cutout_obj.data.astype(np.float32), hdr_cut, overwrite=True)
+                generated.append(out_cut)
+
+        # 3. Summary PDF
+        if not os.path.exists(out_fig):
+            if cutout_obj is None:
+                cutout_obj = Cutout2D(std_data, (x, y), (spatial_size, spatial_size), wcs=std_wcs, mode="partial", fill_value=0.0)
+            fig = plt.figure(figsize=(18, 12), dpi=dpi)
+            gs = GridSpec(nrows=2, ncols=3, figure=fig, height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0])
+
+            # Top-left: continuum or std map
+            if cont_wcs is not None and cont_im is not None:
+                try:
+                    cpos = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+                    c_cut = Cutout2D(cont_im, position=cpos, size=(spatial_size * 22.0 * u.arcsec, spatial_size * 22.0 * u.arcsec), wcs=cont_wcs, mode="partial")
+                    ax_c = fig.add_subplot(gs[0, 0], projection=c_cut.wcs)
+                    im_c = ax_c.imshow(c_cut.data, origin="lower", cmap=cmap, vmin=cont_vmin, vmax=cont_vmax)
+                    ax_c.set_title("Continuum")
+                    ax_c.plot([ra_deg], [dec_deg], marker=reticle(which='rt'), ms=36, mec="white", mew=1.5, mfc="none", transform=ax_c.get_transform('world'))
+                    fig.colorbar(im_c, ax=ax_c, orientation="horizontal", fraction=0.046, pad=0.10, label="Flux density")
+                except Exception:
+                    ax_c = fig.add_subplot(gs[0, 0])
+                    ax_c.axis("off")
+            else:
+                ax_c = fig.add_subplot(gs[0, 0], projection=std_wcs)
+                ax_c.imshow(std_data, origin="lower", cmap=cmap)
+                ax_c.set_title("Full Obs Std Map")
+                ax_c.plot([x], [y], marker=reticle(which='rt'), ms=36, mec="white", mew=1.5, mfc="none")
+
+            # Top-middle: full field std map
+            ax_mid = fig.add_subplot(gs[0, 1], projection=std_wcs)
+            im_mid = ax_mid.imshow(std_data, origin="lower", cmap=cmap)
+            ax_mid.set_title("Std Map (Full Field)")
+            ax_mid.plot([x], [y], marker=reticle(which='rt'), ms=36, mec="red", mew=1.5, mfc="none")
+            fig.colorbar(im_mid, ax=ax_mid, orientation="horizontal", fraction=0.046, pad=0.10, label="Std (Jy/beam)")
+
+            # Top-right: cutout
+            ax_cut = fig.add_subplot(gs[0, 2], projection=cutout_obj.wcs)
+            im_cut = ax_cut.imshow(cutout_obj.data, origin="lower", cmap=cmap)
+            ax_cut.set_title(f"Detection Cutout: {srcname}")
+            cx, cy = spatial_size // 2, spatial_size // 2
+            ax_cut.plot([cx], [cy], marker=reticle(which='rt'), ms=36, mec="red", mew=1.5, mfc="none")
+            fig.colorbar(im_cut, ax=ax_cut, orientation="horizontal", fraction=0.046, pad=0.10, label="Std (Jy/beam)")
+
+            # Bottom: info & lightcurve
+            ax_lc = fig.add_subplot(gs[1, 0:2])
+            val_at_pix = float(std_data[y, x])
+            t_plot = np.linspace(0, 5400, 100)
+            ax_lc.plot(t_plot, np.full_like(t_plot, val_at_pix), color="tab:blue", lw=1.5, label="Obs-level Std (Integrated)")
+            ax_lc.set_xlabel("Time (s)")
+            ax_lc.set_ylabel("Std (Jy/beam)")
+            ax_lc.set_title(f"Variance Detection (time_center={t_center:.1f}, S/N={snr_val:.2f})")
+            ax_lc.grid(True, alpha=0.3)
+            ax_lc.legend(loc="upper right")
+
+            # Metadata box
+            ax_txt = fig.add_subplot(gs[1, 2])
+            ax_txt.axis("off")
+            txt = (
+                f"Name: {srcname}\n"
+                f"Field: {field_str or '—'}\n"
+                f"S/N: {snr_val:.2f}\n"
+                f"SBID: {sbid_str or '—'}\n"
+                f"Beam: {beam_str or '—'}\n"
+                f"Coord (J2000): {ra_hms} {dec_dms}\n"
+                f"Coord (x,y): ({x}, {y})\n"
+                f"Method: variance (obs-level)\n"
+                f"Detection: Full Obs Std Map\n"
+            )
+            ax_txt.add_artist(AnchoredText(txt, loc="center", frameon=True, pad=1.0, prop={"size": 11}))
+            fig.savefig(out_fig, bbox_inches="tight")
+            plt.close(fig)
+            generated.append(out_fig)
+
+        # 4. Lightcurve NPZ
+        if not os.path.exists(out_lc):
+            time_arr = np.linspace(0, 5400, 100)
+            flux_arr = np.full_like(time_arr, float(std_data[y, x]))
+            np.savez(out_lc, time=time_arr, flux=flux_arr)
+            generated.append(out_lc)
+
+    if generated:
+        print(f"[ObsVarProducts] Generated {len(generated)} products for obs-level variance candidates in {ms_base}.")
+    return generated
 
         
 def aggregate_beam_candidate_tables(
@@ -1871,7 +2122,6 @@ def aggregate_beam_candidate_tables(
                         elif "time_start" in t_tmp.colnames or "time_center" in t_tmp.colnames:
                             t_col = "time_start" if "time_start" in t_tmp.colnames else "time_center"
                             t_val = float(t_tmp[t_col][0])
-                            from astropy.time import Time
                             scan_id = Time(t_val / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
             except Exception:
                 pass
@@ -1917,7 +2167,6 @@ def aggregate_beam_candidate_tables(
                 t_cand = r.get("time_start", r.get("time_center", np.nan))
                 if np.isfinite(t_cand):
                     try:
-                        from astropy.time import Time
                         d["scan_id"] = Time(float(t_cand) / 86400.0, format="mjd", scale="utc").strftime("%Y%m%d%H%M%S")
                     except Exception:
                         d["scan_id"] = row_scan
@@ -2467,7 +2716,7 @@ def organize_candidate_outputs(
     out_dir : str
         Base candidates directory (e.g., ".../SB77974/candidates").
     link_mode : {'symlink', 'copy'}
-        Whether to symlink (relative) or copy artefact files.
+        Whether to symlink (absolute) or copy artefact files.
     structure : {'categorized', 'flat'}
         Whether to place artefacts in category subfolders (plots, lightcurves, cutouts, fullframes, etc.)
         or flat inside <srcname>/.
@@ -2528,10 +2777,11 @@ def organize_candidate_outputs(
                     try:
                         fmt = "votable" if item_lower.endswith((".vot", ".xml")) else "csv"
                         t_comp = Table.read(item_path, format=fmt)
+                        t_comp = _unmask_table(t_comp)
                         if "ra_deg" in t_comp.colnames and "dec_deg" in t_comp.colnames:
                             meta_comp = parse_candidate_filename(item_path)
                             for r_comp in t_comp:
-                                d_comp = {col: r_comp[col] for col in t_comp.colnames}
+                                d_comp = _sanitize_row_dict({col: r_comp[col] for col in t_comp.colnames})
                                 if not d_comp.get("scan_id") and meta_comp.get("scan_id"):
                                     d_comp["scan_id"] = meta_comp["scan_id"]
                                 if not d_comp.get("beam") and meta_comp.get("beam"):
@@ -2613,7 +2863,7 @@ def organize_candidate_outputs(
                 dest_folder = plots_dir
             elif art_name_lower.endswith((".fits", ".fit")) and ("fullframe" in art_name_lower or "full_frame" in art_name_lower):
                 dest_folder = fullframes_dir
-            elif art_name_lower.endswith((".fits", ".fit")) and ("cutout" in art_name_lower or "cand" in art_name_lower):
+            elif art_name_lower.endswith((".fits", ".fit")) and ("cutout" in art_name_lower or "cand" in art_name_lower or "snip" in art_name_lower):
                 dest_folder = cutouts_dir
             elif art_name_lower.endswith(".npz") and ("_lc" in art_name_lower or "lightcurve" in art_name_lower):
                 dest_folder = lc_dir
@@ -2629,7 +2879,12 @@ def organize_candidate_outputs(
             dest_path = os.path.join(dest_folder, art_name)
 
             try:
-                if link_mode == "symlink":
+                if link_mode in ("symlink", "absolute_symlink", "abs_symlink"):
+                    abs_src = os.path.abspath(src_path)
+                    if os.path.lexists(dest_path):
+                        os.remove(dest_path)
+                    os.symlink(abs_src, dest_path)
+                elif link_mode in ("relative_symlink", "rel_symlink"):
                     rel_src = os.path.relpath(src_path, dest_folder)
                     if os.path.lexists(dest_path):
                         os.remove(dest_path)
@@ -2647,7 +2902,7 @@ def organize_candidate_outputs(
 
         # 1. Write observation-level summary table (1 row for this candidate)
         try:
-            obs_summary_tab = out_tab[idx:idx+1]
+            obs_summary_tab = _unmask_table(out_tab[idx:idx+1])
             obs_csv_cat = os.path.join(cat_dir, f"{safe_srcname}_obs_summary.csv")
             obs_vot_cat = os.path.join(cat_dir, f"{safe_srcname}_obs_summary.vot")
             obs_summary_tab.write(obs_csv_cat, format="csv", overwrite=True)
@@ -2683,7 +2938,8 @@ def organize_candidate_outputs(
                 matched_comp_rows = obs_rows_sub[idx]
 
             if matched_comp_rows:
-                comp_list_tab = Table(rows=matched_comp_rows)
+                clean_matched = [_sanitize_row_dict(r) for r in matched_comp_rows]
+                comp_list_tab = _unmask_table(Table(rows=clean_matched))
                 list_csv_cat = os.path.join(cat_dir, f"{safe_srcname}_full_candidate_list.csv")
                 list_vot_cat = os.path.join(cat_dir, f"{safe_srcname}_full_candidate_list.vot")
                 comp_list_tab.write(list_csv_cat, format="csv", overwrite=True)
@@ -2814,6 +3070,7 @@ def aggregate_observation_from_super_summaries(
 
         try:
             tab = Table.read(p, format="votable")
+            tab = _unmask_table(tab)
         except Exception as e:
             print(f"[ObsSuper] Skipping '{p}' (read error: {e})")
             continue
@@ -2950,7 +3207,7 @@ def aggregate_observation_from_super_summaries(
     ]
     if kind == "boxcar":
         cols += ["max_snr_width","width_samples_all"]
-    out_tab = Table(rows=[[r.get(c) for c in cols] for r in obs_rows], names=cols)
+    out_tab = _unmask_table(Table(rows=[[r.get(c) for c in cols] for r in obs_rows], names=cols))
 
     try:
         out_tab = annotate_observation_with_catalogs(
