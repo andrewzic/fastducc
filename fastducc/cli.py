@@ -60,14 +60,25 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
+    is_subcommand = False
     if len(argv) > 0 and argv[0] == "aggregate":
-        return _run_aggregate(argv[1:])
+        is_subcommand = True
+        ret = _run_aggregate(argv[1:])
     elif len(argv) > 0 and argv[0] == "aggregate_obs":
-        return _run_aggregate_obs(argv[1:])
+        is_subcommand = True
+        ret = _run_aggregate_obs(argv[1:])
     elif len(argv) > 0 and argv[0] == "periodicity":
-        return _run_periodicity(argv[1:])
+        ret = _run_periodicity(argv[1:])
+    else:
+        ret = _run_imaging_search(argv)
 
-    return _run_imaging_search(argv)
+    if is_subcommand:
+        import os
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(ret if isinstance(ret, int) else 0)
+
+    return ret
 
 
 if __name__ == "__main__":

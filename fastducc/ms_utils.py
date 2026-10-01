@@ -36,6 +36,8 @@ def get_channel_lambdas(ms):
     tf.close()
     return nchan, channel_freqs, channel_lambdas
 
+get_spw_info = get_channel_lambdas
+
 def get_unique_times(msname: str, time_col: str) -> tuple[np.ndarray, np.ndarray]:
     """
     Get sorted unique times and scan numbers efficiently using TaQL.
