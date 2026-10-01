@@ -559,6 +559,17 @@ def finalise_welford_parallel(
                         ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
                     )
 
+    # Ensure all obs-level variance candidates have cutouts, fullframes, plots, and lightcurves
+    try:
+        candidates.generate_obs_variance_candidate_products(
+            ms_base=cfg.ms_base,
+            candidates_dir=cfg.candidates_dir,
+            continuum_dir=getattr(cfg, "continuum_dir", None),
+            spatial_size=50
+        )
+    except Exception as e:
+        print(f"[FinaliseWelford] Note: Obs variance products generation: {e}")
+
     return std_map_full
 
 
@@ -573,15 +584,16 @@ def finalise_welford_serial(cfg: Config, wf_state: WelfordState, dm: float | Non
 
 def consolidate_catalogues(cfg: Config):
     dm_val = float(getattr(cfg, "current_dm", 0.0))
+    scan_tag = f"_scan_{cfg.scan_id}" if getattr(cfg, "scan_id", None) else ""
     if dm_val != 0.0:
         dm_tag = f"_dm{dm_val:06.2f}"
-        ms_base_tag = f"{cfg.ms_base}{dm_tag}"
-        var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{dm_tag}*_chunk_*_var_candidates.csv")
-        box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{dm_tag}*_chunk_*_boxcar_candidates.csv")
+        ms_base_tag = f"{cfg.ms_base}{scan_tag}{dm_tag}"
+        var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{scan_tag}*{dm_tag}*_var_candidates.csv")
+        box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{scan_tag}*{dm_tag}*_chunk_*_boxcar_candidates.csv")
     else:
-        ms_base_tag = cfg.ms_base
-        var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_var_candidates.csv")
-        box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*_chunk_*_boxcar_candidates.csv")
+        ms_base_tag = f"{cfg.ms_base}{scan_tag}"
+        var_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{scan_tag}*_var_candidates.csv")
+        box_pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{scan_tag}*_chunk_*_boxcar_candidates.csv")
     candidates.consolidate_chunk_catalogues(
         ms_base=ms_base_tag,
         out_dir=cfg.candidates_dir,
