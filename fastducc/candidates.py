@@ -707,13 +707,11 @@ def compute_candidate_local_rms(
         loc_mask = np.ones((H, W), dtype=bool)
 
     rms = kernels._clipped_rms_2d_per_time(subcube, loc_mask, float(clip_sigma))
-    bad = (~np.isfinite(rms)) | (rms <= 0.0)
+    cand_lc = cube[:, y, x]
+    zero_or_edge = (cand_lc == 0.0) | (~np.isfinite(cand_lc))
+    bad = (~np.isfinite(rms)) | (rms <= 0.0) | zero_or_edge
     if np.any(bad):
-        good_vals = rms[~bad]
-        default_rms = float(np.median(good_vals)) if good_vals.size > 0 else 1.0
-        if not np.isfinite(default_rms) or default_rms <= 0.0:
-            default_rms = 1.0
-        rms[bad] = default_rms
+        rms[bad] = 0.0
 
     return rms
 
@@ -771,7 +769,10 @@ def save_candidate_lightcurves(
     if rms_full is None:
         rms_full = compute_candidate_local_rms(cube, candidate, window_size=local_window_size)
     else:
-        rms_full = np.asarray(rms_full, dtype=np.float64)
+        rms_full = np.asarray(rms_full, dtype=np.float64).copy()
+    bad_rms = (~np.isfinite(rms_full)) | (rms_full <= 0.0) | (lc_full == 0.0) | (~np.isfinite(lc_full))
+    if np.any(bad_rms):
+        rms_full[bad_rms] = 0.0
 
     # --- Boxcar-smoothed light curve & error propagation ---
     lc_sm, T_eff = kernels._compute_boxcar_1d(lc_full, w)
@@ -885,7 +886,10 @@ def save_candidate_summary(
     if rms_full is None:
         rms_full = compute_candidate_local_rms(cube, candidate, window_size=local_window_size)
     else:
-        rms_full = np.asarray(rms_full, dtype=np.float64)
+        rms_full = np.asarray(rms_full, dtype=np.float64).copy()
+    bad_rms = (~np.isfinite(rms_full)) | (rms_full <= 0.0) | (lc_full == 0.0) | (~np.isfinite(lc_full))
+    if np.any(bad_rms):
+        rms_full[bad_rms] = 0.0
 
     imjd = int(times[0] / 86400.0)  # integer MJD of the first time sample
     mjd = times / 86400.0  # MJD times

@@ -518,12 +518,12 @@ def run_pipeline(args):
         print(f"Limited to first {len(chunk_bounds)} chunks.")
 
     def _process_chunks(client=None):
-        print(f"\n{'='*70}\nProcessing {len(chunk_bounds)} chunk(s) across {len(dm_trials)} DM trial(s) ({dm_trials[0]:.2f}..{dm_trials[-1]:.2f} pc cm^-3)\n{'='*70}")
+        print(f"\n{'='*70}\nProcessing {len(chunk_bounds)} chunk(s) across {len(dm_trials)} DM trial(s) ({dm_trials[0]:.2f}..{dm_trials[-1]:.2f} pc cm^-3)\n{'='*70}", flush=True)
         if client is None:
             # Serial execution
             agg_list = []
             for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
-                print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...")
+                print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...", flush=True)
                 chunk_times = unique_times[start:end+1]
                 res = fd_core.process_chunk_task(
                     cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
@@ -537,7 +537,7 @@ def run_pipeline(args):
             futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
                        for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
             total = len(futures)
-            print(f"[Dask] Submitted {total} chunk tasks across {len(dm_trials)} DM trials. Monitoring progress...")
+            print(f"[Dask] Submitted {total} chunk tasks across {len(dm_trials)} DM trials. Monitoring progress...", flush=True)
             completed = 0
             t_start = time.time()
             fut_to_idx = {f: i for i, f in enumerate(futures)}
@@ -548,7 +548,7 @@ def run_pipeline(args):
                 completed += 1
                 elapsed = time.time() - t_start
                 (s, e), sid = chunk_bounds[idx], chunk_scan_ids[idx]
-                print(f"[Dask Progress] [{completed}/{total}] Chunk {s}..{e} (scan {sid}) finished ({elapsed:.1f}s elapsed)")
+                print(f"[Dask Progress] [{completed}/{total}] Chunk {s}..{e} (scan {sid}) finished ({elapsed:.1f}s elapsed)", flush=True)
             return results
     if args.parallel_mode == 'serial':
         agg_list = _process_chunks()
@@ -629,12 +629,15 @@ def run_pipeline(args):
         with Client(cluster) as client:
             log_memory("After Client(cluster) context creation")
             n_init = len(client.scheduler_info()["workers"])
-            print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready. Waiting for workers...")
+            print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready. Waiting for workers...", flush=True)
             try:
-                client.wait_for_workers(1, timeout=300)
+                client.wait_for_workers(1, timeout=600)
             except Exception as e:
                 logger.warning(f"Timeout waiting for workers: {e}")
-            print(f"[Dask-SLURM] {len(client.scheduler_info()['workers'])} worker(s) online. Proceeding with DM trials.")
+            n_online = len(client.scheduler_info()["workers"])
+            if n_online == 0:
+                raise RuntimeError("No Dask workers connected within the timeout period. Aborting to avoid idle deadlock.")
+            print(f"[Dask-SLURM] {n_online} worker(s) online. Proceeding with DM trials.", flush=True)
             agg_list = _process_chunks(client=client)
             if cfg.enable_var:
                 for trial_dm in dm_trials:
