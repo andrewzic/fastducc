@@ -242,6 +242,7 @@ def image_time_samples(
     nsubbands: int = 1,
     align_to: str = "fmax",
     exact_uvw: bool = True,
+    min_valid_channels: int = 24,
 ):
     """
     Iterate over time samples of a Measurement Set and grid visibilities
@@ -259,13 +260,14 @@ def image_time_samples(
     collapse_channels : bool
         If True, frequency channels are averaged/collapsed before gridding into snapshot images.
     nsubbands : int
-        Number of subbands when collapsing (default 1 for full collapse).
-    align_to : str
-        Reference alignment frequency: 'fmax' or 'fmin'.
+        Number of subbands when collapsing frequency channels.
+    align_to : {'fmax', 'fmin'}
+        Reference frequency alignment for dispersion delays.
     exact_uvw : bool
-        If True and dm != 0, compute exact per-channel (u, v, w) coordinates in wavelengths
-        accounting for the dispersion delay per channel and grid via 1-channel pseudo-rows
-        at full C++ compiled speed (Option A).
+        If True, calculate exact per-channel UVW coordinates accounting for baseline migration.
+    min_valid_channels : int
+        Minimum number of non-zero-weight channels required across the band before gridding.
+        Timesteps with fewer valid channels are zeroed out (default: 24).
 
     Returns
     -------
@@ -421,6 +423,11 @@ def image_time_samples(
         for t_idx in range(nt):
             v_snap = vis_dedisp[:, :, t_idx]
             w_snap = wgt_dedisp[:, :, t_idx]
+
+            n_chans_valid = int(np.count_nonzero(np.any(w_snap > 0.0, axis=0)))
+            if n_chans_valid < min_valid_channels:
+                cube[t_idx, :, :] = 0.0
+                continue
 
             if use_exact:
                 # --------------------------------------------------------------------------
@@ -704,6 +711,7 @@ def grid_chunk_cube(
     center_y: float = 0.0,
     allow_nshift: bool = True,
     double_precision_accumulation: bool = False,
+    min_valid_channels: int = 24,
 ) -> np.ndarray:
     """
     Grid an in-memory visibility chunk into a dirty image time cube for a specified trial DM.
@@ -731,6 +739,11 @@ def grid_chunk_cube(
     for t_idx in range(nt):
         v_snap = vis_dedisp[:, :, t_idx]
         w_snap = wgt_dedisp[:, :, t_idx]
+
+        n_chans_valid = int(np.count_nonzero(np.any(w_snap > 0.0, axis=0)))
+        if n_chans_valid < min_valid_channels:
+            cube[t_idx, :, :] = 0.0
+            continue
 
         if use_exact:
             # --------------------------------------------------------------------------

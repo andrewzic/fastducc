@@ -53,6 +53,10 @@ class Config:
     exact_uvw: bool = True
     scan_id: Optional[str] = None
     is_dm_search: bool = False
+    min_valid_channels: int = 24
+    filter_ips_agn: bool = True
+    ips_snr_ratio_threshold: float = 0.8
+    ips_match_radius_arcsec: float = 30.0
 
 @dataclass
 class WelfordState:

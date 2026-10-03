@@ -420,7 +420,7 @@ def welford_update_cube(count, mean, M2, ema_mean, cube, alphas, do_highpass=Fal
             ema = ema_mean[y, x]
             for t in range(T):
                 val = np.float64(cube[t, y, x])
-                if ignore_nan and not np.isfinite(val):
+                if (ignore_nan and not np.isfinite(val)) or val == 0.0:
                     continue
                 
                 if do_highpass:

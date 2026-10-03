@@ -168,6 +168,8 @@ def annotate_candidates_with_sky_coords(
         det2.update({
             "l": l, "m": m,
             "ra_rad": ra, "dec_rad": dec,
+            "ra_deg": float(np.degrees(ra)),
+            "dec_deg": float(np.degrees(dec)),
             "ra_hms": ra_hms, "dec_dms": dec_dms,
             "srcname": srcname,
             "phase_center_field": used_field

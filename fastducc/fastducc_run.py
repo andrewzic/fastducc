@@ -190,6 +190,17 @@ def build_cli():
     parser.add_argument('--no-exact-uvw', dest='exact_uvw', action='store_false',
                         help='Use baseline UVW coordinates at the snapshot reference timestamp without channel migration.')
     parser.set_defaults(exact_uvw=True)
+    parser.add_argument('--min-valid-channels', type=int, default=24,
+                        help='Minimum number of non-zero-weight channels across band before imaging timestep (default: 24).')
+    parser.add_argument('--filter-ips-agn', dest='filter_ips_agn', action='store_true',
+                        help='Suppress DM>0 candidates at positions of known (RACS - PSRCAT) continuum sources if S/N <= threshold * DM0 S/N (default: True).')
+    parser.add_argument('--no-filter-ips-agn', dest='filter_ips_agn', action='store_false',
+                        help='Disable (RACS - PSRCAT) IPS AGN suppression at DM>0.')
+    parser.set_defaults(filter_ips_agn=True)
+    parser.add_argument('--ips-snr-ratio-threshold', type=float, default=0.8,
+                        help='S/N ratio threshold vs DM=0 for keeping candidates coincident with (RACS - PSRCAT) sources (default: 0.8).')
+    parser.add_argument('--ips-match-radius-arcsec', type=float, default=30.0,
+                        help='Spatial match radius in arcsec for crossmatching candidates with RACS/PSRCAT (default: 30.0).')
 
     # --- Parallel execution flags ---
     parser.add_argument(
@@ -209,6 +220,10 @@ def build_cli():
     parser.add_argument(
         '--dask-scheduler', choices=['processes', 'threads'], default='processes',
         help='Use multiprocessing or multithreading workers (default: processes)'
+    )
+    parser.add_argument(
+        '--dask-worker-timeout', type=int, default=0,
+        help='Timeout in seconds to wait for Dask workers before aborting (0 = wait indefinitely; default: 0)'
     )
     # --- SLURM-only cluster params ---
     parser.add_argument('--slurm-partition', default=None, help='SLURM partition/queue')
@@ -379,6 +394,10 @@ def make_config(args, paths) -> Config:
         nsubbands=nsubbands,
         exact_uvw=getattr(args, "exact_uvw", True),
         scan_id=getattr(args, "scan_id", None),
+        min_valid_channels=getattr(args, "min_valid_channels", 24),
+        filter_ips_agn=getattr(args, "filter_ips_agn", True),
+        ips_snr_ratio_threshold=getattr(args, "ips_snr_ratio_threshold", 0.8),
+        ips_match_radius_arcsec=getattr(args, "ips_match_radius_arcsec", 30.0),
     )
 
 def main_serial(args):
@@ -629,14 +648,31 @@ def run_pipeline(args):
         with Client(cluster) as client:
             log_memory("After Client(cluster) context creation")
             n_init = len(client.scheduler_info()["workers"])
-            print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready. Waiting for workers...", flush=True)
-            try:
-                client.wait_for_workers(1, timeout=600)
-            except Exception as e:
-                logger.warning(f"Timeout waiting for workers: {e}")
-            n_online = len(client.scheduler_info()["workers"])
+            print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready.", flush=True)
+            n_online = n_init
+            worker_timeout = getattr(args, "dask_worker_timeout", 0)
             if n_online == 0:
-                raise RuntimeError("No Dask workers connected within the timeout period. Aborting to avoid idle deadlock.")
+                timeout_desc = f"{worker_timeout}s" if worker_timeout > 0 else "indefinite"
+                print(f"[Dask-SLURM] Waiting for worker(s) to be scheduled by SLURM (timeout: {timeout_desc})...", flush=True)
+                t_wait_start = time.time()
+                while n_online == 0:
+                    wait_step = 60
+                    if worker_timeout > 0:
+                        remaining = worker_timeout - (time.time() - t_wait_start)
+                        if remaining <= 0:
+                            raise RuntimeError(
+                                f"No Dask workers connected within {worker_timeout}s timeout period. "
+                                f"Aborting to avoid idle deadlock."
+                            )
+                        wait_step = min(wait_step, remaining)
+                    try:
+                        client.wait_for_workers(1, timeout=wait_step)
+                    except Exception:
+                        pass
+                    n_online = len(client.scheduler_info()["workers"])
+                    if n_online == 0:
+                        elapsed = int(time.time() - t_wait_start)
+                        print(f"[Dask-SLURM] Still waiting for SLURM worker(s) to allocate and connect ({elapsed}s elapsed)...", flush=True)
             print(f"[Dask-SLURM] {n_online} worker(s) online. Proceeding with DM trials.", flush=True)
             agg_list = _process_chunks(client=client)
             if cfg.enable_var:

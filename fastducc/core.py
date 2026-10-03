@@ -11,7 +11,9 @@ except Exception as e:
 
 from fastducc import wcs as ducc_wcs
 from fastducc.fd_types import Config, WelfordState
-from fastducc import filters, kernels, candidates, detection, imaging
+from fastducc import filters, kernels, candidates, detection, imaging, catalogues
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 
 def init_welford(cfg: Config) -> WelfordState:
     Ny, Nx = cfg.npix_y, cfg.npix_x
@@ -651,6 +653,16 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
 
     scan_suffix = f"_scan_{scan_id_str}" if scan_id_str else ""
 
+    # Tracking candidates at DM=0 for (RACS - PSRCAT) IPS suppression
+    dm0_var_cands = []
+    dm0_box_cands = []
+    racs_coords = None
+    psrcat_coords = None
+    if getattr(cfg, "filter_ips_agn", True):
+        center_c = SkyCoord(cfg.ra0_rad, cfg.dec0_rad, unit="rad", frame="icrs")
+        psrcat_coords = catalogues.get_cached_psrcat_coords()
+        racs_coords = catalogues.get_cached_racs_coords(center_coord=center_c, cone_radius_deg=3.0)
+
     # Ensure DM 0.0 is processed first if present, so Welford state is accumulated early
     sorted_dm_trials = list(dm_trials)
     if 0.0 in sorted_dm_trials:
@@ -677,6 +689,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
             collapse_channels=getattr(cfg, "collapse_channels", False),
             nsubbands=getattr(cfg, "nsubbands", 1),
             exact_uvw=getattr(cfg, "exact_uvw", True),
+            min_valid_channels=getattr(cfg, "min_valid_channels", 24),
         )
 
         is_search = getattr(cfg, "is_dm_search", False) or (dm_val != 0.0)
@@ -747,6 +760,36 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         for cand in annotated_var:
                             cand["scan_id"] = scan_id_str
                             cand["dm"] = dm_val
+                            if "ra_deg" not in cand and "ra_rad" in cand:
+                                cand["ra_deg"] = float(np.degrees(cand["ra_rad"]))
+                            if "dec_deg" not in cand and "dec_rad" in cand:
+                                cand["dec_deg"] = float(np.degrees(cand["dec_rad"]))
+
+                        # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
+                        if dm_val == 0.0:
+                            dm0_var_cands = [dict(c) for c in annotated_var]
+                        elif getattr(cfg, "filter_ips_agn", True) and len(dm0_var_cands) > 0 and (racs_coords is not None):
+                            filtered_var = []
+                            ips_thresh = getattr(cfg, "ips_snr_ratio_threshold", 0.8)
+                            ips_radius = getattr(cfg, "ips_match_radius_arcsec", 30.0)
+                            for cand in annotated_var:
+                                c_ra = cand.get("ra_deg", float(np.degrees(cand["ra_rad"])))
+                                c_dec = cand.get("dec_deg", float(np.degrees(cand["dec_rad"])))
+                                c_coord = SkyCoord(c_ra, c_dec, unit="deg", frame="icrs")
+                                suppress = False
+                                for c0 in dm0_var_cands:
+                                    c0_ra = c0.get("ra_deg", float(np.degrees(c0["ra_rad"])))
+                                    c0_dec = c0.get("dec_deg", float(np.degrees(c0["dec_rad"])))
+                                    c0_coord = SkyCoord(c0_ra, c0_dec, unit="deg", frame="icrs")
+                                    if c_coord.separation(c0_coord).arcsec <= ips_radius:
+                                        if catalogues.is_racs_minus_psrcat(c0_ra, c0_dec, racs_coords, psrcat_coords, match_radius_arcsec=ips_radius):
+                                            if float(cand.get("snr", 0)) <= ips_thresh * float(c0.get("snr", 0)):
+                                                suppress = True
+                                                break
+                                if not suppress:
+                                    filtered_var.append(cand)
+                            annotated_var = filtered_var
+
                         t_var = candidates.candidates_to_astropy_table(annotated_var)
                         candidates.save_candidates_table(
                             t_var,
@@ -852,6 +895,36 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     for cand in annotated:
                         cand["scan_id"] = scan_id_str
                         cand["dm"] = dm_val
+                        if "ra_deg" not in cand and "ra_rad" in cand:
+                            cand["ra_deg"] = float(np.degrees(cand["ra_rad"]))
+                        if "dec_deg" not in cand and "dec_rad" in cand:
+                            cand["dec_deg"] = float(np.degrees(cand["dec_rad"]))
+
+                    # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
+                    if dm_val == 0.0:
+                        dm0_box_cands = [dict(c) for c in annotated]
+                    elif getattr(cfg, "filter_ips_agn", True) and len(dm0_box_cands) > 0 and (racs_coords is not None):
+                        filtered_box = []
+                        ips_thresh = getattr(cfg, "ips_snr_ratio_threshold", 0.8)
+                        ips_radius = getattr(cfg, "ips_match_radius_arcsec", 30.0)
+                        for cand in annotated:
+                            c_ra = cand.get("ra_deg", float(np.degrees(cand["ra_rad"])))
+                            c_dec = cand.get("dec_deg", float(np.degrees(cand["dec_rad"])))
+                            c_coord = SkyCoord(c_ra, c_dec, unit="deg", frame="icrs")
+                            suppress = False
+                            for c0 in dm0_box_cands:
+                                c0_ra = c0.get("ra_deg", float(np.degrees(c0["ra_rad"])))
+                                c0_dec = c0.get("dec_deg", float(np.degrees(c0["dec_rad"])))
+                                c0_coord = SkyCoord(c0_ra, c0_dec, unit="deg", frame="icrs")
+                                if c_coord.separation(c0_coord).arcsec <= ips_radius:
+                                    if catalogues.is_racs_minus_psrcat(c0_ra, c0_dec, racs_coords, psrcat_coords, match_radius_arcsec=ips_radius):
+                                        if float(cand.get("snr", 0)) <= ips_thresh * float(c0.get("snr", 0)):
+                                            suppress = True
+                                            break
+                            if not suppress:
+                                filtered_box.append(cand)
+                        annotated = filtered_box
+
                     t_box = candidates.candidates_to_astropy_table(annotated)
                     candidates.save_candidates_table(
                         t_box,
