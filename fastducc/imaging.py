@@ -421,10 +421,10 @@ def image_time_samples(
 
         cube = np.empty((nt, npix_y, npix_x), dtype=np.float64)
         for t_idx in range(nt):
-            v_snap = vis_dedisp[:, :, t_idx]
-            w_snap = wgt_dedisp[:, :, t_idx]
+            vis_snap = vis_dedisp[:, :, t_idx]
+            wgt_snap = wgt_dedisp[:, :, t_idx]
 
-            n_chans_valid = int(np.count_nonzero(np.any(w_snap > 0.0, axis=0)))
+            n_chans_valid = int(np.count_nonzero(np.any(wgt_snap > 0.0, axis=0)))
             if n_chans_valid < min_valid_channels:
                 cube[t_idx, :, :] = 0.0
                 continue
@@ -469,15 +469,15 @@ def image_time_samples(
                 #    into 1-channel pseudo-rows maintains full C++ compiled execution speed (~10 ms
                 #    per snapshot) while guaranteeing exact per-channel geometric accuracy.
                 uvw_input = uvw_lambda.reshape(-1, 3)
-                vis_input = v_snap.reshape(-1, 1)
-                wgt_input = w_snap.reshape(-1, 1).copy()
+                vis_input = vis_snap.reshape(-1, 1)
+                wgt_input = wgt_snap.reshape(-1, 1).copy()
                 freq_input = freq_1chan
             else:
                 # Standard path: fixed baseline UVW across all channels at snapshot reference time
                 uvw_input = uvw_3d[:, :, t_idx]
                 freq_input = eff_freq
-                vis_input = v_snap
-                wgt_input = w_snap.copy()
+                vis_input = vis_snap
+                wgt_input = wgt_snap.copy()
 
             w_max = np.max(wgt_input)
             if w_max > 0:
@@ -737,10 +737,10 @@ def grid_chunk_cube(
 
     cube = np.empty((nt, npix_y, npix_x), dtype=np.float64)
     for t_idx in range(nt):
-        v_snap = vis_dedisp[:, :, t_idx]
-        w_snap = wgt_dedisp[:, :, t_idx]
+        vis_snap = vis_dedisp[:, :, t_idx]
+        wgt_snap = wgt_dedisp[:, :, t_idx]
 
-        n_chans_valid = int(np.count_nonzero(np.any(w_snap > 0.0, axis=0)))
+        n_chans_valid = int(np.count_nonzero(np.any(wgt_snap > 0.0, axis=0)))
         if n_chans_valid < min_valid_channels:
             cube[t_idx, :, :] = 0.0
             continue
@@ -785,19 +785,19 @@ def grid_chunk_cube(
             #    into 1-channel pseudo-rows maintains full C++ compiled execution speed (~10 ms
             #    per snapshot) while guaranteeing exact per-channel geometric accuracy.
             uvw_input = uvw_lambda.reshape(-1, 3)
-            vis_input = v_snap.reshape(-1, 1)
-            wgt_input = w_snap.reshape(-1, 1).copy()
+            vis_input = vis_snap.reshape(-1, 1)
+            wgt_input = wgt_snap.reshape(-1, 1).copy()
             freq_input = freq_1chan
         else:
             # Standard path: fixed baseline UVW across all channels at snapshot reference time
             uvw_input = uvw_3d[:, :, t_idx]
             freq_input = eff_freq
-            vis_input = v_snap
-            wgt_input = w_snap.copy()
+            vis_input = vis_snap
+            wgt_input = wgt_snap.copy()
 
-        w_max = np.max(wgt_input)
-        if w_max > 0:
-            wgt_input = wgt_input / w_max
+        wgt_max = np.max(wgt_input)
+        if wgt_max > 0:
+            wgt_input = wgt_input / wgt_max
 
         dirty = ducc0.wgridder.vis2dirty(
             uvw=uvw_input,
