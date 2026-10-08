@@ -2,10 +2,12 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 import numpy as np
 
 logger = logging.getLogger(__name__)
+import dask
 from dask.distributed import Client, LocalCluster, as_completed
 
 from dask_jobqueue import SLURMCluster
@@ -228,7 +230,7 @@ def build_cli():
     # --- SLURM-only cluster params ---
     parser.add_argument('--slurm-partition', default=None, help='SLURM partition/queue')
     parser.add_argument('--slurm-account',  default=None, help='SLURM account/project')
-    parser.add_argument('--slurm-cores-per-worker', type=int, default=4)
+    parser.add_argument('--slurm-cores-per-worker', type=int, default=1)
     parser.add_argument('--slurm-mem', default='32GB', help='Memory per worker (e.g., 32GB)')
     parser.add_argument('--slurm-walltime', default='02:30:00')
     parser.add_argument('--slurm-job-extra', nargs='*', default=[],
@@ -341,7 +343,7 @@ def build_cli_periodicity(argv=None):
     p.add_argument("--scheduler-address", default=None, help="Existing Dask scheduler address")
     p.add_argument('--slurm-partition', default=None, help='SLURM partition/queue')
     p.add_argument('--slurm-account',  default=None, help='SLURM account/project')
-    p.add_argument('--slurm-cores-per-worker', type=int, default=4, help='CPUs/cores per SLURM worker')
+    p.add_argument('--slurm-cores-per-worker', type=int, default=1, help='CPUs/cores per SLURM worker')
     p.add_argument('--slurm-mem', default='128GB', help='Memory limit per SLURM worker (e.g., 128GB)')
     p.add_argument('--slurm-walltime', default='02:00:00', help='SLURM job walltime (e.g. 02:00:00)')
     p.add_argument('--slurm-job-extra', nargs='*', default=None, help='Extra SLURM directives')
@@ -561,13 +563,37 @@ def run_pipeline(args):
             t_start = time.time()
             fut_to_idx = {f: i for i, f in enumerate(futures)}
             results = [None] * total
-            for f in as_completed(futures):
-                idx = fut_to_idx[f]
-                results[idx] = f.result()
-                completed += 1
-                elapsed = time.time() - t_start
-                (s, e), sid = chunk_bounds[idx], chunk_scan_ids[idx]
-                print(f"[Dask Progress] [{completed}/{total}] Chunk {s}..{e} (scan {sid}) finished ({elapsed:.1f}s elapsed)", flush=True)
+
+            stop_heartbeat = threading.Event()
+            def _heartbeat():
+                while not stop_heartbeat.wait(60):
+                    try:
+                        n_workers = len(client.scheduler_info().get("workers", {}))
+                        elapsed = int(time.time() - t_start)
+                        print(f"[Dask Heartbeat] {completed}/{total} chunks completed | {n_workers} worker(s) online ({elapsed}s elapsed)", flush=True)
+                    except Exception:
+                        pass
+
+            hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+            hb_thread.start()
+
+            try:
+                for f in as_completed(futures):
+                    idx = fut_to_idx.pop(f)
+                    results[idx] = f.result()
+                    try:
+                        client.cancel(f, force=True)
+                    except Exception:
+                        pass
+                    f.release()
+                    completed += 1
+                    elapsed = time.time() - t_start
+                    (s, e), sid = chunk_bounds[idx], chunk_scan_ids[idx]
+                    n_workers = len(client.scheduler_info().get("workers", {}))
+                    print(f"[Dask Progress] [{completed}/{total}] Chunk {s}..{e} (scan {sid}) finished ({elapsed:.1f}s elapsed, {n_workers} worker(s) online)", flush=True)
+            finally:
+                stop_heartbeat.set()
+
             return results
     if args.parallel_mode == 'serial':
         agg_list = _process_chunks()
@@ -616,6 +642,25 @@ def run_pipeline(args):
             "export OPENBLAS_NUM_THREADS=1"
         ]
 
+        # Allow tasks to be retried if workers retire or fail without aborting cluster
+        # Configure adaptive target-duration to match coarse-grained batch tasks (~1 hour)
+        dask.config.set({
+            "distributed.scheduler.allowed-failures": 25,
+            "distributed.adaptive.target-duration": "3600s",
+        })
+
+        worker_extra = ["--nthreads", "1", "--memory-limit", "0"]
+        if args.slurm_walltime:
+            try:
+                parts = args.slurm_walltime.split(":")
+                if len(parts) >= 2:
+                    wt_min = int(parts[0]) * 60 + int(parts[1])
+                    # Retire gracefully 45 minutes before SLURM hard walltime, but at least 30m lifetime
+                    lifetime_min = max(30, wt_min - 45)
+                    worker_extra.extend(["--lifetime", f"{lifetime_min}m", "--lifetime-stagger", "5m"])
+            except Exception:
+                pass
+
         log_memory("Before creating SLURMCluster")
         cluster = SLURMCluster(
             queue=args.slurm_partition,
@@ -629,19 +674,18 @@ def run_pipeline(args):
             job_script_prologue=prologue,
             scheduler_options=scheduler_opts, #avoid dashboard port conflicts
             processes=1,
-            worker_extra_args=["--nthreads", "1", "--memory-limit", "0"],
+            worker_extra_args=worker_extra,
         )
         log_memory("After creating SLURMCluster")
-        # scale to number of workers: scale to match expected number of time chunks if 0 or not specified
+        # adapt to number of workers: scale dynamically to match expected number of time chunks if 0 or not specified
         if args.dask_workers and args.dask_workers > 0:
-            cluster.scale(args.dask_workers)
-            print(f"[Dask-SLURM] Scaled cluster to {args.dask_workers} worker(s).", flush=True)
-            log_memory(f"After cluster.scale({args.dask_workers})")
+            n_workers = args.dask_workers
         else:
             n_workers = max(1, len(chunk_bounds))
-            cluster.scale(n_workers)
-            print(f"[Dask-SLURM] Scaled cluster to {n_workers} worker(s) (matching {len(chunk_bounds)} time chunks).", flush=True)
-            log_memory(f"After cluster.scale({n_workers})")
+
+        cluster.adapt(minimum=0, maximum=n_workers)
+        print(f"[Dask-SLURM] Dynamically adapted cluster (0..{n_workers} workers).", flush=True)
+        log_memory(f"After cluster.adapt ({n_workers})")
 
         # Connect the client and run
         log_memory("Before Client(cluster) context creation")
@@ -649,31 +693,6 @@ def run_pipeline(args):
             log_memory("After Client(cluster) context creation")
             n_init = len(client.scheduler_info()["workers"])
             print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready.", flush=True)
-            n_online = n_init
-            worker_timeout = getattr(args, "dask_worker_timeout", 0)
-            if n_online == 0:
-                timeout_desc = f"{worker_timeout}s" if worker_timeout > 0 else "indefinite"
-                print(f"[Dask-SLURM] Waiting for worker(s) to be scheduled by SLURM (timeout: {timeout_desc})...", flush=True)
-                t_wait_start = time.time()
-                while n_online == 0:
-                    wait_step = 60
-                    if worker_timeout > 0:
-                        remaining = worker_timeout - (time.time() - t_wait_start)
-                        if remaining <= 0:
-                            raise RuntimeError(
-                                f"No Dask workers connected within {worker_timeout}s timeout period. "
-                                f"Aborting to avoid idle deadlock."
-                            )
-                        wait_step = min(wait_step, remaining)
-                    try:
-                        client.wait_for_workers(1, timeout=wait_step)
-                    except Exception:
-                        pass
-                    n_online = len(client.scheduler_info()["workers"])
-                    if n_online == 0:
-                        elapsed = int(time.time() - t_wait_start)
-                        print(f"[Dask-SLURM] Still waiting for SLURM worker(s) to allocate and connect ({elapsed}s elapsed)...", flush=True)
-            print(f"[Dask-SLURM] {n_online} worker(s) online. Proceeding with DM trials.", flush=True)
             agg_list = _process_chunks(client=client)
             if cfg.enable_var:
                 for trial_dm in dm_trials:
