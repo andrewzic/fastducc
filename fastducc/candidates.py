@@ -1538,7 +1538,9 @@ def save_candidate_snippet_products(snippet_rec: dict,
 
 def _stack_tables_or_empty(tables):
     """Vstack a list of tables (outer join), return a filled table or empty schema."""
-    if len(tables) == 0:
+    # Filter out empty 0-row tables to avoid unpopulated column dtype conflicts (e.g. srcname int64 vs str)
+    valid_tables = [t for t in tables if len(t) > 0]
+    if len(valid_tables) == 0:
         # Create a minimal empty table with common columns used in pipeline
         return Table(names=["x","y","l","m","ra_rad","dec_rad","ra_deg","dec_deg",
                             "ra_hms","dec_dms","dm","snr","std","width_samples",
@@ -1548,11 +1550,19 @@ def _stack_tables_or_empty(tables):
                             "U20","U20",float,float,float,int,
                             float,float,float,float,int,int,
                             int,"U64",int,"U16"])
+
+    for t in valid_tables:
+        if "srcname" in t.colnames:
+            t["srcname"] = np.array(t["srcname"], dtype="U64")
+
     # Use outer join to be resilient to column differences across chunks
-    T = vstack(tables, join_type="outer", metadata_conflicts="silent")
+    T = vstack(valid_tables, join_type="outer", metadata_conflicts="silent")
     # Fill masked values (NA) with sensible defaults for CSV/VOT output
     T.fill_value = np.nan
     T = T.filled()
+    if "srcname" in T.colnames:
+        T["srcname"] = np.array(T["srcname"], dtype="U64")
+        
     if "dm" in T.colnames:
         T["dm"] = np.nan_to_num(np.array(T["dm"], dtype=float), nan=0.0)
     else:
