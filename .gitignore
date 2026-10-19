@@ -14,3 +14,5 @@ build/*
 
 *.xml
 fastducc/catalogues/racs/*.xml
+fastducc/run_targeted_test.sh
+fastducc/calculate_worker_stats.py
