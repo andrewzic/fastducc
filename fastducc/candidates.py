@@ -4,6 +4,8 @@ import os
 import shutil
 import itertools
 import re
+import csv
+import collections
 from typing import IO, Iterable, Tuple, List, Dict, Any, Optional, Union
 from zipfile import Path
 
@@ -2200,6 +2202,7 @@ def aggregate_beam_candidate_tables(
     time_tol_s: float = 0.3,
     sky_tol_arcsec: float = 35.0,
     out_dir: Optional[str] = None,
+    max_n_candidates_per_source: Optional[int] = 100,
 ) -> Table:
     """
     Crossmatch candidates across beams within each scan and build a field-level summary,
@@ -2450,40 +2453,20 @@ def aggregate_beam_candidate_tables(
                 ev['width_all'] = ','.join([str(int(r.get('width_samples', 1))) for r in sub_sorted])
             events.append(ev)
 
-    events.sort(key=lambda r: r['time_center'])
-    for i, ev in enumerate(events):
-        ev['event_id'] = i
-
-    # Build event table (columns preserved)
-    colnames = [
-        'event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
-        'dm', 'max_snr', 'max_snr_time_center', 'max_snr_beam'
-    ]
-    if kind == 'boxcar':
-        colnames.append('max_snr_width')
-        colnames.append('width_samples')
-        colnames.append('width_all')
-    colnames += ['beam_ids', 'beam_all', 'snr_all', 'dm_all', 'scan_ids', 'n_beams', 'n_detections']
-    event_tab = Table(rows=[[ev.get(c) for c in colnames] for ev in events], names=colnames)
-    if out_csv: 
-        event_tab.write(out_csv, format='csv', overwrite=True)
-    if out_vot: 
-        event_tab.write(out_vot, format='votable', overwrite=True)
-
-    # ------------------- Super-summary within scan -------------------
-    # Reuse sky clustering on the *event* table (time-marginalised).
-    # Ensure sexagesimal/srcname present
-    event_rows = [dict(zip(colnames, row)) for row in event_tab.as_array()]
-    _ensure_sexagesimal_on_rows(event_rows, ra_key="ra_deg", dec_key="dec_deg",
+    events.sort(key=lambda r: float(r['time_center']))
+    _ensure_sexagesimal_on_rows(events, ra_key="ra_deg", dec_key="dec_deg",
                                 ra_hms_key="ra_hms", dec_dms_key="dec_dms", src_key="srcname")
 
-    ra_all = np.array([float(r["ra_deg"]) for r in event_rows])
-    dec_all = np.array([float(r["dec_deg"]) for r in event_rows])
+    # ------------------- Super-summary within scan & Candidate Thinning -------------------
+    # Reuse sky clustering on the *event* table (time-marginalised).
+    ra_all = np.array([float(r["ra_deg"]) for r in events])
+    dec_all = np.array([float(r["dec_deg"]) for r in events])
     comps = _cluster_indices_by_sky(ra_all, dec_all, seplimit_arcsec=sky_tol_arcsec)
 
     super_rows = []
+    thinned_events = []
     for comp in comps:
-        sub = [event_rows[i] for i in comp]
+        sub = [events[i] for i in comp]
         # max-SNR representative
         best = max(sub, key=lambda r: float(r.get("max_snr", -np.inf)))
         beams_union = set()
@@ -2531,6 +2514,41 @@ def aggregate_beam_candidate_tables(
 
         super_rows.append(row)
 
+        # Thin out candidate events per source for event_tab
+        def _ev_snr(r):
+            v = r.get("max_snr", r.get("snr", -np.inf))
+            try:
+                f = float(v)
+                return f if not np.isnan(f) else -np.inf
+            except Exception:
+                return -np.inf
+
+        sub_sorted = sorted(sub, key=_ev_snr, reverse=True)
+        if max_n_candidates_per_source is not None and max_n_candidates_per_source > 0:
+            thinned_events.extend(sub_sorted[:max_n_candidates_per_source])
+        else:
+            thinned_events.extend(sub_sorted)
+
+    thinned_events.sort(key=lambda r: float(r.get('time_center', 0.0)))
+    for i, ev in enumerate(thinned_events):
+        ev['event_id'] = i
+
+    # Build event table (columns preserved, thinned to top candidates per source)
+    colnames = [
+        'event_id', 'srcname', 'time_center', 'ra_deg', 'dec_deg', 'ra_hms', 'dec_dms',
+        'dm', 'max_snr', 'max_snr_time_center', 'max_snr_beam'
+    ]
+    if kind == 'boxcar':
+        colnames.append('max_snr_width')
+        colnames.append('width_samples')
+        colnames.append('width_all')
+    colnames += ['beam_ids', 'beam_all', 'snr_all', 'dm_all', 'scan_ids', 'n_beams', 'n_detections']
+    event_tab = Table(rows=[[ev.get(c) for c in colnames] for ev in thinned_events], names=colnames)
+    if out_csv: 
+        event_tab.write(out_csv, format='csv', overwrite=True)
+    if out_vot: 
+        event_tab.write(out_vot, format='votable', overwrite=True)
+
     super_rows.sort(key=lambda r: float(r.get("max_snr", -np.inf)), reverse=True)
     for i, r in enumerate(super_rows):
         r["source_id"] = i
@@ -2574,6 +2592,7 @@ def aggregate_observation(
     sky_tol_arcsec: float = 35.0,
     out_dir: Optional[str] = None,
     pattern: Optional[str] = None,
+    max_n_candidates_per_source: Optional[int] = 100,
 ) -> Table:
     """Discover per-beam candidate tables under obs_root and write a field-level summary."""
     kind = kind.lower().strip()
@@ -2598,6 +2617,7 @@ def aggregate_observation(
         time_tol_s=time_tol_s,
         sky_tol_arcsec=sky_tol_arcsec,
         out_dir=out_dir,
+        max_n_candidates_per_source=max_n_candidates_per_source,
         # out_csv=out_csv,
         # out_vot=out_vot,
     )
@@ -2747,40 +2767,42 @@ def annotate_observation_with_catalogs(
     radius = match_radius_arcsec * u.arcsec
 
     # --- 1) PSRCAT (optional) ---
-    psrcat_coord = None
     psrcat_tbl = None
+    idx_psr = None
+    sep_psr = None
     if psrcat_csv_path:
         psrcat_tbl = _load_psrcat_csv(psrcat_csv_path)
         psrcat_coord = SkyCoord(psrcat_tbl["ra_deg"], psrcat_tbl["dec_deg"], unit="deg", frame="icrs")
+        if len(psrcat_coord) > 0 and len(cand_coord) > 0:
+            idx_psr, sep_psr, _ = cand_coord.match_to_catalog_sky(psrcat_coord)
 
     # --- 2) RACS (optional) ---
-    racs_coord = None
     racs_tbl = None
+    idx_racs = None
+    sep_racs = None
     if racs_vot_path:
         racs_tbl = _load_racs_votable(racs_vot_path)
         racs_coord = SkyCoord(racs_tbl["ra_deg"], racs_tbl["dec_deg"], unit="deg", frame="icrs")
+        if len(racs_coord) > 0 and len(cand_coord) > 0:
+            idx_racs, sep_racs, _ = cand_coord.match_to_catalog_sky(racs_coord)
 
-    # Iterate candidates (few hundred -> simple loop OK; Astropy uses vectorised internals)
+    # Iterate candidates
     for i in range(len(out_tab)):
-        tcoord = cand_coord[i]
-
         # PSRCAT first
-        if psrcat_coord is not None and len(psrcat_coord) > 0:
-            j, sep = _nearest_within_radius(tcoord, psrcat_coord, radius)
-            if j >= 0:
-                source_name[i] = str(psrcat_tbl["src_name"][j])
-                source_offset[i] = float(sep.to(u.arcsec).value)
-                source_cat[i] = "PSRCAT"
-                continue
+        if idx_psr is not None and sep_psr[i] <= radius:
+            j = int(idx_psr[i])
+            source_name[i] = str(psrcat_tbl["src_name"][j])
+            source_offset[i] = float(sep_psr[i].to(u.arcsec).value)
+            source_cat[i] = "PSRCAT"
+            continue
 
         # Then RACS
-        if racs_coord is not None and len(racs_coord) > 0:
-            j, sep = _nearest_within_radius(tcoord, racs_coord, radius)
-            if j >= 0:
-                source_name[i] = str(racs_tbl["src_name"][j])
-                source_offset[i] = float(sep.to(u.arcsec).value)
-                source_cat[i] = "RACS"
-                continue
+        if idx_racs is not None and sep_racs[i] <= radius:
+            j = int(idx_racs[i])
+            source_name[i] = str(racs_tbl["src_name"][j])
+            source_offset[i] = float(sep_racs[i].to(u.arcsec).value)
+            source_cat[i] = "RACS"
+            continue
 
         # Finally SIMBAD (network; optional)
         if simbad_enable:
@@ -2848,6 +2870,7 @@ def organize_candidate_outputs(
     structure: str = "categorized",
     clean_existing: bool = True,
     obs_rows_sub: Optional[List[List[Dict[str, Any]]]] = None,
+    max_n_candidates_per_source: Optional[int] = 100,
 ) -> None:
     """
     Organize per-candidate artefacts (summary plots, lightcurves, FITS cutouts,
@@ -2872,6 +2895,8 @@ def organize_candidate_outputs(
         Whether to auto-purge candidate directories before re-populating them (default: True).
     obs_rows_sub : list of list of dict, optional
         Per-candidate list of sub-rows from individual scan summaries.
+    max_n_candidates_per_source : int, optional
+        Maximum candidates/events per unique source to output in full candidate list (default: 100).
     """
     kind = kind.lower().strip()
     if out_tab is None or len(out_tab) == 0:
@@ -2888,9 +2913,17 @@ def organize_candidate_outputs(
     for pat in [
         os.path.join(obs_root, "candidates"),
         os.path.join(obs_root, "*", "candidates"),
-        os.path.join(obs_root, "*", "*", "candidates"),
     ]:
         for d in glob.glob(pat):
+            if os.path.isdir(d):
+                abs_d = os.path.abspath(d)
+                if abs_d == abs_out_dir or abs_d.startswith(abs_out_dir + os.sep):
+                    continue
+                cand_dir_set.add(d)
+
+    # Fallback to deeper search only if no candidate directories found at root or chunk level
+    if not cand_dir_set:
+        for d in glob.glob(os.path.join(obs_root, "*", "*", "candidates")):
             if os.path.isdir(d):
                 abs_d = os.path.abspath(d)
                 if abs_d == abs_out_dir or abs_d.startswith(abs_out_dir + os.sep):
@@ -2902,47 +2935,127 @@ def organize_candidate_outputs(
 
     for cdir in sorted(cand_dir_set):
         try:
-            for item in os.listdir(cdir):
-                item_path = os.path.join(cdir, item)
-                item_lower = item.lower()
+            other_family = ["_var_", "_variance_", "_periodicity_"] if kind == "boxcar" else ["_boxcar_", "_box_", "_periodicity_"]
+            cdir_items = [f for f in os.listdir(cdir) if not any(t in f.lower() for t in other_family)]
 
-                # Strict family filter on file names during indexing
-                if kind == "boxcar" and any(t in item_lower for t in ["_var_", "_variance_", "_periodicity_"]):
-                    continue
-                elif kind == "variance" and any(t in item_lower for t in ["_boxcar_", "_box_", "_periodicity_"]):
-                    continue
-
+            for item in cdir_items:
                 if any(k in item for k in ["_cand_", "_summary", "_lc_", "_cutout", "_fullframe", ".ds"]):
-                    all_artefacts.append(item_path)
+                    all_artefacts.append(os.path.join(cdir, item))
 
-                # Only read scan-level candidate summary tables (_all, _super_summary, _candidates)
-                is_scan_table = (
-                    item_lower.endswith(("_all.vot", "_all.csv", "_all.xml", "_super_summary.vot", "_super_summary.csv", "_candidates.csv", "_candidates.vot"))
-                    and not any(tag in item_lower for tag in ["_obs_", "_entry", "_full_candidate_list"])
-                )
+            # Candidate tables for this chunk (prefer chunk summary to avoid reading redundant raw per-beam tables)
+            cand_tables = [f for f in cdir_items if f.endswith(("_summary.csv", "_summary.vot")) and "_super_" not in f]
+            if not cand_tables:
+                cand_tables = [f for f in cdir_items if f.endswith(("_all.csv", "_all.vot", "_super_summary.csv", "_super_summary.vot", "_candidates.csv", "_candidates.vot"))]
+            cand_tables = [f for f in cand_tables if not any(t in f for t in ["_obs_", "_full_candidate_list"])]
 
-                if is_scan_table:
-                    try:
-                        fmt = "votable" if item_lower.endswith((".vot", ".xml")) else "csv"
-                        t_comp = Table.read(item_path, format=fmt)
-                        t_comp = _unmask_table(t_comp)
-                        if "ra_deg" in t_comp.colnames and "dec_deg" in t_comp.colnames:
-                            meta_comp = parse_candidate_filename(item_path)
-                            for r_comp in t_comp:
-                                d_comp = _sanitize_row_dict({col: _row_value_to_python(r_comp[col]) for col in t_comp.colnames})
-                                if not d_comp.get("scan_id") and meta_comp.get("scan_id"):
-                                    d_comp["scan_id"] = meta_comp["scan_id"]
-                                if not d_comp.get("beam") and meta_comp.get("beam"):
-                                    d_comp["beam"] = meta_comp["beam"]
-                                if ("dm" not in d_comp or d_comp["dm"] is None or (isinstance(d_comp["dm"], float) and np.isnan(d_comp["dm"]))) and meta_comp.get("dm") is not None:
-                                    d_comp["dm"] = meta_comp["dm"]
-                                all_comp_rows.append(d_comp)
-                    except Exception:
-                        pass
+            for item in cand_tables:
+                item_path = os.path.join(cdir, item)
+                meta_comp = parse_candidate_filename(item_path)
+                try:
+                    if item.lower().endswith(".csv"):
+                        with open(item_path, "r", encoding="utf-8", errors="replace") as f:
+                            rows = [_sanitize_row_dict(r) for r in csv.DictReader(f)]
+                    else:
+                        fmt = "votable" if item.lower().endswith((".vot", ".xml")) else "csv"
+                        t = _unmask_table(Table.read(item_path, format=fmt))
+                        rows = [_sanitize_row_dict({c: _row_value_to_python(r[c]) for c in t.colnames}) for r in t]
+
+                    for d in rows:
+                        d["scan_id"] = d.get("scan_id") or meta_comp.get("scan_id")
+                        d["beam"] = d.get("beam") or meta_comp.get("beam")
+                        if (d.get("dm") is None or str(d.get("dm")).strip() in ("", "nan", "None")) and meta_comp.get("dm") is not None:
+                            d["dm"] = meta_comp["dm"]
+                        all_comp_rows.append(d)
+                except Exception:
+                    pass
         except Exception:
             continue
 
     print(f"[ObsOrganize] Indexed {len(all_artefacts)} artefact paths and {len(all_comp_rows)} component candidate entries under {obs_root}")
+
+    # Build index of candidate names to table indices
+    cand_name_to_indices: Dict[str, List[int]] = collections.defaultdict(list)
+    for idx, row in enumerate(out_tab):
+        s = str(row["srcname"]).strip()
+        if s:
+            cand_name_to_indices[s].append(idx)
+    if obs_rows_sub:
+        for idx, sub_list in enumerate(obs_rows_sub):
+            for sub_r in sub_list:
+                s = str(sub_r.get("srcname", "")).strip()
+                if s:
+                    cand_name_to_indices[s].append(idx)
+
+    # Pre-index artefacts by candidate index in a single pass
+    artefacts_by_cand_idx: Dict[int, List[str]] = collections.defaultdict(list)
+    for art_path in all_artefacts:
+        art_name = os.path.basename(art_path)
+        art_name_lower = art_name.lower()
+
+        if kind == "boxcar":
+            if any(tag in art_name_lower for tag in ["_var_", "_variance_", "_periodicity_", "_period_"]):
+                continue
+        elif kind == "variance":
+            if any(tag in art_name_lower for tag in ["_boxcar_", "_box_", "_periodicity_", "_period_"]):
+                continue
+        elif kind == "periodicity":
+            if any(tag in art_name_lower for tag in ["_boxcar_", "_box_", "_var_", "_variance_"]):
+                continue
+
+        matched_cand_indices = set()
+        if "cand_" in art_name:
+            after_cand = art_name.split("cand_", 1)[1]
+            base_cand = os.path.splitext(after_cand)[0]
+            tokens = base_cand.split("_")
+            accum = []
+            for tok in tokens:
+                accum.append(tok)
+                prefix = "_".join(accum)
+                if prefix in cand_name_to_indices:
+                    matched_cand_indices.update(cand_name_to_indices[prefix])
+        if not matched_cand_indices:
+            base_name = os.path.splitext(art_name)[0]
+            tokens = base_name.split("_")
+            for tok in tokens:
+                if tok in cand_name_to_indices:
+                    matched_cand_indices.update(cand_name_to_indices[tok])
+
+        for c_idx in matched_cand_indices:
+            artefacts_by_cand_idx[c_idx].append(art_path)
+
+    # Pre-match component rows to candidate sources (by name and vectorized sky search)
+    comp_matches_by_cand: Dict[int, List[Dict[str, Any]]] = collections.defaultdict(list)
+    for comp_r in all_comp_rows:
+        comp_src = str(comp_r.get("srcname", "")).strip()
+        if comp_src in cand_name_to_indices:
+            for c_idx in cand_name_to_indices[comp_src]:
+                comp_matches_by_cand[c_idx].append(comp_r)
+
+    if len(all_comp_rows) > 0 and len(out_tab) > 0:
+        try:
+            cand_ra_arr = np.array([float(r["ra_deg"]) for r in out_tab], dtype=float)
+            cand_dec_arr = np.array([float(r["dec_deg"]) for r in out_tab], dtype=float)
+            cand_coords = SkyCoord(cand_ra_arr * u.deg, cand_dec_arr * u.deg, frame="icrs")
+
+            comp_ra_arr = np.array([float(r.get("ra_deg", np.nan)) for r in all_comp_rows], dtype=float)
+            comp_dec_arr = np.array([float(r.get("dec_deg", np.nan)) for r in all_comp_rows], dtype=float)
+            valid_comp_mask = ~np.isnan(comp_ra_arr) & ~np.isnan(comp_dec_arr)
+
+            if np.any(valid_comp_mask):
+                valid_comp_indices = np.where(valid_comp_mask)[0]
+                comp_coords = SkyCoord(comp_ra_arr[valid_comp_mask] * u.deg, comp_dec_arr[valid_comp_mask] * u.deg, frame="icrs")
+                idx_cand, idx_comp_valid, _, _ = cand_coords.search_around_sky(comp_coords, 35.0 * u.arcsec)
+                for c_i, comp_v_i in zip(idx_cand, idx_comp_valid):
+                    comp_matches_by_cand[int(c_i)].append(all_comp_rows[valid_comp_indices[comp_v_i]])
+        except Exception as e:
+            print(f"[ObsOrganize] WARNING: Spatial component pre-matching failed: {e}")
+
+    # On-demand directory creation tracker to eliminate empty directories and reduce Lustre MDS load
+    created_dirs = set()
+    def _ensure_dir(dpath: str) -> None:
+        if dpath not in created_dirs:
+            os.makedirs(dpath, exist_ok=True)
+            created_dirs.add(dpath)
 
     organized_count = 0
     linked_files_count = 0
@@ -2954,13 +3067,6 @@ def organize_candidate_outputs(
 
         safe_srcname = srcname.replace("/", "_")
         cand_dir = os.path.join(kind_dir, safe_srcname)
-        if clean_existing and os.path.exists(cand_dir):
-            try:
-                shutil.rmtree(cand_dir)
-            except Exception as e:
-                print(f"[ObsOrganize] WARNING: Failed to clean existing directory {cand_dir}: {e}")
-
-        os.makedirs(cand_dir, exist_ok=True)
 
         if structure == "categorized":
             plots_dir = os.path.join(cand_dir, "plots")
@@ -2969,43 +3075,11 @@ def organize_candidate_outputs(
             fullframes_dir = os.path.join(cand_dir, "fullframes")
             ds_dir = os.path.join(cand_dir, "dynamic_spectra")
             cat_dir = os.path.join(cand_dir, "catalogs")
-            for d in (plots_dir, lc_dir, cutouts_dir, fullframes_dir, ds_dir, cat_dir):
-                os.makedirs(d, exist_ok=True)
         else:
             plots_dir = lc_dir = cutouts_dir = fullframes_dir = ds_dir = cat_dir = cand_dir
 
-        names_to_match = {srcname}
-        if obs_rows_sub and idx < len(obs_rows_sub):
-            for sub_r in obs_rows_sub[idx]:
-                sub_name = str(sub_r.get("srcname", "")).strip()
-                if sub_name:
-                    names_to_match.add(sub_name)
-
-        cand_ra = float(row["ra_deg"])
-        cand_dec = float(row["dec_deg"])
-
-        matched_artefacts = set()
-        for art_path in all_artefacts:
-            art_name = os.path.basename(art_path)
-            art_name_lower = art_name.lower()
-
-            # Enforce strict family filtering to prevent cross-family artefact pollution
-            if kind == "boxcar":
-                if any(tag in art_name_lower for tag in ["_var_", "_variance_", "_periodicity_", "_period_"]):
-                    continue
-            elif kind == "variance":
-                if any(tag in art_name_lower for tag in ["_boxcar_", "_box_", "_periodicity_", "_period_"]):
-                    continue
-            elif kind == "periodicity":
-                if any(tag in art_name_lower for tag in ["_boxcar_", "_box_", "_var_", "_variance_"]):
-                    continue
-
-            for name in names_to_match:
-                if (f"cand_{name}" in art_name or f"_{name}_" in art_name or f"_{name}." in art_name):
-                    matched_artefacts.add(art_path)
-                    break
-
-        for src_path in sorted(matched_artefacts):
+        matched_artefacts = artefacts_by_cand_idx.get(idx, [])
+        for src_path in sorted(set(matched_artefacts)):
             art_name = os.path.basename(src_path)
             art_name_lower = art_name.lower()
 
@@ -3026,6 +3100,7 @@ def organize_candidate_outputs(
             else:
                 dest_folder = cand_dir
 
+            _ensure_dir(dest_folder)
             dest_path = os.path.join(dest_folder, art_name)
 
             try:
@@ -3050,58 +3125,84 @@ def organize_candidate_outputs(
             except Exception as e:
                 print(f"[ObsOrganize] WARNING: Failed to {link_mode} '{src_path}' -> '{dest_path}': {e}")
 
-        # 1. Write observation-level summary table (1 row for this candidate)
+        # 1. Write observation-level summary table (1 row for this candidate) directly as CSV
         try:
-            obs_summary_tab = _unmask_table(out_tab[idx:idx+1])
+            _ensure_dir(cat_dir)
+            obs_row_dict = _sanitize_row_dict({col: row[col] for col in out_tab.colnames})
             obs_csv_cat = os.path.join(cat_dir, f"{safe_srcname}_obs_summary.csv")
-            obs_vot_cat = os.path.join(cat_dir, f"{safe_srcname}_obs_summary.vot")
-            obs_summary_tab.write(obs_csv_cat, format="csv", overwrite=True)
-            obs_summary_tab.write(obs_vot_cat, format="votable", overwrite=True)
+            with open(obs_csv_cat, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=out_tab.colnames)
+                writer.writeheader()
+                writer.writerow(obs_row_dict)
 
             if structure == "categorized":
+                _ensure_dir(cand_dir)
                 obs_csv_root = os.path.join(cand_dir, f"{safe_srcname}_obs_summary.csv")
-                obs_summary_tab.write(obs_csv_root, format="csv", overwrite=True)
+                with open(obs_csv_root, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=out_tab.colnames)
+                    writer.writeheader()
+                    writer.writerow(obs_row_dict)
         except Exception as e:
             print(f"[ObsOrganize] WARNING: Could not write obs summary table for {srcname}: {e}")
 
         # 2. Agglomerate & write all component candidate entries matching this source across scans/beams/chunks
         try:
-            matched_comp_rows = []
-            cos_dec = math.cos(math.radians(cand_dec))
-            for d_comp in all_comp_rows:
-                comp_src = str(d_comp.get("srcname", "")).strip()
-                if comp_src and comp_src in names_to_match:
-                    matched_comp_rows.append(d_comp)
-                    continue
-                try:
-                    r_ra = float(d_comp["ra_deg"])
-                    r_dec = float(d_comp["dec_deg"])
-                    dra = (r_ra - cand_ra) * cos_dec
-                    ddec = r_dec - cand_dec
-                    sep_arcsec = math.hypot(dra, ddec) * 3600.0
-                    if sep_arcsec <= 35.0:
-                        matched_comp_rows.append(d_comp)
-                except Exception:
-                    pass
+            matched_raw = comp_matches_by_cand.get(idx, [])
+            if not matched_raw and obs_rows_sub and idx < len(obs_rows_sub) and obs_rows_sub[idx]:
+                matched_raw = obs_rows_sub[idx]
 
-            if not matched_comp_rows and obs_rows_sub and idx < len(obs_rows_sub) and obs_rows_sub[idx]:
-                matched_comp_rows = obs_rows_sub[idx]
+            if matched_raw:
+                # Deduplicate matching component rows by id
+                seen_row_ids = set()
+                matched_comp_rows = []
+                for r in matched_raw:
+                    rid = id(r)
+                    if rid not in seen_row_ids:
+                        seen_row_ids.add(rid)
+                        matched_comp_rows.append(r)
 
-            if matched_comp_rows:
+                def _get_comp_snr(d: Dict[str, Any]) -> float:
+                    val = d.get("max_snr", d.get("snr", -np.inf))
+                    try:
+                        f = float(val)
+                        return f if not np.isnan(f) else -np.inf
+                    except Exception:
+                        return -np.inf
+
+                matched_comp_rows.sort(key=_get_comp_snr, reverse=True)
+                if max_n_candidates_per_source is not None and max_n_candidates_per_source > 0:
+                    matched_comp_rows = matched_comp_rows[:max_n_candidates_per_source]
+
                 clean_matched = [_sanitize_row_dict(r) for r in matched_comp_rows]
-                comp_list_tab = _unmask_table(Table(rows=clean_matched))
+                # Determine fieldnames from union of all keys, preserving key order from first row
+                fieldnames = []
+                seen_fields = set()
+                for r_m in clean_matched:
+                    for k in r_m.keys():
+                        if k not in seen_fields:
+                            seen_fields.add(k)
+                            fieldnames.append(k)
+
+                _ensure_dir(cat_dir)
                 list_csv_cat = os.path.join(cat_dir, f"{safe_srcname}_full_candidate_list.csv")
-                list_vot_cat = os.path.join(cat_dir, f"{safe_srcname}_full_candidate_list.vot")
-                comp_list_tab.write(list_csv_cat, format="csv", overwrite=True)
-                comp_list_tab.write(list_vot_cat, format="votable", overwrite=True)
+                with open(list_csv_cat, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(clean_matched)
 
                 if structure == "categorized":
+                    _ensure_dir(cand_dir)
                     list_csv_root = os.path.join(cand_dir, f"{safe_srcname}_full_candidate_list.csv")
-                    comp_list_tab.write(list_csv_root, format="csv", overwrite=True)
+                    with open(list_csv_root, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(clean_matched)
         except Exception as e:
             print(f"[ObsOrganize] WARNING: Could not write full candidate list table for {srcname}: {e}")
 
         organized_count += 1
+        if (idx + 1) % 500 == 0 or (idx + 1) == len(out_tab):
+            print(f"[ObsOrganize] Processed {idx + 1}/{len(out_tab)} candidates ({linked_files_count} links/files created)...", flush=True)
 
     print(f"[ObsOrganize] Organized {organized_count} candidates ({linked_files_count} files/links created) under {kind_dir}")
 
@@ -3120,6 +3221,7 @@ def aggregate_observation_from_super_summaries(
     organize: bool = True,
     link_mode: str = "symlink",
     organize_structure: str = "categorized",
+    max_n_candidates_per_source: Optional[int] = 100,
 ) -> Table:    
     """
     Read *per-scan* cross-beam super summaries (VOT) under obs_root,
@@ -3408,6 +3510,7 @@ def aggregate_observation_from_super_summaries(
                 link_mode=link_mode,
                 structure=organize_structure,
                 obs_rows_sub=obs_rows_sub,
+                max_n_candidates_per_source=max_n_candidates_per_source,
             )
         except Exception as e:
             print(f"[ObsSuper] WARNING: Candidate output organization failed: {e}")

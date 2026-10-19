@@ -259,6 +259,9 @@ def build_cli_aggregate(argv=None):
                    help="Optional glob pattern to discover input CSVs (overrides default)")
     p.add_argument("--outdir", default=None,
                    help="Output directory (default: obs-root)")
+    p.add_argument("--max-n-candidates-per-source", "--max-candidates-per-source", "--max-N-candidates-per-source",
+                   type=int, default=100,
+                   help="Maximum events per candidate source to retain in summary (default: 100)")
 
     args = p.parse_args(argv)
     return args
@@ -286,6 +289,9 @@ def build_cli_aggregate_obs(argv=None):
                    help="How to place artefact files into candidate directories: absolute symlink or copy (default: symlink)")
     p.add_argument("--organize-structure", choices=["categorized", "flat"], default="categorized",
                    help="Directory tree structure for candidate subfolders (default: categorized)")
+    p.add_argument("--max-n-candidates-per-source", "--max-candidates-per-source", "--max-N-candidates-per-source",
+                   type=int, default=100,
+                   help="Maximum events per candidate source to output in full candidate list (default: 100)")
     return p.parse_args(argv)
 
 
@@ -417,6 +423,7 @@ def aggregate_main(argv=None):
         sky_tol_arcsec=args.sky_tol_arcsec,
         out_dir=args.outdir,
         pattern=args.pattern,
+        max_n_candidates_per_source=args.max_n_candidates_per_source,
     )
     return 0
 
@@ -435,6 +442,7 @@ def aggregate_obs_main(argv=None):
         organize=args.organize,
         link_mode=args.link_mode,
         organize_structure=args.organize_structure,
+        max_n_candidates_per_source=args.max_n_candidates_per_source,
     )
     return 0
 
