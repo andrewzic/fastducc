@@ -5,6 +5,8 @@ fastducc CLI dispatcher.
 Provides:
   fastducc            -> existing fastducc.fastducc_run:main
   fastducc aggregate  -> field-level candidate aggregation across beams
+  fastducc periodicity -> periodicity search
+  fastducc cube       -> dirty image FITS cube generation with fitscube
 """
 
 import sys
@@ -49,12 +51,21 @@ def _run_periodicity(argv):
     nufft_periodicity.run_periodicity(args)
     return 0
 
+def _run_cube(argv):
+    """
+    Parse cube args and run cube.main().
+    """
+    from fastducc import cube
+    return cube.main(list(argv))
+
 def main(argv=None):
     """
     Entry point for the console script "fastducc".
 
     If first argument is "aggregate", run aggregation.
+    If first argument is "aggregate_obs", run observation-level aggregation.
     If first argument is "periodicity", run periodicity search.
+    If first argument is "cube" or "make-cube", generate a FITS dirty image cube.
     Otherwise, treat everything as arguments for the imaging/search pipeline.
     """
     if argv is None:
@@ -68,7 +79,11 @@ def main(argv=None):
         is_subcommand = True
         ret = _run_aggregate_obs(argv[1:])
     elif len(argv) > 0 and argv[0] == "periodicity":
+        is_subcommand = True
         ret = _run_periodicity(argv[1:])
+    elif len(argv) > 0 and argv[0] in ("cube", "make-cube", "make_cube"):
+        is_subcommand = True
+        ret = _run_cube(argv[1:])
     else:
         ret = _run_imaging_search(argv)
 

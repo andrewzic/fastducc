@@ -16,12 +16,14 @@ dependencies = [
   "astropy",
   "scipy",
   "ducc0>=0.40",
+  "fitscube",
 ]
 
 [project.scripts]
 
 fastducc = "fastducc.cli:main"
 fastducc-run = "fastducc.fastducc_run:main"
+fastducc-cube = "fastducc.cube:main"
 fastducc-periodicity = "fastducc.nufft_periodicity:run_periodicity"
 ducc-continuum-img = "fastducc.ducc_continuum_img:main"
 

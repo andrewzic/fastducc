@@ -6,6 +6,7 @@ fastducc: tools for imaging and transient detection with ducc0 and casacore.
 
 Submodules:
 - fastducc_run: CLI / orchestration to image MS in time chunks and run detection
+- cube: utility to write dirty image FITS cubes using fitscube
 - imaging: per-chunk dirty image generation (ducc0 wgridder)
 - detection: boxcar/SNR maps
 - dedisp: brute-force dedispersion utility
@@ -23,6 +24,7 @@ __all__ = [
     "catalogues",
     "core",
     "cli",
+    "cube",
     "dedisp",
     "imaging",
     "detection",
@@ -31,7 +33,6 @@ __all__ = [
     "ms_utils",
     "wcs",
     "candidates",
-    "dedisp",
     "types"
 ]
 

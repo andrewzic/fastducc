@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import sys
 from typing import Any, Tuple
 
 import numpy as np
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable is not None else []
 
 from casacore.tables import table
 

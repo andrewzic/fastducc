@@ -238,6 +238,74 @@ def build_cli():
     parser.add_argument('--slurm-interface', default=None,
                         help='Network interface name (if needed for TCP comms)')
 
+    # --- Cube creation mode ---
+    parser.add_argument(
+        '--make-cube', '--cube-only', dest='make_cube', action='store_true', default=False,
+        help='Write out dirty FITS cube with no further detection'
+    )
+    parser.add_argument(
+        '--use-fitscube', action='store_true', default=False,
+        help='Combine via Alec Thomson fitscube file-based workflow instead of direct memory-mapped streaming'
+    )
+    parser.add_argument('--out-cube', default=None, help='Output path for dirty FITS cube')
+    parser.add_argument('--start-time-idx', '--start-idx', type=int, default=None, help='0-based start time index')
+    parser.add_argument('--end-time-idx', '--end-idx', type=int, default=None, help='0-based end time index')
+    parser.add_argument('--start-time', type=float, default=None, help='Start time in seconds or MJD')
+    parser.add_argument('--end-time', type=float, default=None, help='End time in seconds or MJD')
+    parser.add_argument('--create-blanks', action='store_true', default=False,
+                        help='Create blank NaN planes for missing time intervals on a regular grid (following fitscube)')
+    parser.add_argument('--time-step', '--dt', dest='time_step', type=float, default=None,
+                        help='Nominal time step / integration time in seconds (auto-detected if omitted)')
+    parser.add_argument('--max-blank-factor', type=float, default=10.0,
+                        help='Maximum allowed ratio of regular grid frames to observed frames when --create-blanks is enabled (default: 10.0)')
+    parser.add_argument('--no-timestamps-table', dest='write_timestamps_table', action='store_false', default=True,
+                        help='Do not include TIMESTAMPS binary table extension HDU')
+    parser.add_argument('--save-uv', '-save-uv', dest='save_uv', action='store_true', default=False,
+                        help='Save gridded UV visibilities (2D FFT of dirty images) into separate real and imaginary FITS cubes (following wsclean -save-uv)')
+    parser.add_argument('--uv-only', dest='uv_only', action='store_true', default=False,
+                        help='Only output real and imaginary UV cubes, skipping the dirty image cube')
+    parser.add_argument('--out-uv-real', default=None,
+                        help='Explicit path for output real UV cube (default: <prefix>-uv-real.cube.fits)')
+    parser.add_argument('--out-uv-imag', default=None,
+                        help='Explicit path for output imaginary UV cube (default: <prefix>-uv-imag.cube.fits)')
+    parser.add_argument('--uv-4d', '--uv-stokes-axis', dest='uv_4d', action='store_true', default=False,
+                        help='Output UV cubes with 4D geometry (STOKES, TIME, V, U)')
+    parser.add_argument(
+        '--coord', '--cubelet-coord', '--target-coord', '--target', dest='coord', default=None,
+        help="Target celestial coordinates for cubelet mode (e.g. '17:33:00 -23:44:00', '17h33m00s -23d44m00s', '263.25, -23.73')"
+    )
+    parser.add_argument(
+        '--ra', '--cubelet-ra', dest='ra', default=None,
+        help='Target Right Ascension for cubelet mode (sexagesimal or degrees)'
+    )
+    parser.add_argument(
+        '--dec', '--cubelet-dec', dest='dec', default=None,
+        help='Target Declination for cubelet mode (sexagesimal or degrees)'
+    )
+    parser.add_argument(
+        '--radius', '--cubelet-radius', dest='radius', default=None,
+        help="Cubelet cutout radius (e.g. '45arcsec', '1.5arcmin', '32pix', or float in arcsec)"
+    )
+    parser.add_argument(
+        '--radius-arcsec', type=float, default=None,
+        help='Cubelet cutout radius in arcseconds'
+    )
+    parser.add_argument(
+        '--radius-pix', type=float, default=None,
+        help='Cubelet cutout radius in pixels'
+    )
+    parser.add_argument(
+        '--box-size', '--box-size-pix', dest='box_size_pix', type=int, default=None,
+        help='Explicit cubelet diameter / box size in pixels (e.g. 64)'
+    )
+    parser.add_argument(
+        '--box-size-arcsec', type=float, default=None,
+        help='Explicit cubelet diameter / box size in arcseconds'
+    )
+    parser.add_argument(
+        '--radius-unit', choices=['arcsec', 'pix'], default='arcsec',
+        help='Default unit when radius is passed as a bare number (default: arcsec)'
+    )
 
     args = parser.parse_args()
 
@@ -754,8 +822,61 @@ def main():
         args = build_cli_periodicity(sys.argv[2:])
         nufft_periodicity.run_periodicity(args)
         return None
+    elif len(sys.argv) > 1 and sys.argv[1] in ("cube", "make-cube", "make_cube"):
+        from fastducc import cube
+        cube.main(sys.argv[2:])
+        return None
     
     args = build_cli()
+    if getattr(args, "make_cube", False):
+        from fastducc import cube
+        dm_trials = args.dm_list if (getattr(args, "dm_list", None) is not None and len(args.dm_list) > 0) else [args.dm if args.dm is not None else 0.0]
+        for trial_dm in dm_trials:
+            cube.make_dirty_cube(
+                msname=args.msname,
+                out_cube=args.out_cube if len(dm_trials) == 1 else None,
+                coord=getattr(args, "coord", None),
+                ra=getattr(args, "ra", None),
+                dec=getattr(args, "dec", None),
+                radius=getattr(args, "radius", None),
+                radius_arcsec=getattr(args, "radius_arcsec", None),
+                radius_pix=getattr(args, "radius_pix", None),
+                box_size_pix=getattr(args, "box_size_pix", None),
+                box_size_arcsec=getattr(args, "box_size_arcsec", None),
+                radius_unit=getattr(args, "radius_unit", "arcsec"),
+                start_time_idx=args.start_time_idx,
+                end_time_idx=args.end_time_idx,
+                start_time=args.start_time,
+                end_time=args.end_time,
+                chunk_size=args.chunk_size,
+                npix_x=args.npix_x,
+                npix_y=args.npix_y,
+                pixsize_arcsec=args.pixsize_arcsec,
+                corr_mode=args.corr_mode,
+                single_pol=args.single_pol,
+                basis=args.basis,
+                data_column=args.data_column,
+                epsilon=args.epsilon,
+                do_wgridding=args.do_wgridding,
+                nthreads=args.nthreads,
+                verbosity=args.verbosity,
+                min_valid_channels=args.min_valid_channels,
+                dm=float(trial_dm),
+                collapse_channels=getattr(args, "collapse_channels", False),
+                nsubbands=getattr(args, "nsubbands", 1),
+                exact_uvw=getattr(args, "exact_uvw", True),
+                use_fitscube=getattr(args, "use_fitscube", False),
+                create_blanks=getattr(args, "create_blanks", False),
+                time_step=getattr(args, "time_step", None),
+                max_blank_factor=getattr(args, "max_blank_factor", 10.0),
+                write_timestamps_table=getattr(args, "write_timestamps_table", True),
+                save_uv=getattr(args, "save_uv", False),
+                uv_only=getattr(args, "uv_only", False),
+                out_uv_real=getattr(args, "out_uv_real", None) if len(dm_trials) == 1 else None,
+                out_uv_imag=getattr(args, "out_uv_imag", None) if len(dm_trials) == 1 else None,
+                uv_4d=getattr(args, "uv_4d", False),
+            )
+        return None
     run_pipeline(args)
     return None
 
