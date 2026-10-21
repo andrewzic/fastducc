@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 import glob
 import os
 import shutil
@@ -7,7 +8,7 @@ import re
 import csv
 import collections
 from typing import IO, Iterable, Tuple, List, Dict, Any, Optional, Union
-from zipfile import Path
+from pathlib import Path
 
 import numpy as np
 import math
@@ -15,6 +16,7 @@ import math
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
@@ -182,33 +184,21 @@ def extract_candidate_snippets(
 
     # --- spatial center index within snippet ---
     half_sp = spatial_size // 2
+    t_len_sm = max(1, time_factor)
+    half_t = t_len_sm // 2
 
-    # --- Precompute cumulative sum for fast boxcar smoothing (once) ---
-    # Use float64 for numerical stability (same dtype as numba kernels).
-    csum = np.zeros((T + 1, Ny, Nx), dtype=np.float64)
-    csum[1:] = np.cumsum(cube.astype(np.float64, copy=False), axis=0)
-
-
-    # --- Build smoothed cubes & times per unique width ---
+    # --- Precompute times per unique width (avoids full-cube 3D smoothing) ---
     unique_w = sorted(set(max(1, int(d.get("width_samples", 1))) for d in detections))
-    smoothed_by_w: Dict[int, Dict[str, Any]] = {}
+    times_by_w: Dict[int, np.ndarray] = {}
 
     for w in unique_w:
         if w > T:
-            # pathological: window longer than data
-            sm_cube = np.empty((0, Ny, Nx), dtype=np.float64)
             sm_times = np.empty((0,), dtype=times.dtype)
         else:
-            S_sum = kernels._moving_sum_from_csum(csum, w)  # (T_eff, Ny, Nx) windowed sums
-            sm_cube = S_sum / float(w)
-            T_eff = sm_cube.shape[0]
-            # Choose center time index inside each window
+            T_eff = T - w + 1
             offset = (w // 2) if (center_policy == "right") else ((w - 1) // 2)
-            # `times_sm[t0] = times[t0 + offset]`
-            start = offset
-            end = start + T_eff
-            sm_times = times[start:end]
-        smoothed_by_w[w] = {"cube": sm_cube, "times": sm_times}
+            sm_times = times[offset : offset + T_eff]
+        times_by_w[w] = sm_times
 
     out: List[Dict[str, Any]] = []
 
@@ -237,14 +227,11 @@ def extract_candidate_snippets(
         y = int(det["y"]); x = int(det["x"])
         w = _resolve_w(det)
 
-        sm = smoothed_by_w[w]
-        sm_cube = sm["cube"]         # shape: (T_eff, Ny, Nx)
-        sm_times = sm["times"]       # shape: (T_eff,)
-        T_eff = sm_cube.shape[0]
+        sm_times = times_by_w[w]
+        T_eff = sm_times.shape[0]
 
         # If width exceeds data length, return an all-NaN snippet
         if T_eff == 0:
-            t_len_sm = max(1, time_factor)
             snippet_cube = np.full((t_len_sm, spatial_size, spatial_size), np.nan, dtype=np.float32)
             snippet_times = np.full((t_len_sm,), np.nan, dtype=times.dtype)
             rec = {"candidate": det, "snippet_cube": snippet_cube, "snippet_times": snippet_times}
@@ -265,8 +252,7 @@ def extract_candidate_snippets(
         k_center = _resolve_sm_center_idx(det, w)
 
         # Snippet length in *smoothed frames*
-        t_len_sm = max(1, time_factor)
-        half_t = t_len_sm // 2
+        # (t_len_sm and half_t defined above)
 
         # Desired smoothed time window around k_center
         k0 = k_center - half_t
@@ -296,8 +282,18 @@ def extract_candidate_snippets(
         pad_x_left  = x0_clip - x0
         pad_x_right = x1 - x1_clip
 
-        # Slice smoothed region
-        sub_cube  = sm_cube[k0_clip:k1_clip, y0_clip:y1_clip, x0_clip:x1_clip]
+        # Compute smoothed subcube only on the spatial cutout (reduces memory from >16GB to <10MB)
+        n_sm_frames = k1_clip - k0_clip
+        if n_sm_frames > 0:
+            raw_t0 = k0_clip
+            raw_t1 = k1_clip + w - 1
+            raw_cutout = cube[raw_t0:raw_t1, y0_clip:y1_clip, x0_clip:x1_clip].astype(np.float64, copy=False)
+            csum_cut = np.zeros((raw_cutout.shape[0] + 1, raw_cutout.shape[1], raw_cutout.shape[2]), dtype=np.float64)
+            csum_cut[1:] = np.cumsum(raw_cutout, axis=0)
+            sub_cube = (csum_cut[w : n_sm_frames + w] - csum_cut[:n_sm_frames]) / float(w)
+        else:
+            sub_cube = np.empty((0, y1_clip - y0_clip, x1_clip - x0_clip), dtype=np.float64)
+
         sub_times = sm_times[k0_clip:k1_clip]
 
         # Pad to fixed shapes
@@ -634,8 +630,8 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
     return t
 
 def save_periodicity_candidates_table(table: Table, csv_path: str, vot_path: str) -> None:
-    table.write(csv_path, format="csv", overwrite=True)
-    table.write(vot_path, format="votable", overwrite=True)
+    """Save periodicity candidates table to CSV and VOTable."""
+    save_candidates_table(table, csv_path, vot_path)
 
 
     
@@ -807,7 +803,7 @@ def save_candidate_lightcurves(
             for t, v, e in zip(times_sm, lc_sm, rms_sm):
                 f.write(f"{t:.9f} {v:.9e} {e:.9e}\n")
 
-    return out_full
+    return {"lc_full": out_full, "lc_boxcar": out_box}
 
  
 def save_candidate_summary(
@@ -835,6 +831,7 @@ def save_candidate_summary(
     var_highpass_cutoff_sec: float = 0.0,
     local_window_size: int = 64,
     rms_full: Optional[np.ndarray] = None,
+    mean_cube: Optional[np.ndarray] = None,
 ) -> Dict[str, str]:
     """
     Build a prepfold-like *single* candidate page:
@@ -979,10 +976,7 @@ def save_candidate_summary(
         meta_guess = parse_candidate_filename(out_prefix)  # use filename parser shipped in this module
         beam_lbl = meta_guess.get("beam", "") if isinstance(meta_guess, dict) else ""
         print(f"Looking for continuum FITS in '{continuum_dir}' with beam label '{beam_lbl}'...")
-        # try:
         fits_cands = sorted(glob.glob(os.path.join(continuum_dir, f"*{beam_lbl}*.fits")))
-        # if beam_lbl:
-        #     fits_cands = [p for p in fits_cands if beam_lbl in os.path.basename(p)]
         if len(fits_cands) == 0:
             fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits")))  # fallback: first available
         if len(fits_cands) > 0:
@@ -1009,8 +1003,6 @@ def save_candidate_summary(
             cont_wcs = c2d.wcs
             cont_vmin = np.nanpercentile(cont_im, 5.0)
             cont_vmax = np.nanpercentile(cont_im, 99.5)
-        # except Exception:
-        #     cont_im, cont_wcs = None, None
 
     # --- figure layout ---
     # Embed detection MJD in filenames to disambiguate multiple candidates
@@ -1048,11 +1040,11 @@ def save_candidate_summary(
             orientation="horizontal", fraction=0.046, pad=0.10
         )
         cb3.set_label("Flux density (mJy/beam)")
-        #cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Cont.")
     else:
         ax_cont = fig.add_subplot(gs[0, 0], projection=wcs_full)
-        mean_cube = np.mean(cube, axis=0)
+        if mean_cube is None:
+            mean_cube = np.mean(cube, axis=0)
         mean_vmin = np.nanpercentile(mean_cube, 5.0)
         mean_vmax = np.nanpercentile(mean_cube, 99.5)
         im_cont = ax_cont.imshow(mean_cube, origin="lower", cmap=cmap, vmin=mean_vmin, vmax=mean_vmax)
@@ -1068,7 +1060,6 @@ def save_candidate_summary(
             orientation="horizontal", fraction=0.046, pad=0.10
         )
         cb3.set_label("Flux density (mJy/beam)")
-        #cb3.set_label("Flux density (mJy/beam)")
         ax_cont.set_title("Mean cube (no cont.)")
 
     # Top-middle: full field (WCS)
@@ -1281,9 +1272,6 @@ def save_candidate_summary(
     # Frame metadata if present
     if getattr(wcs_cut.wcs, "radesys", None):
         hdr["RADESYS"] = wcs_cut.wcs.radesys
-    #if getattr(wcs2d.wcs, "equinox", None) is not None:
-    #    hdr["EQUINOX"] = wcs2d.wcs.equinox
-        
 
     # CTYPE/CUNIT/CRPIX/CRVAL are already provided by to_header(), so no need to duplicate.
     
@@ -1314,71 +1302,7 @@ def save_candidate_summary(
 
     return {"figure": out_fig, "fits_cutout": out_fits, "fits_fullframe": out_fits_full}
 
-    
-    # # --- Build the figure ---
-    # out_fig = f"{out_prefix}_lightcurves.png"
-    # fig = plt.figure(figsize=(10, 10), dpi=dpi)
 
-    # gs = GridSpec(
-    #     nrows=3, ncols=2, figure=fig,
-    #     height_ratios=[1.1, 1.0, 1.0],   # give images slightly more height
-    #     width_ratios=[1, 1],
-    # )
-
-    
-    
-    # # Top-left: WCS full frame
-    # ax_full = fig.add_subplot(gs[0,0], projection=wcs_full)
-    # im_full = ax_full.imshow(frame_for_display, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    # ax_full.plot([x], [y], marker=reticle(which='rt'), ms=32, color="white")
-    # ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
-    # ax_full.set_xlabel("Right Ascension (J2000)")
-    # ax_full.set_ylabel("Declination (J2000)")
-    # ax_full.set_title(f"Full image @ t={times[t_full_center]:.3f}s (idx {t_full_center})")
-    # cbar1 = fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.02)
-    # cbar1.set_label("Flux Density (mJy/beam)")
-    
-    # # Top-right: WCS cutout
-    # ax_cut = fig.add_subplot(gs[0,1], projection=wcs_cut)
-    # im_cut = ax_cut.imshow(snippet, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    # ax_cut.plot([min(half_sp, x - x0)], [min(half_sp, y - y0)], marker=reticle(which='rt'), ms=32, color="white")
-    # ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
-    # ax_cut.set_xlabel("Right Ascension (J2000)")
-    # ax_cut.set_ylabel("Declination (J2000)")
-    # ax_cut.set_title(f"Cutout")
-
-
-    # cbar2 = fig.colorbar(im_cut, ax=ax_cut, fraction=0.046, pad=0.02)
-    # cbar2.set_label("Flux density (mJy/beam)")    
-
-
-    # # Middle: full-res light curve
-    # ax_lc_full = fig.add_subplot(gs[1, :])  # spans full width below
-    # ax_lc_full.plot(times, lc_full, color="tab:blue", lw=1.6)
-    # ax_lc_full.axvline(times[t_full_center], color="white", ls="--", lw=1.0, label="Detection time")
-    # ax_lc_full.set_ylabel("Flux density (mJy/beam)")
-    # ax_lc_full.grid(True, alpha=0.3)
-    # ax_lc_full.legend(loc="best")
-
-    # # Bottom: boxcar-smoothed light curve
-    # ax_lc_box = fig.add_subplot(gs[2, :])
-    # if T_eff > 0:
-    #     ax_lc_box.plot(times_sm, lc_sm, color="tab:green", lw=1.6)
-    #     ax_lc_box.axvline(times_sm[k_center], color="white", ls="--", lw=1.0, label=f"Smoothed center (w={w})")
-    #     ax_lc_box.legend(loc="best")
-    # else:
-    #     ax_lc_box.text(0.5, 0.5, f"Width {w} > T; no smoothed LC",
-    #                    transform=ax_lc_box.transAxes, ha="center", va="center", color="white")
-    # ax_lc_box.set_xlabel("Time (s)")
-    # ax_lc_box.set_ylabel(f"Flux density - boxcar mean, w={w} (mJy/beam)")
-    # ax_lc_box.grid(True, alpha=0.3)
-
-    # #fig.subplots_adjust(left=0.08, right=0.98, top=0.94, bottom=0.08, wspace=0.22, hspace=0.35)
-    # fig.savefig(out_fig, bbox_inches="tight")
-    # plt.close(fig)
-
-    # return {"lc_full": out_full, "lc_boxcar": out_box, "figure": out_fig}
-    
 def save_candidate_snippet_products(snippet_rec: dict,
                                     out_prefix: str,
                                     *,
@@ -1482,59 +1406,6 @@ def save_candidate_snippet_products(snippet_rec: dict,
     anim.save(out_gif, writer=PillowWriter(fps=gif_fps))
     plt.close(fig)
 
-    # # 2) Static PNG at detection frame + light curve
-    # fig2 = plt.figure(figsize=(10, 10), dpi=dpi)
-    # gs = GridSpec(
-    #     nrows=3, ncols=2, figure=fig,
-    #     height_ratios=[1.0, 1.0, 1.0],   # give images slightly more height
-    #     width_ratios=[1, 1],
-    # )
-    
-    # # Top: WCSAxes image
-    # ax_img = fig2.add_subplot(gs[0:2, :], projection=wcs2d)
-    # im2 = ax_img.imshow(det_frame, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    # ax_img.coords.grid(True, color="white", alpha=0.3, ls=":")
-    # ax_img.set_xlabel("Right Ascension (J2000)")
-    # ax_img.set_ylabel("Declination (J2000)")
-    # ax_img.plot([x_center], [y_center], marker=reticle(which='rt'), ms=32, color="white")
-    # cb = fig2.colorbar(im2, ax=ax_img, fraction=0.046, pad=0.04)
-    # cb.set_label("Intensity (arb. units)")
-    # # Title with RA/Dec, SNR if available
-    # ra_hms = cand.get("ra_hms", None)
-    # dec_dms = cand.get("dec_dms", None)
-    # title_txt = "Candidate frame"
-    # if ra_hms and dec_dms:
-    #     title_txt += f"  |  RA={ra_hms}  Dec={dec_dms}"
-    # ax_img.set_title(title_txt)
-
-    # # Bottom: light curve of detection pixel
-    # ax_lc = fig2.add_subplot(gs[2, :])
-    # lc = cube[:, y_center, x_center]
-    # # Mask NaNs from pad zones
-    # good = np.isfinite(times) & np.isfinite(lc)
-    # ax_lc.plot(times[good], lc[good], color="tab:blue", lw=1.5)
-    # # Mark the detection center time
-    # t0 = times[t_center] if np.isfinite(times[t_center]) else np.nan
-
-    # print(cand)
-    # try:
-    #     tline = cand.get("time_center_peak", cand["time_center"])
-    #     ax_lc.axvline(tline, color="white", ls="--", lw=1.0, label="Candidate peak")
-
-    # except KeyError:
-    #     print("time_center not found")
-        
-    # # if np.isfinite(t0):
-    # #     ax_lc.axvline(t0, color="white", ls="--", lw=1.0, label="Detection time")
-    # #     ax_lc.legend(loc="best")
-    # ax_lc.set_xlabel("Time (s)")
-    # ax_lc.set_ylabel("Peak flux density (mJy/beam)")
-    # ax_lc.grid(True, alpha=0.3)
-
-    # fig2.savefig(out_png, bbox_inches="tight")
-    # plt.close(fig2)
-    #, "png": out_png}
-
     return {"gif": out_gif}
 
 
@@ -1634,13 +1505,14 @@ def _load_racs_votable(racs_vot_path: str) -> Table:
     """
     t = Table.read(racs_vot_path, format="votable")
     # Choose ID column
-    id_col = "Name" #  Source_ID" if "Source_ID" in t.colnames else ("Gaussian_ID" if "Gaussian_ID" in t.colnames else None)
-    # if id_col is None:
-    #     id_col = "ID" if "ID" in t.colnames else None
-    # if id_col is None:
-    #     id_col = "name" if "name" in t.colnames else None
-    # if id_col is None:
-    #     raise ValueError("Could not find an identifier column in RACS VOTable (e.g. 'Source_ID' or 'Gaussian_ID').")
+    id_col = "Name"
+    if id_col not in t.colnames:
+        for c in ("Source_ID", "Gaussian_ID", "ID", "name"):
+            if c in t.colnames:
+                id_col = c
+                break
+        else:
+            raise ValueError("Could not find an identifier column in RACS VOTable (e.g. 'Name', 'Source_ID' or 'Gaussian_ID').")
 
     # Coordinates
     if not (("RA" in t.colnames) and ("Dec" in t.colnames)):
@@ -1731,9 +1603,9 @@ def parse_candidate_filename(path: str, *, require: str | None = None) -> dict:
         info["is_all"] = True
 
     if require == "super" and not info["is_super"]:
-        return {k: (False if isinstance(v, bool) else "") for k, v in info.items()}
+        return {k: (False if isinstance(v, bool) else (0.0 if isinstance(v, (int, float)) else "")) for k, v in info.items()}
     if require == "all" and not info["is_all"]:
-        return {k: (False if isinstance(v, bool) else "") for k, v in info.items()}
+        return {k: (False if isinstance(v, bool) else (0.0 if isinstance(v, (int, float)) else "")) for k, v in info.items()}
     return info
 
 def _connected_components_from_pairs(n: int, i_idx, j_idx) -> List[List[int]]:
@@ -2269,7 +2141,7 @@ def aggregate_beam_candidate_tables(
             except Exception:
                 pass
         if not scan_id:
-            scan_id = 1
+            scan_id = "1"
         if field_name and sbid and scan_id:
             out_csv = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.csv")
             out_vot = os.path.join(out_dir, f"{field_name}.{sbid}_{scan_id}_{kind}_summary.vot")
@@ -2304,9 +2176,9 @@ def aggregate_beam_candidate_tables(
                 try:
                     d["dm"] = float(getattr(row_dm, "value", row_dm))
                 except Exception:
-                    d["dm"] = float(file_dm if file_dm is not None else 0.0)
+                    d["dm"] = float(file_dm if (file_dm not in (None, "", "nan")) else 0.0)
             else:
-                d["dm"] = float(file_dm if file_dm is not None else 0.0)
+                d["dm"] = float(file_dm if (file_dm not in (None, "", "nan")) else 0.0)
             row_scan = str(r.get("scan_id", "")).strip()
             if scan_id and len(str(scan_id)) == 14:
                 d["scan_id"] = str(scan_id)
@@ -2324,7 +2196,7 @@ def aggregate_beam_candidate_tables(
                 else:
                     d["scan_id"] = row_scan
             else:
-                d["scan_id"] = 1
+                d["scan_id"] = "1"
             rows.append(d)
 
     # Empty case
@@ -2507,11 +2379,6 @@ def aggregate_beam_candidate_tables(
             else:
                 ws_best = _split_list_int(best.get("width_samples",""))
                 row["max_snr_width"] = (ws_best[0] if len(ws_best) == 1 else -1)            
-        else:
-            #beams_best = _split_list_str(best.get("beam_ids",""))
-            #row["max_snr_beam"] = (beams_best[0] if len(beams_best) == 1 else "")
-            pass
-
         super_rows.append(row)
 
         # Thin out candidate events per source for event_tab
@@ -2607,8 +2474,6 @@ def aggregate_observation(
         out_dir = obs_root
     os.makedirs(out_dir, exist_ok=True)
 
-    # out_csv = os.path.join(out_dir, f"field_{kind}_summary.csv")
-    # out_vot = os.path.join(out_dir, f"field_{kind}_summary.vot")
     print(f"[Aggregate] Found {len(files)} '{kind}' tables under '{obs_root}'")
 
     return aggregate_beam_candidate_tables(
@@ -2618,8 +2483,6 @@ def aggregate_observation(
         sky_tol_arcsec=sky_tol_arcsec,
         out_dir=out_dir,
         max_n_candidates_per_source=max_n_candidates_per_source,
-        # out_csv=out_csv,
-        # out_vot=out_vot,
     )
 
 
@@ -2788,6 +2651,7 @@ def annotate_observation_with_catalogs(
 
     # Iterate candidates
     for i in range(len(out_tab)):
+        tcoord = cand_coord[i]
         # PSRCAT first
         if idx_psr is not None and sep_psr[i] <= radius:
             j = int(idx_psr[i])
@@ -3311,7 +3175,7 @@ def aggregate_observation_from_super_summaries(
             if m_path_scan:
                 f_scan = m_path_scan.group(1)
             else:
-                f_scan = f_scan or 1
+                f_scan = f_scan or "1"
         f_kind = meta['kind']
         if f_kind != kind:
             continue
@@ -3341,9 +3205,9 @@ def aggregate_observation_from_super_summaries(
                 try:
                     d["dm"] = float(getattr(row_dm, "value", row_dm))
                 except Exception:
-                    d["dm"] = float(meta_dm if meta_dm is not None else 0.0)
+                    d["dm"] = float(meta_dm if (meta_dm not in (None, "", "nan")) else 0.0)
             else:
-                d["dm"] = float(meta_dm if meta_dm is not None else 0.0)
+                d["dm"] = float(meta_dm if (meta_dm not in (None, "", "nan")) else 0.0)
             r_scan = str(r.get("scan_id", "")).strip() if "scan_id" in tab.colnames else ""
             if len(str(f_scan)) == 14:
                 d["scan_id"] = str(f_scan)
@@ -3354,7 +3218,7 @@ def aggregate_observation_from_super_summaries(
             elif r_scan:
                 d["scan_id"] = r_scan
             else:
-                d["scan_id"] = 1
+                d["scan_id"] = "1"
             rows.append(d)
 
     if len(rows) == 0:
