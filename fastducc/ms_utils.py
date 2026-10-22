@@ -166,18 +166,6 @@ def get_time(t):
     nsub = unique_times.shape[0]
     return nsub, vis_time, unique_times
 
-def get_uvwave_indices(t, channel_lambdas, uvcell_size, N_pixels):    
-    #  get the uv positions (in lambdas) for each visibility sample
-    uvws = t.getcol('UVW') # in units of metres
-    #populate uvw_l grid
-    uvws_l = np.ones((uvws.shape[0], uvws.shape[1], len(channel_lambdas))) * uvws[:, :, None]
-    # duplicate each uv sample into a size such that we can multiply with the channel lambdas    
-    #uvs_l = uvws_l[:, :2, :]        # gets rid of w axis. DONT FORGET: need to do w-projection! can't just ignore the w axis like im doing here
-    
-    chan_tiled = np.ones_like(uvws_l)*channel_lambdas[None, None, :] # arrange and repeat the channel lambdas in an array shape such that we can multiply it onto the uv samples
-    
-    uvws_l = uvws_l / chan_tiled    # get the uvw positions in lambdas
-
 
 def get_phase_center(msname: str, field_name: str | None = None):
     """
@@ -225,16 +213,6 @@ def get_timebin(t_main, time_col: str) -> float:
         else:
             timebin = 1.0
     return timebin
-
-
-def open_ms(msname: str):
-    t_main = table(msname, readonly=True)
-    colnames = set(t_main.colnames())
-    time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
-    # Use get_unique_times helper to avoid loading full time column in Python
-    unique_times, _ = get_unique_times(msname, time_col)
-    total_chunks = len(unique_times)
-    return t_main, total_chunks, time_col
 
 
 def derive_paths(msname: str):
