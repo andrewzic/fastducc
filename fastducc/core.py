@@ -343,6 +343,352 @@ def consolidate_catalogues(cfg: Config):
 
 
 
+def _load_plot_only_candidates(
+    candidates_dir: str,
+    root_path: str,
+    ms_base: str,
+    scan_suffix: str,
+    dm_suffix: str,
+    search_type: str,
+) -> list[dict]:
+    """Load candidates for plot-only mode from VOTables."""
+    vot_path = f"{root_path}_candidates.vot"
+    if os.path.exists(vot_path):
+        return candidates.astropy_table_to_candidates(vot_path)
+
+    vot_path = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_{search_type}_all.vot")
+    if not os.path.exists(vot_path):
+        vot_path = os.path.join(candidates_dir, f"{ms_base}_{search_type}_all.vot")
+
+    if os.path.exists(vot_path):
+        return candidates.astropy_table_to_candidates(vot_path)
+
+    print(f"[Warning] No candidates found for plotting: no vot files at {root_path}_candidates.vot or {vot_path}")
+    return []
+
+
+def _export_variance_chunk_products(
+    cfg: Config,
+    times: np.ndarray,
+    cube: np.ndarray,
+    std_map_partial: np.ndarray,
+    annotated_var: list[dict],
+    var_root: str,
+):
+    """Generate lightcurves, summary plots, and snippets for chunk variance candidates."""
+    for i, cand in enumerate(annotated_var):
+        srcname = cand["srcname"]
+        if cfg.save_var_lightcurves:
+            if times[0] <= cand["time_center"] <= times[-1]:
+                rms_full = candidates.compute_candidate_local_rms(
+                    cube, cand, window_size=cfg.local_window_size,
+                    clip_sigma=cfg.rms_clip_sigma,
+                )
+                candidates.save_candidate_lightcurves(
+                    times, cube, cand,
+                    out_prefix=f"{var_root}_cand_{srcname}_lc",
+                    save_format="npz",
+                    rms_full=rms_full,
+                )
+                _ = candidates.save_candidate_summary(
+                    times=times, cube=cube, candidate=cand,
+                    out_prefix=f"{var_root}_cand_{srcname}",
+                    spatial_size=50,
+                    center_policy="right", cmap="viridis", dpi=300,
+                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                    ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
+                    pix_rad=cfg.pix_rad,
+                    ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
+                    std_map=std_map_partial, use_std_images=True,
+                    continuum_dir=cfg.continuum_dir,
+                    method="variance",
+                    var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
+                    rms_full=rms_full,
+                )
+            else:
+                print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
+        if cfg.save_var_snippets:
+            std_snip = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
+            candidates.save_candidate_snippet_products(
+                snippet_rec=std_snip,
+                out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
+                pixscale_rad=cfg.pix_rad,
+                ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
+                ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
+            )
+
+
+def _export_boxcar_chunk_products(
+    cfg: Config,
+    times: np.ndarray,
+    cube: np.ndarray,
+    annotated: list[dict],
+    box_root: str,
+):
+    """Generate lightcurves, summary plots, and snippets for chunk boxcar candidates."""
+    for i, cand in enumerate(annotated):
+        srcname = cand["srcname"]
+        w = max(1, int(cand.get("width_samples", 1)))
+        if times[0] <= cand["time_center"] <= times[-1]:
+            if cfg.save_box_lightcurves:
+                rms_full = candidates.compute_candidate_local_rms(
+                    cube, cand, window_size=cfg.local_window_size,
+                    clip_sigma=cfg.rms_clip_sigma,
+                )
+                candidates.save_candidate_lightcurves(
+                    times, cube, cand,
+                    out_prefix=f"{box_root}_cand_{srcname}_w{w}_lc",
+                    save_format="npz",
+                    rms_full=rms_full,
+                )
+                _ = candidates.save_candidate_summary(
+                    times=times, cube=cube, candidate=cand,
+                    out_prefix=f"{box_root}_cand_{srcname}_w{w}",
+                    spatial_size=50,
+                    center_policy="right", cmap="viridis", dpi=180,
+                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                    ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
+                    pix_rad=cfg.pix_rad,
+                    ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
+                    std_map=None, use_std_images=False,
+                    continuum_dir=cfg.continuum_dir,
+                    method="boxcar",
+                    rms_full=rms_full,
+                )
+            if cfg.save_box_snippets:
+                snippets = candidates.extract_candidate_snippets(
+                    times, cube, [cand],
+                    spatial_size=50, time_factor=50,
+                    pad_mode="constant", pad_value=0.0,
+                    return_indices=True, center_policy="right"
+                )
+                snip = snippets[0]
+                candidates.save_candidate_snippet_products(
+                    snippet_rec=snip,
+                    out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
+                    pixscale_rad=cfg.pix_rad,
+                    ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
+                    ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=6, dpi=180
+                )
+        else:
+            print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
+
+
+def _process_variance_chunk_dm(
+    cfg: Config,
+    times: np.ndarray,
+    cube: np.ndarray,
+    dm_val: float,
+    chunk_root: str,
+    scan_id_str: str,
+    candidates_dir: str,
+    ms_base: str,
+    scan_suffix: str,
+    dm_suffix: str,
+    racs_coords,
+    psrcat_coords,
+    dm0_var_cands: list[dict],
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], list[dict]]:
+    """Process variance detection and Welford accumulation for a single trial DM on a chunk."""
+    Ny, Nx = cfg.npix_y, cfg.npix_x
+    do_highpass = cfg.var_highpass_cutoff_sec > 0
+    alphas = np.zeros(len(times), dtype=np.float64)
+    if do_highpass:
+        ema_mean = np.nanmean(cube, axis=0, dtype=np.float64)
+        last_t = np.nan
+        dt_median = np.median(np.diff(times)) if len(times) > 1 else 0.0
+        for i, t in enumerate(times):
+            if np.isnan(last_t):
+                alphas[i] = 1.0 - np.exp(-dt_median / cfg.var_highpass_cutoff_sec)
+            else:
+                dt_step = max(0.0, t - last_t)
+                alphas[i] = 1.0 - np.exp(-dt_step / cfg.var_highpass_cutoff_sec)
+            last_t = t
+    else:
+        ema_mean = np.full((Ny, Nx), np.nan, dtype=np.float64)
+
+    c_dm = np.zeros((Ny, Nx), dtype=np.int64)
+    m_dm = np.zeros((Ny, Nx), dtype=np.float64)
+    M2_dm = np.zeros((Ny, Nx), dtype=np.float64)
+    kernels.welford_update_cube(c_dm, m_dm, M2_dm, ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
+
+    annotated_var: list[dict] = []
+    if cfg.enable_var_chunk:
+        var_root = chunk_root + "_var"
+        std_map_partial = kernels.welford_finalise_std(c_dm, M2_dm, ddof=1)
+        if cfg.do_var_search:
+            var_dets, snr_img = detection.variance_search_welford(
+                std_map_partial,
+                threshold_sigma=cfg.var_threshold,
+                return_snr_image=True,
+                keep_top_k=cfg.var_keep_k,
+                valid_mask=None,
+                spatial_estimator="clipped_rms",
+                clip_sigma=cfg.rms_clip_sigma,
+                subtract_mean_of_std_map=True,
+                use_local_threshold=cfg.use_local_threshold,
+                local_window_size=cfg.local_window_size,
+                dm=dm_val,
+            )
+            if len(var_dets) > 0:
+                var_nms = filters.nms_snr_map_2d(
+                    snr_2d=snr_img, base_detections=var_dets,
+                    threshold_sigma=cfg.var_threshold,
+                    spatial_radius=cfg.nms_radius,
+                    valid_mask=None,
+                    times=times, cube=cube, time_tag_policy="peak_absdev"
+                )
+                annotated_var = ducc_wcs.annotate_candidates_with_sky_coords(
+                    msname=cfg.msname, final_detections=var_nms,
+                    npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                    pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
+                    flip_u=True, flip_v=True, field_name=None
+                )
+                for cand in annotated_var:
+                    cand["scan_id"] = scan_id_str
+                    cand["dm"] = dm_val
+                    if "ra_deg" not in cand and "ra_rad" in cand:
+                        cand["ra_deg"] = float(np.degrees(cand["ra_rad"]))
+                    if "dec_deg" not in cand and "dec_rad" in cand:
+                        cand["dec_deg"] = float(np.degrees(cand["dec_rad"]))
+
+                # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
+                if dm_val == 0.0:
+                    dm0_var_cands = [dict(c) for c in annotated_var]
+                elif cfg.filter_ips_agn and len(dm0_var_cands) > 0 and (racs_coords is not None):
+                    annotated_var = filters.filter_ips_agn_candidates(
+                        annotated_var, dm0_var_cands, racs_coords, psrcat_coords,
+                        ips_thresh=cfg.ips_snr_ratio_threshold,
+                        ips_radius_arcsec=cfg.ips_match_radius_arcsec,
+                    )
+
+                t_var = candidates.candidates_to_astropy_table(annotated_var)
+                candidates.save_candidates_table(
+                    t_var,
+                    csv_path=f"{var_root}_candidates.csv",
+                    vot_path=f"{var_root}_candidates.vot"
+                )
+        elif cfg.plot_cands_only:
+            annotated_var = _load_plot_only_candidates(
+                candidates_dir=candidates_dir,
+                root_path=var_root,
+                ms_base=ms_base,
+                scan_suffix=scan_suffix,
+                dm_suffix=dm_suffix,
+                search_type="variance",
+            )
+
+        _export_variance_chunk_products(
+            cfg=cfg,
+            times=times,
+            cube=cube,
+            std_map_partial=std_map_partial,
+            annotated_var=annotated_var,
+            var_root=var_root,
+        )
+
+    return (c_dm, m_dm, M2_dm), annotated_var
+
+
+def _process_boxcar_chunk_dm(
+    cfg: Config,
+    times: np.ndarray,
+    cube: np.ndarray,
+    dm_val: float,
+    chunk_root: str,
+    scan_id_str: str,
+    candidates_dir: str,
+    ms_base: str,
+    scan_suffix: str,
+    dm_suffix: str,
+    racs_coords,
+    psrcat_coords,
+    dm0_box_cands: list[dict],
+) -> list[dict]:
+    """Process boxcar detection for a single trial DM on a chunk."""
+    box_root = chunk_root + "_boxcar"
+    annotated: list[dict] = []
+    if cfg.do_boxcar_search:
+        dets, snr_cubes = detection.boxcar_search_time(
+            times, cube,
+            widths=cfg.boxcar_widths,
+            widths_in_seconds=False,
+            threshold_sigma=cfg.boxcar_threshold,
+            return_snr_cubes=True,
+            keep_top_k=50,
+            std_mode="spatial_per_window",
+            subtract_mean_per_pixel=True,
+            use_local_threshold=cfg.use_local_threshold,
+            local_window_size=cfg.local_window_size,
+            dm=dm_val,
+        )
+        dets_by_w = filters.nms_snr_maps_per_width(
+            snr_cubes, times,
+            threshold_sigma=cfg.boxcar_threshold,
+            spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None,
+            cube=cube
+        )
+        final_dets = filters.group_filter_across_widths(
+            dets_by_w, times,
+            spatial_radius=cfg.nms_radius,
+            time_radius=8,
+            policy="max_snr",
+            max_per_time_group=1,
+            ny_nx=(cube.shape[1], cube.shape[2]),
+            cube=cube
+        )
+        if len(final_dets) > 0:
+            annotated = ducc_wcs.annotate_candidates_with_sky_coords(
+                msname=cfg.msname, final_detections=final_dets,
+                npix_x=cfg.npix_x, npix_y=cfg.npix_y,
+                pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
+                flip_u=True, flip_v=True, field_name=None
+            )
+            for cand in annotated:
+                cand["scan_id"] = scan_id_str
+                cand["dm"] = dm_val
+                if "ra_deg" not in cand and "ra_rad" in cand:
+                    cand["ra_deg"] = float(np.degrees(cand["ra_rad"]))
+                if "dec_deg" not in cand and "dec_rad" in cand:
+                    cand["dec_deg"] = float(np.degrees(cand["dec_rad"]))
+
+            # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
+            if dm_val == 0.0:
+                dm0_box_cands = [dict(c) for c in annotated]
+            elif cfg.filter_ips_agn and len(dm0_box_cands) > 0 and (racs_coords is not None):
+                annotated = filters.filter_ips_agn_candidates(
+                    annotated, dm0_box_cands, racs_coords, psrcat_coords,
+                    ips_thresh=cfg.ips_snr_ratio_threshold,
+                    ips_radius_arcsec=cfg.ips_match_radius_arcsec,
+                )
+
+            t_box = candidates.candidates_to_astropy_table(annotated)
+            candidates.save_candidates_table(
+                t_box,
+                csv_path=f"{box_root}_candidates.csv",
+                vot_path=f"{box_root}_candidates.vot"
+            )
+    elif cfg.plot_cands_only:
+        annotated = _load_plot_only_candidates(
+            candidates_dir=candidates_dir,
+            root_path=box_root,
+            ms_base=ms_base,
+            scan_suffix=scan_suffix,
+            dm_suffix=dm_suffix,
+            search_type="boxcar",
+        )
+
+    _export_boxcar_chunk_products(
+        cfg=cfg,
+        times=times,
+        cube=cube,
+        annotated=annotated,
+        box_root=box_root,
+    )
+
+    return annotated
+
+
 def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int, scan_id_str: str = "", chunk_times: np.ndarray | None = None):
     """
     Worker task: load the chunk data from MS once, loop over trial DMs in memory,
@@ -362,10 +708,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
         data_column=cfg.data_column,
     )
 
-    Ny, Nx = cfg.npix_y, cfg.npix_x
     welford_by_dm = {}
     cube_dm0 = None
-
     scan_suffix = f"_scan_{scan_id_str}" if scan_id_str else ""
 
     # Tracking candidates at DM=0 for (RACS - PSRCAT) IPS suppression
@@ -415,271 +759,49 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
         # 1. Variance search: on each trial DM (if cfg.enable_var)
         # ---------------------------------------------------------------------
         if cfg.enable_var:
-            do_highpass = cfg.var_highpass_cutoff_sec > 0
-            alphas = np.zeros(len(times), dtype=np.float64)
-            if do_highpass:
-                ema_mean = np.nanmean(cube, axis=0, dtype=np.float64)
-                last_t = np.nan
-                dt_median = np.median(np.diff(times)) if len(times) > 1 else 0.0
-                for i, t in enumerate(times):
-                    if np.isnan(last_t):
-                        alphas[i] = 1.0 - np.exp(-dt_median / cfg.var_highpass_cutoff_sec)
-                    else:
-                        dt_step = max(0.0, t - last_t)
-                        alphas[i] = 1.0 - np.exp(-dt_step / cfg.var_highpass_cutoff_sec)
-                    last_t = t
-            else:
-                ema_mean = np.full((Ny, Nx), np.nan, dtype=np.float64)
-
-            c_dm = np.zeros((Ny, Nx), dtype=np.int64)
-            m_dm = np.zeros((Ny, Nx), dtype=np.float64)
-            M2_dm = np.zeros((Ny, Nx), dtype=np.float64)
-            kernels.welford_update_cube(c_dm, m_dm, M2_dm, ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
-            welford_by_dm[dm_val] = (c_dm, m_dm, M2_dm)
+            welford_agg, var_cands = _process_variance_chunk_dm(
+                cfg=cfg,
+                times=times,
+                cube=cube,
+                dm_val=dm_val,
+                chunk_root=chunk_root,
+                scan_id_str=scan_id_str,
+                candidates_dir=candidates_dir,
+                ms_base=ms_base,
+                scan_suffix=scan_suffix,
+                dm_suffix=dm_suffix,
+                racs_coords=racs_coords,
+                psrcat_coords=psrcat_coords,
+                dm0_var_cands=dm0_var_cands,
+            )
+            welford_by_dm[dm_val] = welford_agg
+            if dm_val == 0.0:
+                dm0_var_cands = var_cands
 
             if (dm_val == 0.0 or cube_dm0 is None) and cfg.save_full_var_lightcurves:
                 cube_dm0 = cube.copy()
-
-            if cfg.enable_var_chunk:
-                var_root = chunk_root + "_var"
-                std_map_partial = kernels.welford_finalise_std(c_dm, M2_dm, ddof=1)
-                annotated_var = []
-                if cfg.do_var_search:
-                    var_dets, snr_img = detection.variance_search_welford(
-                        std_map_partial,
-                        threshold_sigma=cfg.var_threshold,
-                        return_snr_image=True,
-                        keep_top_k=cfg.var_keep_k,
-                        valid_mask=None,
-                        spatial_estimator="clipped_rms",
-                        clip_sigma=cfg.rms_clip_sigma,
-                        subtract_mean_of_std_map=True,
-                        use_local_threshold=cfg.use_local_threshold,
-                        local_window_size=cfg.local_window_size,
-                        dm=dm_val,
-                    )
-                    if len(var_dets) > 0:
-                        var_nms = filters.nms_snr_map_2d(
-                            snr_2d=snr_img, base_detections=var_dets,
-                            threshold_sigma=cfg.var_threshold,
-                            spatial_radius=cfg.nms_radius,
-                            valid_mask=None,
-                            times=times, cube=cube, time_tag_policy="peak_absdev"
-                        )
-                        annotated_var = ducc_wcs.annotate_candidates_with_sky_coords(
-                            msname=cfg.msname, final_detections=var_nms,
-                            npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                            pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
-                            flip_u=True, flip_v=True, field_name=None
-                        )
-                        for cand in annotated_var:
-                            cand["scan_id"] = scan_id_str
-                            cand["dm"] = dm_val
-                            if "ra_deg" not in cand and "ra_rad" in cand:
-                                cand["ra_deg"] = float(np.degrees(cand["ra_rad"]))
-                            if "dec_deg" not in cand and "dec_rad" in cand:
-                                cand["dec_deg"] = float(np.degrees(cand["dec_rad"]))
-
-                        # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
-                        if dm_val == 0.0:
-                            dm0_var_cands = [dict(c) for c in annotated_var]
-                        elif cfg.filter_ips_agn and len(dm0_var_cands) > 0 and (racs_coords is not None):
-                            annotated_var = filters.filter_ips_agn_candidates(
-                                annotated_var, dm0_var_cands, racs_coords, psrcat_coords,
-                                ips_thresh=cfg.ips_snr_ratio_threshold,
-                                ips_radius_arcsec=cfg.ips_match_radius_arcsec,
-                            )
-
-                        t_var = candidates.candidates_to_astropy_table(annotated_var)
-                        candidates.save_candidates_table(
-                            t_var,
-                            csv_path=f"{var_root}_candidates.csv",
-                            vot_path=f"{var_root}_candidates.vot"
-                        )
-                elif cfg.plot_cands_only:
-                    vot_path = f"{var_root}_candidates.vot"
-                    if os.path.exists(vot_path):
-                        annotated_var = candidates.astropy_table_to_candidates(vot_path)
-                    else:
-                        vot_path = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_variance_all.vot")
-                        if not os.path.exists(vot_path):
-                            vot_path = os.path.join(candidates_dir, f"{ms_base}_variance_all.vot")
-                        if os.path.exists(vot_path):
-                            annotated_var = candidates.astropy_table_to_candidates(vot_path)
-                        else:
-                            annotated_var = []
-                            print(f"[Warning] No candidates found for plotting: no vot files at {var_root}_candidates.vot or {vot_path}")
-
-                for i, cand in enumerate(annotated_var):
-                    srcname = cand["srcname"]
-                    if cfg.save_var_lightcurves:
-                        if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
-                            rms_full = candidates.compute_candidate_local_rms(
-                                cube, cand, window_size=cfg.local_window_size,
-                                clip_sigma=cfg.rms_clip_sigma,
-                            )
-                            candidates.save_candidate_lightcurves(
-                                times, cube, cand,
-                                out_prefix=f"{var_root}_cand_{srcname}_lc",
-                                save_format="npz",
-                                rms_full=rms_full,
-                            )
-                            _ = candidates.save_candidate_summary(
-                                times=times, cube=cube, candidate=cand,
-                                out_prefix=f"{var_root}_cand_{srcname}",
-                                spatial_size=50,
-                                center_policy="right", cmap="viridis", dpi=300,
-                                npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                                ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
-                                pix_rad=cfg.pix_rad,
-                                ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                                std_map=std_map_partial, use_std_images=True,
-                                continuum_dir=cfg.continuum_dir,
-                                method="variance",
-                                var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
-                                rms_full=rms_full,
-                            )
-                        else:
-                            print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
-                    if cfg.save_var_snippets:
-                        std_snip = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
-                        candidates.save_candidate_snippet_products(
-                            snippet_rec=std_snip,
-                            out_prefix=f"{var_root}_cand_{srcname}_{i:03d}_snip",
-                            pixscale_rad=cfg.pix_rad,
-                            ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                            ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
-                        )
 
         # ---------------------------------------------------------------------
         # 2. Boxcar search: applied to ALL DMs (if cfg.enable_boxcar)
         # ---------------------------------------------------------------------
         if cfg.enable_boxcar:
-            box_root = chunk_root + "_boxcar"
-            if cfg.do_boxcar_search:
-                dets, snr_cubes = detection.boxcar_search_time(
-                    times, cube,
-                    widths=cfg.boxcar_widths,
-                    widths_in_seconds=False,
-                    threshold_sigma=cfg.boxcar_threshold,
-                    return_snr_cubes=True,
-                    keep_top_k=50,
-                    std_mode="spatial_per_window",
-                    subtract_mean_per_pixel=True,
-                    use_local_threshold=cfg.use_local_threshold,
-                    local_window_size=cfg.local_window_size,
-                    dm=dm_val,
-                )
-                dets_by_w = filters.nms_snr_maps_per_width(
-                    snr_cubes, times,
-                    threshold_sigma=cfg.boxcar_threshold,
-                    spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None,
-                    cube=cube
-                )
-                final_dets = filters.group_filter_across_widths(
-                    dets_by_w, times,
-                    spatial_radius=cfg.nms_radius,
-                    time_radius=8,
-                    policy="max_snr",
-                    max_per_time_group=1,
-                    ny_nx=(cube.shape[1], cube.shape[2]),
-                    cube=cube
-                )
-                if len(final_dets) > 0:
-                    annotated = ducc_wcs.annotate_candidates_with_sky_coords(
-                        msname=cfg.msname, final_detections=final_dets,
-                        npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                        pixsize_x=cfg.pix_rad, pixsize_y=cfg.pix_rad,
-                        flip_u=True, flip_v=True, field_name=None
-                    )
-                    for cand in annotated:
-                        cand["scan_id"] = scan_id_str
-                        cand["dm"] = dm_val
-                        if "ra_deg" not in cand and "ra_rad" in cand:
-                            cand["ra_deg"] = float(np.degrees(cand["ra_rad"]))
-                        if "dec_deg" not in cand and "dec_rad" in cand:
-                            cand["dec_deg"] = float(np.degrees(cand["dec_rad"]))
-
-                    # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
-                    if dm_val == 0.0:
-                        dm0_box_cands = [dict(c) for c in annotated]
-                    elif cfg.filter_ips_agn and len(dm0_box_cands) > 0 and (racs_coords is not None):
-                        annotated = filters.filter_ips_agn_candidates(
-                            annotated, dm0_box_cands, racs_coords, psrcat_coords,
-                            ips_thresh=cfg.ips_snr_ratio_threshold,
-                            ips_radius_arcsec=cfg.ips_match_radius_arcsec,
-                        )
-
-                    t_box = candidates.candidates_to_astropy_table(annotated)
-                    candidates.save_candidates_table(
-                        t_box,
-                        csv_path=f"{box_root}_candidates.csv",
-                        vot_path=f"{box_root}_candidates.vot"
-                    )
-                else:
-                    annotated = []
-            elif cfg.plot_cands_only:
-                vot_path = f"{box_root}_candidates.vot"
-                if os.path.exists(vot_path):
-                    annotated = candidates.astropy_table_to_candidates(vot_path)
-                else:
-                    vot_path = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_boxcar_all.vot")
-                    if not os.path.exists(vot_path):
-                        vot_path = os.path.join(candidates_dir, f"{ms_base}_boxcar_all.vot")
-                    if os.path.exists(vot_path):
-                        annotated = candidates.astropy_table_to_candidates(vot_path)
-                    else:
-                        annotated = []
-                        print(f"[Warning] No candidates found for plotting: no vot files at {box_root}_candidates.vot or {vot_path}")
-            else:
-                annotated = []
-
-            for i, cand in enumerate(annotated):
-                srcname = cand["srcname"]
-                w = max(1, int(cand.get("width_samples", 1)))
-                if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
-                    if cfg.save_box_lightcurves:
-                        rms_full = candidates.compute_candidate_local_rms(
-                            cube, cand, window_size=cfg.local_window_size,
-                            clip_sigma=cfg.rms_clip_sigma,
-                        )
-                        candidates.save_candidate_lightcurves(
-                            times, cube, cand,
-                            out_prefix=f"{box_root}_cand_{srcname}_w{w}_lc",
-                            save_format="npz",
-                            rms_full=rms_full,
-                        )
-                        _ = candidates.save_candidate_summary(
-                            times=times, cube=cube, candidate=cand,
-                            out_prefix=f"{box_root}_cand_{srcname}_w{w}",
-                            spatial_size=50,
-                            center_policy="right", cmap="viridis", dpi=180,
-                            npix_x=cfg.npix_x, npix_y=cfg.npix_y,
-                            ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
-                            pix_rad=cfg.pix_rad,
-                            ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
-                            std_map=None, use_std_images=False,
-                            continuum_dir=cfg.continuum_dir,
-                            method="boxcar",
-                            rms_full=rms_full,
-                        )
-                    if cfg.save_box_snippets:
-                        snippets = candidates.extract_candidate_snippets(
-                            times, cube, [cand],
-                            spatial_size=50, time_factor=50,
-                            pad_mode="constant", pad_value=0.0,
-                            return_indices=True, center_policy="right"
-                        )
-                        snip = snippets[0]
-                        candidates.save_candidate_snippet_products(
-                            snippet_rec=snip,
-                            out_prefix=f"{box_root}_cand_{srcname}_w{w}_{i:03d}_snip",
-                            pixscale_rad=cfg.pix_rad,
-                            ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
-                            ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=6, dpi=180
-                        )
-                else:
-                    print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
+            box_cands = _process_boxcar_chunk_dm(
+                cfg=cfg,
+                times=times,
+                cube=cube,
+                dm_val=dm_val,
+                chunk_root=chunk_root,
+                scan_id_str=scan_id_str,
+                candidates_dir=candidates_dir,
+                ms_base=ms_base,
+                scan_suffix=scan_suffix,
+                dm_suffix=dm_suffix,
+                racs_coords=racs_coords,
+                psrcat_coords=psrcat_coords,
+                dm0_box_cands=dm0_box_cands,
+            )
+            if dm_val == 0.0:
+                dm0_box_cands = box_cands
 
         # Immediately free cube memory before next DM trial
         del cube
