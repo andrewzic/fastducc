@@ -367,8 +367,8 @@ def group_filter_across_widths(
         # Suppress spatial neighborhood across +/-time_radius
         y0 = max(0, y - spatial_radius); y1 = min(Ny, y + spatial_radius + 1)
         x0 = max(0, x - spatial_radius); x1 = min(Nx, x + spatial_radius + 1)
-        for dt in range(-time_radius, time_radius + 1):
-            ci2 = ci + dt
+        for dt_step in range(-time_radius, time_radius + 1):
+            ci2 = ci + dt_step
             occ = occ_by_center.get(ci2)
             if occ is None:
                 occ = np.ones((Ny, Nx), dtype=bool)
@@ -376,3 +376,57 @@ def group_filter_across_widths(
             occ[y0:y1, x0:x1] = False
 
     return final
+
+
+def filter_ips_agn_candidates(
+    candidates_list: List[Dict[str, Any]],
+    dm0_candidates: List[Dict[str, Any]],
+    racs_coords: Any,
+    psrcat_coords: Any,
+    *,
+    ips_thresh: float = 0.8,
+    ips_radius_arcsec: float = 30.0,
+) -> List[Dict[str, Any]]:
+    """
+    Vectorized candidate filter suppressing DM > 0 candidates that match DM=0 candidates
+    coincident with (RACS - PSRCAT) persistent continuum sources.
+    """
+    if not candidates_list or not dm0_candidates or racs_coords is None:
+        return candidates_list
+
+    from astropy.coordinates import SkyCoord
+    from fastducc import catalogues
+
+    # 1. Pre-filter and pre-compute coordinates for DM=0 candidates that match (RACS - PSRCAT)
+    c0_ra_list = []
+    c0_dec_list = []
+    c0_snr_list = []
+    for c0 in dm0_candidates:
+        c0_ra = float(c0.get("ra_deg", np.degrees(c0.get("ra_rad", 0.0))))
+        c0_dec = float(c0.get("dec_deg", np.degrees(c0.get("dec_rad", 0.0))))
+        if catalogues.is_racs_minus_psrcat(c0_ra, c0_dec, racs_coords, psrcat_coords, match_radius_arcsec=ips_radius_arcsec):
+            c0_ra_list.append(c0_ra)
+            c0_dec_list.append(c0_dec)
+            c0_snr_list.append(float(c0.get("snr", 0.0)))
+
+    if not c0_ra_list:
+        return candidates_list
+
+    c0_sky = SkyCoord(c0_ra_list, c0_dec_list, unit="deg", frame="icrs")
+    c0_snr_arr = np.array(c0_snr_list, dtype=np.float64)
+
+    filtered = []
+    for cand in candidates_list:
+        c_ra = float(cand.get("ra_deg", np.degrees(cand.get("ra_rad", 0.0))))
+        c_dec = float(cand.get("dec_deg", np.degrees(cand.get("dec_rad", 0.0))))
+        c_coord = SkyCoord(c_ra, c_dec, unit="deg", frame="icrs")
+
+        seps_arcsec = c_coord.separation(c0_sky).arcsec
+        match_mask = seps_arcsec <= ips_radius_arcsec
+        if np.any(match_mask):
+            cand_snr = float(cand.get("snr", 0.0))
+            if np.any(cand_snr <= ips_thresh * c0_snr_arr[match_mask]):
+                continue  # Suppress IPS candidate
+        filtered.append(cand)
+
+    return filtered

@@ -408,13 +408,17 @@ def finalise_welford_parallel(
         total_slices = sum(c.shape[0] for c in cubes_to_stack)
         all_cube = np.empty((total_slices, cfg.npix_y, cfg.npix_x), dtype=cubes_to_stack[0].dtype)
         start_ = 0
-        for c in cubes_to_stack:
-            nsub = c.shape[0]
-            end_ = start_ + nsub
-            all_cube[start_:end_] = c
-            start_ += nsub
+        for i in range(len(valid_items)):
+            c = valid_items[i][1]
+            if c is not None:
+                nsub = c.shape[0]
+                all_cube[start_:start_ + nsub] = c
+                start_ += nsub
+                # Release chunk cube reference early to reclaim memory
+                valid_items[i] = (valid_items[i][0], None, *valid_items[i][2:])
+        del cubes_to_stack
 
-        if len(order) == all_cube.shape[0]:
+        if len(order) == all_cube.shape[0] and not np.array_equal(order, np.arange(len(order))):
             all_cube = all_cube[order]
     else:
         all_cube = None
@@ -582,6 +586,10 @@ def finalise_welford_parallel(
                         ra_rad=float(cand["ra_rad"]), dec_rad=float(cand["dec_rad"]),
                         ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
                     )
+
+            if all_cube is not None:
+                del all_cube
+                all_cube = None
 
     # Ensure all obs-level variance candidates have cutouts, fullframes, plots, and lightcurves
     try:
@@ -770,26 +778,11 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         if dm_val == 0.0:
                             dm0_var_cands = [dict(c) for c in annotated_var]
                         elif getattr(cfg, "filter_ips_agn", True) and len(dm0_var_cands) > 0 and (racs_coords is not None):
-                            filtered_var = []
-                            ips_thresh = getattr(cfg, "ips_snr_ratio_threshold", 0.8)
-                            ips_radius = getattr(cfg, "ips_match_radius_arcsec", 30.0)
-                            for cand in annotated_var:
-                                c_ra = cand.get("ra_deg", float(np.degrees(cand["ra_rad"])))
-                                c_dec = cand.get("dec_deg", float(np.degrees(cand["dec_rad"])))
-                                c_coord = SkyCoord(c_ra, c_dec, unit="deg", frame="icrs")
-                                suppress = False
-                                for c0 in dm0_var_cands:
-                                    c0_ra = c0.get("ra_deg", float(np.degrees(c0["ra_rad"])))
-                                    c0_dec = c0.get("dec_deg", float(np.degrees(c0["dec_rad"])))
-                                    c0_coord = SkyCoord(c0_ra, c0_dec, unit="deg", frame="icrs")
-                                    if c_coord.separation(c0_coord).arcsec <= ips_radius:
-                                        if catalogues.is_racs_minus_psrcat(c0_ra, c0_dec, racs_coords, psrcat_coords, match_radius_arcsec=ips_radius):
-                                            if float(cand.get("snr", 0)) <= ips_thresh * float(c0.get("snr", 0)):
-                                                suppress = True
-                                                break
-                                if not suppress:
-                                    filtered_var.append(cand)
-                            annotated_var = filtered_var
+                            annotated_var = filters.filter_ips_agn_candidates(
+                                annotated_var, dm0_var_cands, racs_coords, psrcat_coords,
+                                ips_thresh=getattr(cfg, "ips_snr_ratio_threshold", 0.8),
+                                ips_radius_arcsec=getattr(cfg, "ips_match_radius_arcsec", 30.0),
+                            )
 
                         t_var = candidates.candidates_to_astropy_table(annotated_var)
                         candidates.save_candidates_table(
@@ -905,26 +898,11 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     if dm_val == 0.0:
                         dm0_box_cands = [dict(c) for c in annotated]
                     elif getattr(cfg, "filter_ips_agn", True) and len(dm0_box_cands) > 0 and (racs_coords is not None):
-                        filtered_box = []
-                        ips_thresh = getattr(cfg, "ips_snr_ratio_threshold", 0.8)
-                        ips_radius = getattr(cfg, "ips_match_radius_arcsec", 30.0)
-                        for cand in annotated:
-                            c_ra = cand.get("ra_deg", float(np.degrees(cand["ra_rad"])))
-                            c_dec = cand.get("dec_deg", float(np.degrees(cand["dec_rad"])))
-                            c_coord = SkyCoord(c_ra, c_dec, unit="deg", frame="icrs")
-                            suppress = False
-                            for c0 in dm0_box_cands:
-                                c0_ra = c0.get("ra_deg", float(np.degrees(c0["ra_rad"])))
-                                c0_dec = c0.get("dec_deg", float(np.degrees(c0["dec_rad"])))
-                                c0_coord = SkyCoord(c0_ra, c0_dec, unit="deg", frame="icrs")
-                                if c_coord.separation(c0_coord).arcsec <= ips_radius:
-                                    if catalogues.is_racs_minus_psrcat(c0_ra, c0_dec, racs_coords, psrcat_coords, match_radius_arcsec=ips_radius):
-                                        if float(cand.get("snr", 0)) <= ips_thresh * float(c0.get("snr", 0)):
-                                            suppress = True
-                                            break
-                            if not suppress:
-                                filtered_box.append(cand)
-                        annotated = filtered_box
+                        annotated = filters.filter_ips_agn_candidates(
+                            annotated, dm0_box_cands, racs_coords, psrcat_coords,
+                            ips_thresh=getattr(cfg, "ips_snr_ratio_threshold", 0.8),
+                            ips_radius_arcsec=getattr(cfg, "ips_match_radius_arcsec", 30.0),
+                        )
 
                     t_box = candidates.candidates_to_astropy_table(annotated)
                     candidates.save_candidates_table(

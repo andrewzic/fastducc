@@ -740,16 +740,20 @@ def grid_chunk_cube(
     c_light = 299792458.0
     use_exact = bool(exact_uvw and (dm != 0.0) and (not collapse_channels) and (engine is not None))
     freq_1chan = np.array([c_light], dtype=np.float64)
+    freq_scale = (eff_freq[None, :, None] / c_light) if use_exact else None
+
+    # Vectorized precomputation of valid channel count per time snapshot
+    has_valid_wgts = np.any(wgt_dedisp > 0.0, axis=0)  # (nchan, nt)
+    valid_chans_per_t = np.count_nonzero(has_valid_wgts, axis=0)  # (nt,)
 
     cube = np.empty((nt, npix_y, npix_x), dtype=np.float64)
     for t_idx in range(nt):
-        vis_snap = vis_dedisp[:, :, t_idx]
-        wgt_snap = wgt_dedisp[:, :, t_idx]
-
-        n_chans_valid = int(np.count_nonzero(np.any(wgt_snap > 0.0, axis=0)))
-        if n_chans_valid < min_valid_channels:
+        if valid_chans_per_t[t_idx] < min_valid_channels:
             cube[t_idx, :, :] = 0.0
             continue
+
+        vis_snap = vis_dedisp[:, :, t_idx]
+        wgt_snap = wgt_dedisp[:, :, t_idx]
 
         if use_exact:
             # --------------------------------------------------------------------------
@@ -768,14 +772,8 @@ def grid_chunk_cube(
             uvw_snap_m = uvw_3d[:, :, t_phys].transpose(0, 2, 1)  # (nbl, nchan, 3) in meters
 
             # 2. Dimensionless Wavelength Transformation:
-            #    DUCC's internal gridding algorithm operates in units of wavelengths:
-            #        u_lambda = u_meters * (freq_c / c)
-            #    Normally DUCC calculates this internally per channel from a single
-            #    per-row coordinate in meters. Because each channel here has its own
-            #    migrated physical coordinate in meters, we pre-convert the coordinates
-            #    directly into dimensionless wavelengths (cycles):
-            #        u_lambda = u_meters * (freq_c / c)
-            uvw_lambda = uvw_snap_m * (eff_freq[None, :, None] / c_light)
+            #    Pre-convert coordinates directly into dimensionless wavelengths (cycles):
+            uvw_lambda = uvw_snap_m * freq_scale
 
             # 3. 1D Pseudo-Row Representation:
             #    We flatten the spatial baselines and frequency channels into N_vis = (nbl * nchan)
@@ -784,26 +782,22 @@ def grid_chunk_cube(
             #        - its visibility and weight values, shaped as 1-channel arrays: (N_vis, 1)
             #        - a reference frequency array [c_light], ensuring DUCC's internal scaling
             #          factor (f / c_light) equals exactly 1.0, preserving our wavelength coordinates.
-            #
-            #    DUCC's C++ AVX/SIMD vectorization operates across the Kaiser-Bessel convolution
-            #    support footprint in the image plane (not across the channel dimension), and its
-            #    multithreading operates across spatial (u, v) tiles and w-planes. Thus, flattening
-            #    into 1-channel pseudo-rows maintains full C++ compiled execution speed (~10 ms
-            #    per snapshot) while guaranteeing exact per-channel geometric accuracy.
             uvw_input = uvw_lambda.reshape(-1, 3)
             vis_input = vis_snap.reshape(-1, 1)
-            wgt_input = wgt_snap.reshape(-1, 1).copy()
+            wgt_input = wgt_snap.reshape(-1, 1)
             freq_input = freq_1chan
         else:
             # Standard path: fixed baseline UVW across all channels at snapshot reference time
             uvw_input = uvw_3d[:, :, t_idx]
             freq_input = eff_freq
             vis_input = vis_snap
-            wgt_input = wgt_snap.copy()
+            wgt_input = wgt_snap
 
-        wgt_max = np.max(wgt_input)
+        wgt_max = float(np.max(wgt_input))
         if wgt_max > 0:
-            wgt_input = wgt_input / wgt_max
+            wgt_input = (wgt_input / wgt_max).astype(np.float32, copy=False)
+        else:
+            wgt_input = wgt_input.copy()
 
         dirty = ducc0.wgridder.vis2dirty(
             uvw=uvw_input,
@@ -834,5 +828,8 @@ def grid_chunk_cube(
         if n_valid > 0:
             dirty = dirty / n_valid
         cube[t_idx, :, :] = dirty
+
+    if vis_dedisp is not vis_3d:
+        del vis_dedisp, wgt_dedisp
 
     return cube
