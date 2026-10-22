@@ -720,53 +720,13 @@ def main(argv: list[str] | None = None):
     args = build_cli(argv)
     if getattr(args, "make_cube", False):
         from fastducc import cube
+        from fastducc.fd_types import CubeConfig
         dm_list = getattr(args, "dm_list", None)
         dm_trials = dm_list if (dm_list is not None and len(dm_list) > 0) else [getattr(args, "dm", None) if getattr(args, "dm", None) is not None else 0.0]
         for trial_dm in dm_trials:
-            cube.make_dirty_cube(
-                msname=args.msname,
-                out_cube=getattr(args, "out_cube", None) if len(dm_trials) == 1 else None,
-                coord=getattr(args, "coord", None),
-                ra=getattr(args, "ra", None),
-                dec=getattr(args, "dec", None),
-                radius=getattr(args, "radius", None),
-                radius_arcsec=getattr(args, "radius_arcsec", None),
-                radius_pix=getattr(args, "radius_pix", None),
-                box_size_pix=getattr(args, "box_size_pix", None),
-                box_size_arcsec=getattr(args, "box_size_arcsec", None),
-                radius_unit=getattr(args, "radius_unit", "arcsec"),
-                start_time_idx=getattr(args, "start_time_idx", None),
-                end_time_idx=getattr(args, "end_time_idx", None),
-                start_time=getattr(args, "start_time", None),
-                end_time=getattr(args, "end_time", None),
-                chunk_size=getattr(args, "chunk_size", 512),
-                npix_x=getattr(args, "npix_x", 384),
-                npix_y=getattr(args, "npix_y", 384),
-                pixsize_arcsec=getattr(args, "pixsize_arcsec", 22.0),
-                corr_mode=getattr(args, "corr_mode", "single"),
-                single_pol=getattr(args, "single_pol", "XX"),
-                basis=getattr(args, "basis", "linear"),
-                data_column=getattr(args, "data_column", "DATA"),
-                epsilon=getattr(args, "epsilon", 1e-6),
-                do_wgridding=getattr(args, "do_wgridding", True),
-                nthreads=getattr(args, "nthreads", 0),
-                verbosity=getattr(args, "verbosity", 0),
-                min_valid_channels=getattr(args, "min_valid_channels", 24),
-                dm=float(trial_dm),
-                collapse_channels=getattr(args, "collapse_channels", False),
-                nsubbands=getattr(args, "nsubbands", 1),
-                exact_uvw=getattr(args, "exact_uvw", True),
-                use_fitscube=getattr(args, "use_fitscube", False),
-                create_blanks=getattr(args, "create_blanks", False),
-                time_step=getattr(args, "time_step", None),
-                max_blank_factor=getattr(args, "max_blank_factor", 10.0),
-                write_timestamps_table=getattr(args, "write_timestamps_table", True),
-                save_uv=getattr(args, "save_uv", False),
-                uv_only=getattr(args, "uv_only", False),
-                out_uv_real=getattr(args, "out_uv_real", None) if len(dm_trials) == 1 else None,
-                out_uv_imag=getattr(args, "out_uv_imag", None) if len(dm_trials) == 1 else None,
-                uv_4d=getattr(args, "uv_4d", False),
-            )
+            out_cube = getattr(args, "out_cube", None) if len(dm_trials) == 1 else None
+            cfg = CubeConfig.from_namespace(args, dm=float(trial_dm), out_cube=out_cube)
+            cube.make_dirty_cube(cfg=cfg)
         return 0
     res = run_pipeline(args)
     return res if isinstance(res, int) else 0

@@ -47,6 +47,7 @@ try:
 except ImportError:
     ducc0 = None
 
+from fastducc.fd_types import CubeConfig
 from fastducc import ms_utils, imaging, dedisp
 from fastducc import wcs as ducc_wcs
 
@@ -701,9 +702,11 @@ def resolve_time_bounds(
 # =========================================================================
 
 def make_dirty_cube(
-    msname: str,
+    msname: str = "",
     out_cube: Optional[str] = None,
     *,
+    cfg: Optional[CubeConfig] = None,
+    config: Optional[CubeConfig] = None,
     coord: Optional[Any] = None,
     ra: Optional[Any] = None,
     dec: Optional[Any] = None,
@@ -770,6 +773,113 @@ def make_dirty_cube(
     floating: int = 32,
     **kwargs,
 ) -> str:
+    """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes."""
+    if cfg is None:
+        cfg = config
+
+    if cfg is None:
+        if not msname:
+            raise ValueError("msname or cfg/config must be provided to make_dirty_cube.")
+        cfg = CubeConfig(
+            msname=msname, out_cube=out_cube, coord=coord, ra=ra, dec=dec,
+            radius=radius, radius_arcsec=radius_arcsec, radius_pix=radius_pix,
+            box_size_pix=box_size_pix, box_size_arcsec=box_size_arcsec,
+            radius_unit=radius_unit, start_time_idx=start_time_idx,
+            end_time_idx=end_time_idx, start_time=start_time, end_time=end_time,
+            chunk_size=chunk_size, time_step=time_step, time_tolerance=time_tolerance,
+            max_blank_factor=max_blank_factor, write_timestamps_table=write_timestamps_table,
+            save_uv=save_uv, uv_only=uv_only, out_uv_real=out_uv_real, out_uv_imag=out_uv_imag,
+            uv_4d=uv_4d, npix_x=npix_x, npix_y=npix_y, pixsize_arcsec=pixsize_arcsec,
+            corr_mode=corr_mode, single_pol=single_pol, basis=basis, data_column=data_column,
+            field_name=field_name, ra_sign=ra_sign, dec_sign=dec_sign, epsilon=epsilon,
+            do_wgridding=do_wgridding, nthreads=nthreads, verbosity=verbosity,
+            flip_u=flip_u, flip_v=flip_v, flip_w=flip_w, divide_by_n=divide_by_n,
+            sigma_min=sigma_min, sigma_max=sigma_max, min_valid_channels=min_valid_channels,
+            dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands,
+            exact_uvw=exact_uvw, align_to=align_to, overwrite=overwrite,
+            parallel_mode=parallel_mode, max_workers=max_workers,
+            threads_per_worker=threads_per_worker, dask_scheduler=dask_scheduler,
+            slurm_partition=slurm_partition, slurm_account=slurm_account,
+            slurm_cores_per_worker=slurm_cores_per_worker, slurm_mem=slurm_mem,
+            slurm_walltime=slurm_walltime, slurm_job_extra=slurm_job_extra,
+            slurm_interface=slurm_interface, use_fitscube=use_fitscube,
+            create_blanks=create_blanks, floating=floating,
+        )
+    else:
+        if msname:
+            cfg.msname = msname
+        if out_cube is not None:
+            cfg.out_cube = out_cube
+        for k, v in kwargs.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+    msname = cfg.msname
+    out_cube = cfg.out_cube
+    coord = cfg.coord
+    ra = cfg.ra
+    dec = cfg.dec
+    radius = cfg.radius
+    radius_arcsec = cfg.radius_arcsec
+    radius_pix = cfg.radius_pix
+    box_size_pix = cfg.box_size_pix
+    box_size_arcsec = cfg.box_size_arcsec
+    radius_unit = cfg.radius_unit
+    start_time_idx = cfg.start_time_idx
+    end_time_idx = cfg.end_time_idx
+    start_time = cfg.start_time
+    end_time = cfg.end_time
+    chunk_size = cfg.chunk_size
+    time_step = cfg.time_step
+    time_tolerance = cfg.time_tolerance
+    max_blank_factor = cfg.max_blank_factor
+    write_timestamps_table = cfg.write_timestamps_table
+    save_uv = cfg.save_uv
+    uv_only = cfg.uv_only
+    out_uv_real = cfg.out_uv_real
+    out_uv_imag = cfg.out_uv_imag
+    uv_4d = cfg.uv_4d
+    npix_x = cfg.npix_x
+    npix_y = cfg.npix_y
+    pixsize_arcsec = cfg.pixsize_arcsec
+    corr_mode = cfg.corr_mode
+    single_pol = cfg.single_pol
+    basis = cfg.basis
+    data_column = cfg.data_column
+    field_name = cfg.field_name
+    ra_sign = cfg.ra_sign
+    dec_sign = cfg.dec_sign
+    epsilon = cfg.epsilon
+    do_wgridding = cfg.do_wgridding
+    nthreads = cfg.nthreads
+    verbosity = cfg.verbosity
+    flip_u = cfg.flip_u
+    flip_v = cfg.flip_v
+    flip_w = cfg.flip_w
+    divide_by_n = cfg.divide_by_n
+    sigma_min = cfg.sigma_min
+    sigma_max = cfg.sigma_max
+    min_valid_channels = cfg.min_valid_channels
+    dm = cfg.dm
+    collapse_channels = cfg.collapse_channels
+    nsubbands = cfg.nsubbands
+    exact_uvw = cfg.exact_uvw
+    align_to = cfg.align_to
+    overwrite = cfg.overwrite
+    parallel_mode = cfg.parallel_mode
+    max_workers = cfg.max_workers
+    threads_per_worker = cfg.threads_per_worker
+    dask_scheduler = cfg.dask_scheduler
+    slurm_partition = cfg.slurm_partition
+    slurm_account = cfg.slurm_account
+    slurm_cores_per_worker = cfg.slurm_cores_per_worker
+    slurm_mem = cfg.slurm_mem
+    slurm_walltime = cfg.slurm_walltime
+    slurm_job_extra = cfg.slurm_job_extra
+    slurm_interface = cfg.slurm_interface
+    use_fitscube = cfg.use_fitscube
+    create_blanks = cfg.create_blanks
+    floating = cfg.floating
     """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes."""
     if not os.path.exists(msname):
         raise FileNotFoundError(f"Measurement Set '{msname}' not found.")
@@ -1052,31 +1162,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_cli_cube(argv)
     dm_trials = args.dm_list if (args.dm_list is not None and len(args.dm_list) > 0) else [args.dm]
     for trial_dm in dm_trials:
-        make_dirty_cube(
-            msname=args.msname, out_cube=args.out_cube if len(dm_trials) == 1 else None,
-            coord=args.coord, ra=args.ra, dec=args.dec, radius=args.radius,
-            radius_arcsec=args.radius_arcsec, radius_pix=args.radius_pix,
-            box_size_pix=args.box_size_pix, box_size_arcsec=args.box_size_arcsec,
-            radius_unit=args.radius_unit, start_time_idx=args.start_time_idx,
-            end_time_idx=args.end_time_idx, start_time=args.start_time, end_time=args.end_time,
-            chunk_size=args.chunk_size, time_step=args.time_step, time_tolerance=args.time_tolerance,
-            max_blank_factor=args.max_blank_factor, write_timestamps_table=args.write_timestamps_table,
-            save_uv=args.save_uv, uv_only=args.uv_only,
-            out_uv_real=args.out_uv_real if len(dm_trials) == 1 else None,
-            out_uv_imag=args.out_uv_imag if len(dm_trials) == 1 else None,
-            uv_4d=args.uv_4d, npix_x=args.npix_x, npix_y=args.npix_y,
-            pixsize_arcsec=args.pixsize_arcsec, corr_mode=args.corr_mode,
-            single_pol=args.single_pol, basis=args.basis, data_column=args.data_column,
-            field_name=args.field_name, epsilon=args.epsilon, do_wgridding=args.do_wgridding,
-            nthreads=args.nthreads, verbosity=args.verbosity, min_valid_channels=args.min_valid_channels,
-            dm=float(trial_dm), collapse_channels=args.collapse_channels, nsubbands=args.nsubbands,
-            exact_uvw=args.exact_uvw, align_to=args.align_to, parallel_mode=args.parallel_mode,
-            max_workers=args.max_workers, threads_per_worker=args.threads_per_worker,
-            dask_scheduler=args.dask_scheduler, slurm_partition=args.slurm_partition,
-            slurm_account=args.slurm_account, slurm_cores_per_worker=args.slurm_cores_per_worker,
-            slurm_mem=args.slurm_mem, slurm_walltime=args.slurm_walltime,
-            slurm_job_extra=args.slurm_job_extra, slurm_interface=args.slurm_interface,
-            use_fitscube=args.use_fitscube, overwrite=args.overwrite,
-            create_blanks=args.create_blanks, floating=args.floating,
-        )
+        out_cube = args.out_cube if len(dm_trials) == 1 else None
+        cfg = CubeConfig.from_namespace(args, dm=float(trial_dm), out_cube=out_cube)
+        make_dirty_cube(cfg=cfg)
     return 0

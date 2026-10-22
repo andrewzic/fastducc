@@ -66,3 +66,88 @@ class WelfordState:
     M2:    np.ndarray
     ema_mean: np.ndarray
     last_time: float
+
+
+@dataclass
+class CubeConfig:
+    msname: str
+    out_cube: Optional[str] = None
+    coord: Optional[Any] = None
+    ra: Optional[Any] = None
+    dec: Optional[Any] = None
+    radius: Optional[Any] = None
+    radius_arcsec: Optional[float] = None
+    radius_pix: Optional[float] = None
+    box_size_pix: Optional[int] = None
+    box_size_arcsec: Optional[float] = None
+    radius_unit: str = "arcsec"
+    start_time_idx: Optional[int] = None
+    end_time_idx: Optional[int] = None
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    chunk_size: int = 512
+    time_step: Optional[float] = None
+    time_tolerance: float = 1e-3
+    max_blank_factor: float = 10.0
+    write_timestamps_table: bool = True
+    save_uv: bool = False
+    uv_only: bool = False
+    out_uv_real: Optional[str] = None
+    out_uv_imag: Optional[str] = None
+    uv_4d: bool = False
+    npix_x: int = 384
+    npix_y: int = 384
+    pixsize_arcsec: float = 22.0
+    corr_mode: str = "single"
+    single_pol: str = "XX"
+    basis: str = "linear"
+    data_column: str = "DATA"
+    field_name: Optional[str] = None
+    ra_sign: int = -1
+    dec_sign: int = -1
+    epsilon: float = 1e-6
+    do_wgridding: bool = True
+    nthreads: int = 0
+    verbosity: int = 0
+    flip_u: bool = False
+    flip_v: bool = False
+    flip_w: bool = False
+    divide_by_n: bool = True
+    sigma_min: float = 1.1
+    sigma_max: float = 2.6
+    min_valid_channels: int = 24
+    dm: float = 0.0
+    collapse_channels: bool = False
+    nsubbands: int = 1
+    exact_uvw: bool = True
+    align_to: str = "fmax"
+    overwrite: bool = True
+    parallel_mode: Optional[str] = None
+    max_workers: Optional[int] = None
+    threads_per_worker: int = 1
+    dask_scheduler: str = "processes"
+    slurm_partition: Optional[str] = None
+    slurm_account: Optional[str] = None
+    slurm_cores_per_worker: int = 1
+    slurm_mem: str = "32GB"
+    slurm_walltime: str = "02:30:00"
+    slurm_job_extra: Optional[List[str]] = None
+    slurm_interface: Optional[str] = None
+    use_fitscube: bool = False
+    create_blanks: bool = False
+    floating: int = 32
+
+    @classmethod
+    def from_namespace(cls, args: Any, **overrides) -> CubeConfig:
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        kwargs = {}
+        for f in valid_fields:
+            if f in overrides:
+                kwargs[f] = overrides[f]
+            elif hasattr(args, f):
+                kwargs[f] = getattr(args, f)
+        for k, v in overrides.items():
+            if k in valid_fields:
+                kwargs[k] = v
+        return cls(**kwargs)
