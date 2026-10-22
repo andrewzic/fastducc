@@ -1,8 +1,11 @@
+from __future__ import annotations
 from typing import Tuple, List, Dict, Any
 import numpy as np
 import math
 
 from astropy.wcs import WCS
+from astropy.coordinates import Angle
+import astropy.units as u
 
 from fastducc import ms_utils
 
@@ -46,79 +49,13 @@ def radec_from_lm(l: float, m: float, ra0_rad: float, dec0_rad: float) -> Tuple[
 
 
 def rad_to_hmsdms(ra_rad: float, dec_rad: float, dp: int = 1) -> Tuple[str, str]:
-
     """
     Format RA,Dec (radians) as sexagesimal strings 'hh:mm:ss.s', '+dd:mm:ss.s',
     with proper rounding and carry to prevent '60.0' seconds/minutes.
     """
-    def to_hms(r, dp = 1):
-        
-        r = r % (2 * np.pi)
-        total_hours = r * 12.0 / np.pi
-
-        h = int(total_hours)  # 0..23
-        rem_hours = total_hours - h
-        total_minutes = rem_hours * 60.0
-
-        m = int(total_minutes)  # 0..59
-        rem_minutes = total_minutes - m
-        s = rem_minutes * 60.0
-
-        # Round to one decimal
-        s = round(s, dp)
-
-        # Carry if seconds hit 60.0
-        if s >= 60.0:
-            s = 0.0
-            m += 1
-
-        # Carry if minutes hit 60
-        if m >= 60:
-            m = 0
-            h += 1
-
-        # Wrap hour 24 -> 0
-        if h >= 24:
-            h = 0
-
-        return f"{h:02d}:{m:02d}:{s:0{3+dp}.{dp}f}"  # width 4 covers '0.0'..'59.9'
-
-    def to_dms(r, dp = 1):
-        deg = math.degrees(r)
-        sign = '+' if deg >= 0 else '-'
-        deg = abs(deg)
-
-        d = int(deg)  # degrees 0..90 
-
-        rem_deg = deg - d
-        total_arcmin = rem_deg * 60.0
-
-        m = int(total_arcmin)  # 0..59
-        rem_arcmin = total_arcmin - m
-        s = rem_arcmin * 60.0
-
-        # Round to one decimal
-        s = round(s, dp)
-
-        # Carry if seconds hit 60.0
-        if s >= 60.0:
-            s = 0.0
-            m += 1
-
-        # Carry if minutes hit 60
-        if m >= 60:
-            m = 0
-            d += 1
-
-        # Cap to 90 degrees if rounding/carry pushes it over (rare edge case)
-        if d > 90:
-            d = 90
-            m = 0
-            s = 0.0
-
-        return f"{sign}{d:02d}:{m:02d}:{s:0{3+dp}.{dp}f}"
-
-    return to_hms(ra_rad, dp=dp), to_dms(dec_rad, dp=dp)
+    ra_str = Angle(ra_rad, unit=u.rad).wrap_at(360 * u.deg).to_string(unit=u.hour, sep=":", precision=dp, pad=True)
+    dec_str = Angle(dec_rad, unit=u.rad).to_string(unit=u.degree, sep=":", precision=dp, pad=True, alwayssign=True)
+    return ra_str, dec_str
 
 def hmsdms_to_srcname(ra_hms, dec_dms):
     """

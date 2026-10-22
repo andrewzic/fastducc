@@ -1,3 +1,4 @@
+from __future__ import annotations
 import argparse
 import logging
 import os
@@ -45,7 +46,25 @@ def log_memory(stage: str):
     except Exception as e:
         print(f"[MEM PROFILE ERROR] Could not log memory at {stage}: {e}", flush=True)
 
-def build_cli():
+
+def _add_bool_flag(
+    parser: argparse.ArgumentParser,
+    true_flag: str,
+    false_flag: str,
+    dest: str,
+    default: bool,
+    help_true: str | None = None,
+    help_false: str | None = None,
+):
+    """Register mutually exclusive true/false boolean flags with a default."""
+    kw_true = {"help": help_true} if help_true else {}
+    kw_false = {"help": help_false} if help_false else {}
+    parser.add_argument(true_flag, dest=dest, action="store_true", **kw_true)
+    parser.add_argument(false_flag, dest=dest, action="store_false", **kw_false)
+    parser.set_defaults(**{dest: default})
+
+
+def build_cli(argv=None):
 
     parser = argparse.ArgumentParser(description='Image MS in time chunks using ducc0 wgridder')
     parser.add_argument('--msname', required=True, help='Path to Measurement Set')
@@ -63,8 +82,7 @@ def build_cli():
     parser.add_argument('--pixsize-arcsec', type=float, default=22.0,
                         help='Pixel size (arcsec); applied to both axes (default: 22.0)')
     parser.add_argument('--epsilon', type=float, default=1e-6)
-    parser.add_argument('--do-wgridding', dest='do_wgridding', action='store_true', default=True)
-    parser.add_argument('--no-wgridding', dest='do_wgridding', action='store_false')
+    _add_bool_flag(parser, '--do-wgridding', '--no-wgridding', 'do_wgridding', True)
     parser.add_argument('--nthreads', type=int, default=0)
     parser.add_argument('--verbosity', type=int, default=0)
     parser.add_argument('--boxcar-widths', nargs='+', type=int,
@@ -78,89 +96,53 @@ def build_cli():
     parser.add_argument('--rms-clip-sigma', type=float, default=3.0)
     parser.add_argument('--nms-radius', type=int, default=6)
     parser.add_argument('--local-box-size', type=int, default=64, help="Sliding 2D window size in pixels for local background & stdev thresholding (default: 64)")
-    parser.add_argument('--enable-local-stats', dest='use_local_threshold', action='store_true', help="Enable 2D local background & stdev thresholding (default: enabled)")
-    parser.add_argument('--disable-local-stats', dest='use_local_threshold', action='store_false', help="Disable 2D local thresholding, fallback to global statistics")
-    parser.set_defaults(use_local_threshold=True)
+    _add_bool_flag(
+        parser, '--enable-local-stats', '--disable-local-stats', 'use_local_threshold', True,
+        help_true="Enable 2D local background & stdev thresholding (default: enabled)",
+        help_false="Disable 2D local thresholding, fallback to global statistics",
+    )
     # --- Search toggles ---
-    parser.add_argument(
-        '--enable-boxcar', dest='enable_boxcar', action='store_true',
-        help='Enable per-width boxcar transient search (default: enabled)'
+    _add_bool_flag(
+        parser, '--enable-boxcar', '--disable-boxcar', 'enable_boxcar', True,
+        help_true='Enable per-width boxcar transient search (default: enabled)',
+        help_false='Disable per-width boxcar transient search',
     )
-    parser.add_argument(
-        '--disable-boxcar', dest='enable_boxcar', action='store_false',
-        help='Disable per-width boxcar transient search'
+    _add_bool_flag(
+        parser, '--do-boxcar-search', '--no-boxcar-search', 'do_boxcar_search', True,
+        help_true='Perform boxcar transient search (default: enabled)',
+        help_false='Disable boxcar transient search',
     )
-    parser.set_defaults(enable_boxcar=True)
-    parser.add_argument(
-        '--do-boxcar-search', dest='do_boxcar_search', action='store_true',
-        help='Perform boxcar transient search (default: enabled)'
+    _add_bool_flag(
+        parser, '--enable-var', '--disable-var', 'enable_var', True,
+        help_true='Enable variance (std-map/Welford) variability search — master switch for all variance modes (default: enabled)',
+        help_false='Disable all variance (std-map/Welford) variability searches',
     )
-    parser.add_argument(
-        '--no-boxcar-search', dest='do_boxcar_search', action='store_false',
-        help='Disable boxcar transient search'
+    _add_bool_flag(
+        parser, '--enable-var-obs', '--disable-var-obs', 'enable_var_obs', False,
+        help_true='Enable whole-observation variance search on the final merged std-map (default: disabled)',
+        help_false='Disable whole-observation variance search',
     )
-    parser.set_defaults(do_boxcar_search=True)
-    parser.add_argument(
-        '--enable-var', dest='enable_var', action='store_true',
-        help='Enable variance (std-map/Welford) variability search — master switch for all variance modes (default: enabled)'
+    _add_bool_flag(
+        parser, '--do-var-search', '--no-var-search', 'do_var_search', True,
+        help_true='Perform variance (std-map/Welford) variability search (default: enabled)',
+        help_false='Disable variance (std-map/Welford) variability search',
     )
-    parser.add_argument(
-        '--disable-var', dest='enable_var', action='store_false',
-        help='Disable all variance (std-map/Welford) variability searches'
+    _add_bool_flag(
+        parser, '--enable-var-chunk', '--disable-var-chunk', 'enable_var_chunk', True,
+        help_true='Enable variance (std-map/Welford) variability search per chunk (default: enabled)',
+        help_false='Disable variance (std-map/Welford) variability search per chunk',
     )
-    parser.set_defaults(enable_var=True)
-    parser.add_argument(
-        '--enable-var-obs', dest='enable_var_obs', action='store_true',
-        help='Enable whole-observation variance search on the final merged std-map (default: disabled)'
+    _add_bool_flag(
+        parser, '--enable-var-scan', '--disable-var-scan', 'enable_var_scan', True,
+        help_true='Enable variance (std-map/Welford) variability search per scan (default: enabled)',
+        help_false='Disable variance (std-map/Welford) variability search per scan',
     )
-    parser.add_argument(
-        '--disable-var-obs', dest='enable_var_obs', action='store_false',
-        help='Disable whole-observation variance search'
-    )
-    parser.set_defaults(enable_var_obs=False)
-    parser.add_argument(
-        '--do-var-search', dest='do_var_search', action='store_true',
-        help='Perform variance (std-map/Welford) variability search (default: enabled)'
-    )
-    parser.add_argument(
-        '--no-var-search', dest='do_var_search', action='store_false', 
-        help='Disable variance (std-map/Welford) variability search'
-    )
-    parser.set_defaults(do_var_search=True)
-    parser.add_argument(
-        '--enable-var-chunk', dest='enable_var_chunk', action='store_true',
-        help='Enable variance (std-map/Welford) variability search per chunk (default: enabled)'
-    )
-    parser.add_argument(
-        '--disable-var-chunk', dest='enable_var_chunk', action='store_false',
-        help='Disable variance (std-map/Welford) variability search per chunk'
-    )
-    parser.set_defaults(enable_var_chunk=True)
-    parser.add_argument(
-        '--enable-var-scan', dest='enable_var_scan', action='store_true',
-        help='Enable variance (std-map/Welford) variability search per scan (default: enabled)'
-    )
-    parser.add_argument(
-        '--disable-var-scan', dest='enable_var_scan', action='store_false',
-        help='Disable variance (std-map/Welford) variability search per scan'
-    )
-    parser.set_defaults(enable_var_scan=True)
     parser.add_argument('--plot-cands-only', dest='plot_cands_only', action='store_true', help='When plotting is enabled, only read and plot candidates instead of searching for them')
-    parser.add_argument('--save-var-lightcurves',  dest='save_var_lightcurves',  action='store_true', help='Save lightcurves for variance candidates')
-    parser.add_argument('--no-save-var-lightcurves',  dest='save_var_lightcurves',  action='store_false')
-    parser.set_defaults(save_var_lightcurves=True)
-    parser.add_argument('--save-full-var-lightcurves',  dest='save_full_var_lightcurves',  action='store_true', help='Save full lightcurves (over all chunks) for variance candidates')
-    parser.add_argument('--no-save-full-var-lightcurves',  dest='save_full_var_lightcurves',  action='store_false')
-    parser.set_defaults(save_full_var_lightcurves=False)    
-    parser.add_argument('--save-var-snippets',     dest='save_var_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for variance candidates')
-    parser.add_argument('--no-save-var-snippets',  dest='save_var_snippets',     action='store_false')
-    parser.set_defaults(save_var_snippets=False)
-    parser.add_argument('--save-box-lightcurves',  dest='save_box_lightcurves',  action='store_true', help='Save lightcurves for boxcar candidates')
-    parser.add_argument('--no-save-box-lightcurves',  dest='save_box_lightcurves',  action='store_false')
-    parser.set_defaults(save_box_lightcurves=True)
-    parser.add_argument('--save-box-snippets',     dest='save_box_snippets',     action='store_true', help='Save snippet products (PNG/GIF/FITS) for boxcar candidates')
-    parser.add_argument('--no-save-box-snippets',  dest='save_box_snippets',     action='store_false')
-    parser.set_defaults(save_box_snippets=False)
+    _add_bool_flag(parser, '--save-var-lightcurves', '--no-save-var-lightcurves', 'save_var_lightcurves', True, help_true='Save lightcurves for variance candidates')
+    _add_bool_flag(parser, '--save-full-var-lightcurves', '--no-save-full-var-lightcurves', 'save_full_var_lightcurves', False, help_true='Save full lightcurves (over all chunks) for variance candidates')
+    _add_bool_flag(parser, '--save-var-snippets', '--no-save-var-snippets', 'save_var_snippets', False, help_true='Save snippet products (PNG/GIF/FITS) for variance candidates')
+    _add_bool_flag(parser, '--save-box-lightcurves', '--no-save-box-lightcurves', 'save_box_lightcurves', True, help_true='Save lightcurves for boxcar candidates')
+    _add_bool_flag(parser, '--save-box-snippets', '--no-save-box-snippets', 'save_box_snippets', False, help_true='Save snippet products (PNG/GIF/FITS) for boxcar candidates')
     parser.add_argument('--continuum-dir', default=None, help='Path to directory containing deep per-beam continuum fits images.')
 
     # --- Dedispersion & DM search parameters ---
@@ -174,11 +156,11 @@ def build_cli():
                         help='Trial DM step size (pc cm^-3). If None and dm-max > dm-min, computed using --dm-tol.')
     parser.add_argument('--dm-tol', type=float, default=1.0,
                         help='Smearing tolerance factor in samples for optimal DM trial grid generation (default: 1.0).')
-    parser.add_argument('--collapse-channels', dest='collapse_channels', action='store_true',
-                        help='Average/collapse channel dimension after dedispersion before imaging (default: False).')
-    parser.add_argument('--no-collapse-channels', dest='collapse_channels', action='store_false',
-                        help='Retain channel dimension when imaging (default: True).')
-    parser.set_defaults(collapse_channels=False)
+    _add_bool_flag(
+        parser, '--collapse-channels', '--no-collapse-channels', 'collapse_channels', False,
+        help_true='Average/collapse channel dimension after dedispersion before imaging (default: False).',
+        help_false='Retain channel dimension when imaging (default: True).',
+    )
     parser.add_argument('--nsubbands', type=int, default=1,
                         help='Number of subbands to divide the bandwidth into before imaging (default: 1).')
     parser.add_argument('--dm-list', type=float, nargs='+', default=None,
@@ -187,18 +169,18 @@ def build_cli():
                         help='Filter chunk processing to a specific scan ID (e.g. 20251015085704)')
     parser.add_argument('--max-chunks', type=int, default=0,
                         help='Limit the number of chunks to process (0 = all)')
-    parser.add_argument('--exact-uvw', dest='exact_uvw', action='store_true',
-                        help='Calculate exact per-channel UVW coordinates accounting for dispersion delay (default: True).')
-    parser.add_argument('--no-exact-uvw', dest='exact_uvw', action='store_false',
-                        help='Use baseline UVW coordinates at the snapshot reference timestamp without channel migration.')
-    parser.set_defaults(exact_uvw=True)
+    _add_bool_flag(
+        parser, '--exact-uvw', '--no-exact-uvw', 'exact_uvw', True,
+        help_true='Calculate exact per-channel UVW coordinates accounting for dispersion delay (default: True).',
+        help_false='Use baseline UVW coordinates at the snapshot reference timestamp without channel migration.',
+    )
     parser.add_argument('--min-valid-channels', type=int, default=24,
                         help='Minimum number of non-zero-weight channels across band before imaging timestep (default: 24).')
-    parser.add_argument('--filter-ips-agn', dest='filter_ips_agn', action='store_true',
-                        help='Suppress DM>0 candidates at positions of known (RACS - PSRCAT) continuum sources if S/N <= threshold * DM0 S/N (default: True).')
-    parser.add_argument('--no-filter-ips-agn', dest='filter_ips_agn', action='store_false',
-                        help='Disable (RACS - PSRCAT) IPS AGN suppression at DM>0.')
-    parser.set_defaults(filter_ips_agn=True)
+    _add_bool_flag(
+        parser, '--filter-ips-agn', '--no-filter-ips-agn', 'filter_ips_agn', True,
+        help_true='Suppress DM>0 candidates at positions of known (RACS - PSRCAT) continuum sources if S/N <= threshold * DM0 S/N (default: True).',
+        help_false='Disable (RACS - PSRCAT) IPS AGN suppression at DM>0.',
+    )
     parser.add_argument('--ips-snr-ratio-threshold', type=float, default=0.8,
                         help='S/N ratio threshold vs DM=0 for keeping candidates coincident with (RACS - PSRCAT) sources (default: 0.8).')
     parser.add_argument('--ips-match-radius-arcsec', type=float, default=30.0,
@@ -307,9 +289,7 @@ def build_cli():
         help='Default unit when radius is passed as a bare number (default: arcsec)'
     )
 
-    args = parser.parse_args()
-
-    return args
+    return parser.parse_args(argv)
 
 def build_cli_aggregate(argv=None):
     p = argparse.ArgumentParser(
