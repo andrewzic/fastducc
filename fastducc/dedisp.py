@@ -9,9 +9,11 @@ Also provides compatibility fallbacks / wrappers for tools from craco-python.
 from typing import Optional, Tuple, Union, List
 import numpy as np
 
+from fastducc.constants import K_DM as _K_DM_MHZ
+
 # Dispersion constant: k_DM in s * GHz^2 * pc^-1 * cm^3
 # (4.148808e3 MHz^2 pc^-1 cm^3 s = 4.148808e-3 GHz^2 pc^-1 cm^3 s)
-K_DM = 4.148808e-3
+K_DM = _K_DM_MHZ * 1e-6
 
 # Attempt to import from craco if available
 try:

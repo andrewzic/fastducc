@@ -3,11 +3,6 @@ from numba import njit, prange
 import numpy as np
 from scipy.ndimage import uniform_filter
 
-try:
-    import ducc0
-except Exception as e:
-    raise RuntimeError('ducc0 is required') from e
-
 # ============================
 # NUMBA-ACCELERATED KERNELS
 # ============================

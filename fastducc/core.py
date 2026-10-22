@@ -71,8 +71,8 @@ def finalise_welford_parallel(
     std_map_full : np.ndarray or None
         Final global standard deviation map, shape (Ny, Nx), float64.
     """
-    dm_val = float(dm) if dm is not None else float(getattr(cfg, "current_dm", 0.0))
-    is_search = getattr(cfg, "is_dm_search", False) or (dm_val != 0.0)
+    dm_val = float(dm) if dm is not None else float(cfg.current_dm)
+    is_search = cfg.is_dm_search or (dm_val != 0.0)
     dm_suffix = f"_dm{dm_val:06.2f}" if is_search else ""
 
     # --- 1) Reduce per-chunk aggregates for this dm into one global aggregate ---
@@ -157,14 +157,14 @@ def finalise_welford_parallel(
     hdr["PC2_1"]  = 0.0 
     hdr["PC2_2"] = 1.0
 
-    scan_tag = f"_scan_{cfg.scan_id}" if getattr(cfg, "scan_id", None) else ""
+    scan_tag = f"_scan_{cfg.scan_id}" if cfg.scan_id else ""
     full_std_fits = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}{scan_tag}{dm_suffix}_std_map_full.fits")
     hdr["DM"] = dm_val
     fits.writeto(full_std_fits, data=std_map_full.astype(np.float32), header=hdr, overwrite=True)
     print(f"[Final] wrote full std-map (DM={dm_val:.2f}) -> {full_std_fits}")
 
     # --- 3b) Optional per-scan variance search on aggregated Welford maps within each scan ---
-    if cfg.enable_var and getattr(cfg, "enable_var_scan", False):
+    if cfg.enable_var and cfg.enable_var_scan:
         scan_groups = {}
         for item in valid_items:
             sid = item[5] if len(item) > 5 else ""
@@ -195,8 +195,8 @@ def finalise_welford_parallel(
                 spatial_estimator="clipped_rms",
                 clip_sigma=cfg.rms_clip_sigma,
                 subtract_mean_of_std_map=True,
-                use_local_threshold=getattr(cfg, "use_local_threshold", True),
-                local_window_size=getattr(cfg, "local_window_size", 64),
+                use_local_threshold=cfg.use_local_threshold,
+                local_window_size=cfg.local_window_size,
                 dm=dm_val,
             )
             if len(var_scan_dets) > 0:
@@ -237,8 +237,8 @@ def finalise_welford_parallel(
             spatial_estimator="clipped_rms",
             clip_sigma=cfg.rms_clip_sigma,
             subtract_mean_of_std_map=True,
-            use_local_threshold=getattr(cfg, "use_local_threshold", True),
-            local_window_size=getattr(cfg, "local_window_size", 64),
+            use_local_threshold=cfg.use_local_threshold,
+            local_window_size=cfg.local_window_size,
             dm=dm_val,
         )
         if len(var_final) > 0:
@@ -269,8 +269,8 @@ def finalise_welford_parallel(
                 srcname = cand["srcname"]
                 if cfg.save_full_var_lightcurves and all_cube is not None:
                     rms_full = candidates.compute_candidate_local_rms(
-                        all_cube, cand, window_size=getattr(cfg, "local_window_size", 64),
-                        clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+                        all_cube, cand, window_size=cfg.local_window_size,
+                        clip_sigma=cfg.rms_clip_sigma,
                     )
                     _ = candidates.save_candidate_lightcurves(
                         times=all_times, cube=all_cube, candidate=cand,
@@ -287,7 +287,7 @@ def finalise_welford_parallel(
                         ra0_rad=cfg.ra0_rad, dec0_rad=cfg.dec0_rad,
                         pix_rad=cfg.pix_rad, ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
                         std_map=std_map_full, use_std_images=True,
-                        continuum_dir=getattr(cfg, "continuum_dir", None),
+                        continuum_dir=cfg.continuum_dir,
                         method="variance",
                         var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
                         rms_full=rms_full,
@@ -311,7 +311,7 @@ def finalise_welford_parallel(
         candidates.generate_obs_variance_candidate_products(
             ms_base=cfg.ms_base,
             candidates_dir=cfg.candidates_dir,
-            continuum_dir=getattr(cfg, "continuum_dir", None),
+            continuum_dir=cfg.continuum_dir,
             spatial_size=50
         )
     except Exception as e:
@@ -321,9 +321,9 @@ def finalise_welford_parallel(
 
 
 def consolidate_catalogues(cfg: Config):
-    dm_val = float(getattr(cfg, "current_dm", 0.0))
-    scan_tag = f"_scan_{cfg.scan_id}" if getattr(cfg, "scan_id", None) else ""
-    is_search = getattr(cfg, "is_dm_search", False) or (dm_val != 0.0)
+    dm_val = float(cfg.current_dm)
+    scan_tag = f"_scan_{cfg.scan_id}" if cfg.scan_id else ""
+    is_search = cfg.is_dm_search or (dm_val != 0.0)
     if is_search:
         dm_tag = f"_dm{dm_val:06.2f}"
         ms_base_tag = f"{cfg.ms_base}{scan_tag}{dm_tag}"
@@ -349,9 +349,9 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     run variance search on each trial DM (if enabled), run boxcar search on all trial DMs,
     and return per-chunk Welford aggregates.
     """
-    dm_trials = getattr(cfg, "dm_trials", None)
+    dm_trials = cfg.dm_trials
     if not dm_trials:
-        dm_trials = [float(getattr(cfg, "current_dm", 0.0))]
+        dm_trials = [float(cfg.current_dm)]
 
     # Load chunk visibility and coordinate data once from MS into RAM
     times, chan_freq, dt, vis_3d, wgt_3d, uvw_3d = imaging.load_chunk_data(
@@ -373,7 +373,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
     dm0_box_cands = []
     racs_coords = None
     psrcat_coords = None
-    if getattr(cfg, "filter_ips_agn", True):
+    if cfg.filter_ips_agn:
         center_c = SkyCoord(cfg.ra0_rad, cfg.dec0_rad, unit="rad", frame="icrs")
         psrcat_coords = catalogues.get_cached_psrcat_coords()
         racs_coords = catalogues.get_cached_racs_coords(center_coord=center_c, cone_radius_deg=3.0)
@@ -401,13 +401,13 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
             nthreads=cfg.nthreads,
             verbosity=cfg.verbosity,
             dm=dm_val,
-            collapse_channels=getattr(cfg, "collapse_channels", False),
-            nsubbands=getattr(cfg, "nsubbands", 1),
-            exact_uvw=getattr(cfg, "exact_uvw", True),
-            min_valid_channels=getattr(cfg, "min_valid_channels", 24),
+            collapse_channels=cfg.collapse_channels,
+            nsubbands=cfg.nsubbands,
+            exact_uvw=cfg.exact_uvw,
+            min_valid_channels=cfg.min_valid_channels,
         )
 
-        is_search = getattr(cfg, "is_dm_search", False) or (dm_val != 0.0)
+        is_search = cfg.is_dm_search or (dm_val != 0.0)
         dm_suffix = f"_dm{dm_val:06.2f}" if is_search else ""
         chunk_root = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_chunk_{start:06d}")
 
@@ -454,8 +454,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         spatial_estimator="clipped_rms",
                         clip_sigma=cfg.rms_clip_sigma,
                         subtract_mean_of_std_map=True,
-                        use_local_threshold=getattr(cfg, "use_local_threshold", True),
-                        local_window_size=getattr(cfg, "local_window_size", 64),
+                        use_local_threshold=cfg.use_local_threshold,
+                        local_window_size=cfg.local_window_size,
                         dm=dm_val,
                     )
                     if len(var_dets) > 0:
@@ -483,11 +483,11 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                         # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
                         if dm_val == 0.0:
                             dm0_var_cands = [dict(c) for c in annotated_var]
-                        elif getattr(cfg, "filter_ips_agn", True) and len(dm0_var_cands) > 0 and (racs_coords is not None):
+                        elif cfg.filter_ips_agn and len(dm0_var_cands) > 0 and (racs_coords is not None):
                             annotated_var = filters.filter_ips_agn_candidates(
                                 annotated_var, dm0_var_cands, racs_coords, psrcat_coords,
-                                ips_thresh=getattr(cfg, "ips_snr_ratio_threshold", 0.8),
-                                ips_radius_arcsec=getattr(cfg, "ips_match_radius_arcsec", 30.0),
+                                ips_thresh=cfg.ips_snr_ratio_threshold,
+                                ips_radius_arcsec=cfg.ips_match_radius_arcsec,
                             )
 
                         t_var = candidates.candidates_to_astropy_table(annotated_var)
@@ -515,8 +515,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     if cfg.save_var_lightcurves:
                         if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
                             rms_full = candidates.compute_candidate_local_rms(
-                                cube, cand, window_size=getattr(cfg, "local_window_size", 64),
-                                clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+                                cube, cand, window_size=cfg.local_window_size,
+                                clip_sigma=cfg.rms_clip_sigma,
                             )
                             candidates.save_candidate_lightcurves(
                                 times, cube, cand,
@@ -534,7 +534,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                                 pix_rad=cfg.pix_rad,
                                 ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
                                 std_map=std_map_partial, use_std_images=True,
-                                continuum_dir=getattr(cfg, "continuum_dir", None),
+                                continuum_dir=cfg.continuum_dir,
                                 method="variance",
                                 var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
                                 rms_full=rms_full,
@@ -566,8 +566,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     keep_top_k=50,
                     std_mode="spatial_per_window",
                     subtract_mean_per_pixel=True,
-                    use_local_threshold=getattr(cfg, "use_local_threshold", True),
-                    local_window_size=getattr(cfg, "local_window_size", 64),
+                    use_local_threshold=cfg.use_local_threshold,
+                    local_window_size=cfg.local_window_size,
                     dm=dm_val,
                 )
                 dets_by_w = filters.nms_snr_maps_per_width(
@@ -603,11 +603,11 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                     # (RACS - PSRCAT) IPS AGN candidate clustering & suppression at DM > 0
                     if dm_val == 0.0:
                         dm0_box_cands = [dict(c) for c in annotated]
-                    elif getattr(cfg, "filter_ips_agn", True) and len(dm0_box_cands) > 0 and (racs_coords is not None):
+                    elif cfg.filter_ips_agn and len(dm0_box_cands) > 0 and (racs_coords is not None):
                         annotated = filters.filter_ips_agn_candidates(
                             annotated, dm0_box_cands, racs_coords, psrcat_coords,
-                            ips_thresh=getattr(cfg, "ips_snr_ratio_threshold", 0.8),
-                            ips_radius_arcsec=getattr(cfg, "ips_match_radius_arcsec", 30.0),
+                            ips_thresh=cfg.ips_snr_ratio_threshold,
+                            ips_radius_arcsec=cfg.ips_match_radius_arcsec,
                         )
 
                     t_box = candidates.candidates_to_astropy_table(annotated)
@@ -640,8 +640,8 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 if cand["time_center"] >= times[0] and cand["time_center"] <= times[-1]:
                     if cfg.save_box_lightcurves:
                         rms_full = candidates.compute_candidate_local_rms(
-                            cube, cand, window_size=getattr(cfg, "local_window_size", 64),
-                            clip_sigma=getattr(cfg, "rms_clip_sigma", 3.0),
+                            cube, cand, window_size=cfg.local_window_size,
+                            clip_sigma=cfg.rms_clip_sigma,
                         )
                         candidates.save_candidate_lightcurves(
                             times, cube, cand,
@@ -659,7 +659,7 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                             pix_rad=cfg.pix_rad,
                             ra_sign=-1, dec_sign=-1, radesys="ICRS", equinox=None,
                             std_map=None, use_std_images=False,
-                            continuum_dir=getattr(cfg, "continuum_dir", None),
+                            continuum_dir=cfg.continuum_dir,
                             method="boxcar",
                             rms_full=rms_full,
                         )

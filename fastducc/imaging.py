@@ -18,6 +18,7 @@ except Exception as e:
     raise RuntimeError('ducc0 is required') from e
 
 from fastducc import ms_utils
+from fastducc.constants import c as c_light
 
 def continuum_image(
     msname: str,
@@ -422,7 +423,6 @@ def grid_chunk_cube(
         wgt_dedisp = wgt_3d
         eff_freq = chan_freq
 
-    c_light = 299792458.0
     use_exact = bool(exact_uvw and (dm != 0.0) and (not collapse_channels) and (engine is not None))
     freq_1chan = np.array([c_light], dtype=np.float64)
     freq_scale = (eff_freq[None, :, None] / c_light) if use_exact else None
