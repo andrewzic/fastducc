@@ -812,10 +812,10 @@ def main():
     log_memory("Main Startup")
 
     if len(sys.argv) > 1 and sys.argv[1] == "aggregate":
-        aggregate_main(sys.argv)
+        aggregate_main(sys.argv[2:])
         return None
     elif len(sys.argv) > 1 and sys.argv[1] == "aggregate_obs":
-        aggregate_obs_main(sys.argv)
+        aggregate_obs_main(sys.argv[2:])
         return None
     elif len(sys.argv) > 1 and sys.argv[1] == "periodicity":
         from fastducc import nufft_periodicity
@@ -830,11 +830,12 @@ def main():
     args = build_cli()
     if getattr(args, "make_cube", False):
         from fastducc import cube
-        dm_trials = args.dm_list if (getattr(args, "dm_list", None) is not None and len(args.dm_list) > 0) else [args.dm if args.dm is not None else 0.0]
+        dm_list = getattr(args, "dm_list", None)
+        dm_trials = dm_list if (dm_list is not None and len(dm_list) > 0) else [getattr(args, "dm", None) if getattr(args, "dm", None) is not None else 0.0]
         for trial_dm in dm_trials:
             cube.make_dirty_cube(
                 msname=args.msname,
-                out_cube=args.out_cube if len(dm_trials) == 1 else None,
+                out_cube=getattr(args, "out_cube", None) if len(dm_trials) == 1 else None,
                 coord=getattr(args, "coord", None),
                 ra=getattr(args, "ra", None),
                 dec=getattr(args, "dec", None),
@@ -844,23 +845,23 @@ def main():
                 box_size_pix=getattr(args, "box_size_pix", None),
                 box_size_arcsec=getattr(args, "box_size_arcsec", None),
                 radius_unit=getattr(args, "radius_unit", "arcsec"),
-                start_time_idx=args.start_time_idx,
-                end_time_idx=args.end_time_idx,
-                start_time=args.start_time,
-                end_time=args.end_time,
-                chunk_size=args.chunk_size,
-                npix_x=args.npix_x,
-                npix_y=args.npix_y,
-                pixsize_arcsec=args.pixsize_arcsec,
-                corr_mode=args.corr_mode,
-                single_pol=args.single_pol,
-                basis=args.basis,
-                data_column=args.data_column,
-                epsilon=args.epsilon,
-                do_wgridding=args.do_wgridding,
-                nthreads=args.nthreads,
-                verbosity=args.verbosity,
-                min_valid_channels=args.min_valid_channels,
+                start_time_idx=getattr(args, "start_time_idx", None),
+                end_time_idx=getattr(args, "end_time_idx", None),
+                start_time=getattr(args, "start_time", None),
+                end_time=getattr(args, "end_time", None),
+                chunk_size=getattr(args, "chunk_size", 512),
+                npix_x=getattr(args, "npix_x", 384),
+                npix_y=getattr(args, "npix_y", 384),
+                pixsize_arcsec=getattr(args, "pixsize_arcsec", 22.0),
+                corr_mode=getattr(args, "corr_mode", "single"),
+                single_pol=getattr(args, "single_pol", "XX"),
+                basis=getattr(args, "basis", "linear"),
+                data_column=getattr(args, "data_column", "DATA"),
+                epsilon=getattr(args, "epsilon", 1e-6),
+                do_wgridding=getattr(args, "do_wgridding", True),
+                nthreads=getattr(args, "nthreads", 0),
+                verbosity=getattr(args, "verbosity", 0),
+                min_valid_channels=getattr(args, "min_valid_channels", 24),
                 dm=float(trial_dm),
                 collapse_channels=getattr(args, "collapse_channels", False),
                 nsubbands=getattr(args, "nsubbands", 1),
