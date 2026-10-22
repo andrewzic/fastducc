@@ -37,11 +37,15 @@ except ImportError:
             def __iter__(self): return iter(iterable) if iterable else iter([])
         return iterable if iterable is not None else SimplePbar(total)
 
-from casacore.tables import table
+try:
+    from casacore.tables import table
+except ImportError:
+    table = None
+
 try:
     import ducc0
-except Exception as e:
-    raise RuntimeError("ducc0 is required") from e
+except ImportError:
+    ducc0 = None
 
 from fastducc import ms_utils, imaging, dedisp
 from fastducc import wcs as ducc_wcs

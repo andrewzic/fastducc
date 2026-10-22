@@ -11,12 +11,15 @@ except ImportError:
     def tqdm(iterable=None, **kwargs):
         return iterable if iterable is not None else []
 
-from casacore.tables import table
+try:
+    from casacore.tables import table
+except ImportError:
+    table = None
 
 try:
     import ducc0
-except Exception as e:
-    raise RuntimeError('ducc0 is required') from e
+except ImportError:
+    ducc0 = None
 
 from fastducc import ms_utils
 from fastducc.constants import c as c_light

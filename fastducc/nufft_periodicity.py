@@ -25,12 +25,18 @@ from typing import Optional, Tuple, List, Dict
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
-from casacore.tables import table
+try:
+    from casacore.tables import table
+except ImportError:
+    table = None
 from astropy.io import fits
 from astropy.wcs import WCS
 import matplotlib.pyplot as plt
 
-from ducc0 import nufft as ducc_nufft
+try:
+    from ducc0 import nufft as ducc_nufft
+except ImportError:
+    ducc_nufft = None
 
 from fastducc import ms_utils
 from fastducc import wcs as ducc_wcs

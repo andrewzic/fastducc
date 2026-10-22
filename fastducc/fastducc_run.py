@@ -9,16 +9,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 import dask
-from dask.distributed import Client, LocalCluster, as_completed
+try:
+    from dask.distributed import Client, LocalCluster, as_completed
+except ImportError:
+    Client = LocalCluster = as_completed = None
 
-from dask_jobqueue import SLURMCluster
+try:
+    from dask_jobqueue import SLURMCluster
+except ImportError:
+    SLURMCluster = None
 
-from casacore.tables import table
+try:
+    from casacore.tables import table
+except ImportError:
+    table = None
 
 try:
     import ducc0
-except Exception as e:
-    raise RuntimeError('ducc0 is required') from e
+except ImportError:
+    ducc0 = None
     
 from fastducc.fd_types import Config
 from fastducc import candidates, ms_utils, imaging, dedisp
@@ -66,7 +75,7 @@ def _add_bool_flag(
 
 def build_cli(argv=None):
 
-    parser = argparse.ArgumentParser(description='Image MS in time chunks using ducc0 wgridder')
+    parser = argparse.ArgumentParser(prog='fastducc search', description='Image MS in time chunks using ducc0 wgridder')
     parser.add_argument('--msname', required=True, help='Path to Measurement Set')
     parser.add_argument('--chunk-size', type=int, default=512,
                         help='Number of time samples per chunk (default: 512)')
@@ -84,6 +93,7 @@ def build_cli(argv=None):
     parser.add_argument('--epsilon', type=float, default=1e-6)
     _add_bool_flag(parser, '--do-wgridding', '--no-wgridding', 'do_wgridding', True)
     parser.add_argument('--nthreads', type=int, default=0)
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
     parser.add_argument('--verbosity', type=int, default=0)
     parser.add_argument('--boxcar-widths', nargs='+', type=int,
                         help='Widths (in samples) to perform boxcar search over (default: [1, 2, 4, 8, 16, 32, 64])',
@@ -291,119 +301,11 @@ def build_cli(argv=None):
 
     return parser.parse_args(argv)
 
-def build_cli_aggregate(argv=None):
-    p = argparse.ArgumentParser(
-        prog="fastducc aggregate",
-        description="Aggregate per-beam candidate catalogues",
-    )
-    p.add_argument("--obs-root", required=True, help="Root directory containing per-beam outputs")
-    p.add_argument("--kind", choices=["boxcar", "variance"], default="boxcar",
-                   help="Which candidate type to aggregate (default: boxcar)")
-    p.add_argument("--time-tol", type=float, default=0.3,
-                   help="Time tolerance in seconds (default: 0.3)")
-    p.add_argument("--sky-tol-arcsec", type=float, default=35.0,
-                   help="Sky tolerance in arcsec (default: 35)")
-    p.add_argument("--pattern", default=None,
-                   help="Optional glob pattern to discover input CSVs (overrides default)")
-    p.add_argument("--outdir", default=None,
-                   help="Output directory (default: obs-root)")
-    p.add_argument("--max-n-candidates-per-source", "--max-candidates-per-source", "--max-N-candidates-per-source",
-                   type=int, default=100,
-                   help="Maximum events per candidate source to retain in summary (default: 100)")
-
-    args = p.parse_args(argv)
-    return args
-
-
-def build_cli_aggregate_obs(argv=None):
-    p = argparse.ArgumentParser(
-        prog="aggregate_obs",
-        description="Aggregate per-scan cross-beam super summaries across an observation (SBID)."
-    )
-    p.add_argument("--obs-root", required=True, help="Path to SBID directory (e.g. /path/to/SB77974)")
-    p.add_argument("--kind", choices=["variance", "boxcar"], default="variance",
-                   help="Which family of super summaries to aggregate (default: variance)")
-    p.add_argument("--sky-tol-arcsec", type=float, default=35.0,
-                   help="Sky clustering tolerance in arcsec across scans (default: 35)")
-    p.add_argument("--outdir", default=None,
-                   help="Output directory (default: <obs-root>/candidates)")
-    p.add_argument("--pattern", default=None,
-                   help="Override VOT glob (default: <obs-root>/**/candidates/*_<kind>_super_summary.vot)")
-    p.add_argument("--organize", action="store_true", default=True,
-                   help="Organize candidate outputs into per-candidate directory trees under <outdir>/<kind>/<srcname>/ (default: True)")
-    p.add_argument("--no-organize", action="store_false", dest="organize",
-                   help="Disable candidate output directory tree organization")
-    p.add_argument("--link-mode", choices=["symlink", "copy"], default="symlink",
-                   help="How to place artefact files into candidate directories: absolute symlink or copy (default: symlink)")
-    p.add_argument("--organize-structure", choices=["categorized", "flat"], default="categorized",
-                   help="Directory tree structure for candidate subfolders (default: categorized)")
-    p.add_argument("--max-n-candidates-per-source", "--max-candidates-per-source", "--max-N-candidates-per-source",
-                   type=int, default=100,
-                   help="Maximum events per candidate source to output in full candidate list (default: 100)")
-    return p.parse_args(argv)
-
-
-
-def build_cli_periodicity(argv=None):
-    p = argparse.ArgumentParser(
-        prog="fastducc periodicity",
-        description="3-D DUCC NUFFT (u,v,t)->(l,m,f) periodicity search with S/N detection, catalogues and FITS products"
-    )
-    p.add_argument("--msname", required=True, help="Path to Measurement Set")
-    p.add_argument("--spw", type=int, default=0, help="SPW index (default: 0)")
-    p.add_argument("--pol", type=int, default=0, help="Pol index in DATA (default: 0)")
-    p.add_argument("--data-col", default="DATA", help="MS data column (default: DATA)")
-    p.add_argument("--chan-start", type=int, default=None)
-    p.add_argument("--chan-end", type=int, default=None)
-
-    p.add_argument("--npix", type=int, default=384)
-    p.add_argument("--pixscale-arcsec", type=float, default=22.0)
-    p.add_argument("--fmin", type=float, default=0.5, help="Minimum spin frequency to keep (Hz)")
-    p.add_argument("--dm", type=float, default=0.0, help="Dispersion Measure (pc cm^-3)")
-    p.add_argument("--eps", type=float, default=1e-5, help="DUCC NUFFT tolerance")
-    p.add_argument("--nfft-t", type=int, default=None, help="Length of frequency axis (power of 2)")
-    p.add_argument("--block-rows", type=int, default=20000)
-    p.add_argument("--partials-dir", default="partials_periodicity")
-    p.add_argument("--sum-memmap", default="periodicity_sum_complex.dat")
-    p.add_argument("--nthreads", type=int, default=0)
-
-    # outputs
-    p.add_argument("--out-cube-fits", default="periodicity_cube_pow.fits")
-    p.add_argument("--write-products", action="store_true", help="Write additional 2D products (maxpow, bestfreq, PNG)")
-    p.add_argument("--no-write-products", dest="write_products", action="store_false")
-    p.set_defaults(write_products=True)
-
-    # detection flags
-    p.add_argument("--detect", action="store_true", help="Run spatial S/N detection on the spin-frequency cube")
-    p.add_argument("--no-detect", dest="detect", action="store_false")
-    p.set_defaults(detect=True)
-
-    p.add_argument("--threshold-sigma", type=float, default=7.0)
-    p.add_argument("--nharm", type=int, default=8)
-    p.add_argument("--keep-top-k", type=int, default=None)
-    p.add_argument("--spatial-estimator", choices=["clipped_rms", "mad"], default="clipped_rms")
-    p.add_argument("--clip-sigma", type=float, default=3.0)
-
-    # catalogue outputs
-    p.add_argument("--out-csv", default=None, help="Override candidate CSV output path")
-    p.add_argument("--out-vot", default=None, help="Override candidate VOT output path")
-
-    # parallel execution & limits
-    p.add_argument("--max-blocks", type=int, default=None, help="Limit number of blocks processed for testing")
-    p.add_argument("--parallel-mode", choices=["serial", "dask-local", "dask-slurm"], default="dask-local")
-    p.add_argument("--dask-workers", type=int, default=0)
-    p.add_argument("--threads-per-worker", type=int, default=1)
-    p.add_argument("--dask-scheduler", choices=["processes", "threads"], default="processes")
-    p.add_argument("--scheduler-address", default=None, help="Existing Dask scheduler address")
-    p.add_argument('--slurm-partition', default=None, help='SLURM partition/queue')
-    p.add_argument('--slurm-account',  default=None, help='SLURM account/project')
-    p.add_argument('--slurm-cores-per-worker', type=int, default=1, help='CPUs/cores per SLURM worker')
-    p.add_argument('--slurm-mem', default='128GB', help='Memory limit per SLURM worker (e.g., 128GB)')
-    p.add_argument('--slurm-walltime', default='02:00:00', help='SLURM job walltime (e.g. 02:00:00)')
-    p.add_argument('--slurm-job-extra', nargs='*', default=None, help='Extra SLURM directives')
-    p.add_argument('--slurm-interface', default=None, help='Network interface for SLURM workers')
-
-    return p.parse_args(argv)
+from fastducc.cli import (
+    build_cli_aggregate,
+    build_cli_aggregate_obs,
+    build_cli_periodicity,
+)
 
 
 def make_config(args, paths) -> Config:
@@ -788,9 +690,12 @@ def run_pipeline(args):
     log_memory("After consolidate_chunk_catalogues (Finished)")
 
 
-def main():
+def main(argv: list[str] | None = None):
+    if argv is None:
+        argv = sys.argv[1:]
+
     log_level = logging.INFO
-    if "-v" in sys.argv or "--verbose" in sys.argv or any(arg.startswith("--verbosity") for arg in sys.argv):
+    if "-v" in argv or "--verbose" in argv or any(arg.startswith("--verbosity") for arg in argv):
         log_level = logging.DEBUG
     logging.basicConfig(
         level=log_level,
@@ -799,23 +704,20 @@ def main():
     )
     log_memory("Main Startup")
 
-    if len(sys.argv) > 1 and sys.argv[1] == "aggregate":
-        aggregate_main(sys.argv[2:])
-        return None
-    elif len(sys.argv) > 1 and sys.argv[1] == "aggregate_obs":
-        aggregate_obs_main(sys.argv[2:])
-        return None
-    elif len(sys.argv) > 1 and sys.argv[1] == "periodicity":
+    if len(argv) > 0 and argv[0] == "aggregate":
+        return aggregate_main(argv[1:])
+    elif len(argv) > 0 and argv[0] in ("aggregate_obs", "aggregate-obs"):
+        return aggregate_obs_main(argv[1:])
+    elif len(argv) > 0 and argv[0] == "periodicity":
         from fastducc import nufft_periodicity
-        args = build_cli_periodicity(sys.argv[2:])
+        args = build_cli_periodicity(argv[1:])
         nufft_periodicity.run_periodicity(args)
-        return None
-    elif len(sys.argv) > 1 and sys.argv[1] in ("cube", "make-cube", "make_cube"):
+        return 0
+    elif len(argv) > 0 and argv[0] in ("cube", "make-cube", "make_cube"):
         from fastducc import cube
-        cube.main(sys.argv[2:])
-        return None
+        return cube.main(argv[1:])
     
-    args = build_cli()
+    args = build_cli(argv)
     if getattr(args, "make_cube", False):
         from fastducc import cube
         dm_list = getattr(args, "dm_list", None)
@@ -865,9 +767,9 @@ def main():
                 out_uv_imag=getattr(args, "out_uv_imag", None) if len(dm_trials) == 1 else None,
                 uv_4d=getattr(args, "uv_4d", False),
             )
-        return None
-    run_pipeline(args)
-    return None
+        return 0
+    res = run_pipeline(args)
+    return res if isinstance(res, int) else 0
 
 
     

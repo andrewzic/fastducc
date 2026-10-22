@@ -5,7 +5,18 @@ import numpy as np
 import astropy.constants as const
 import astropy.units as u
 
-from casacore.tables import table, taql
+try:
+    from casacore.tables import table, taql
+except ImportError:
+    table = None
+    taql = None
+
+def _require_casacore():
+    if table is None or taql is None:
+        raise ImportError(
+            "casacore is required for Measurement Set operations. "
+            "Please install python-casacore (e.g. conda install -c conda-forge python-casacore)."
+        )
 
 # CASA POLARIZATION CORR_TYPE integer codes to labels
 _CORR_CODE_TO_NAME = {
@@ -15,6 +26,7 @@ _CORR_CODE_TO_NAME = {
 
 def get_corr_label_indices(msname: str):
     """Return (labels_list, label->index dict) from POLARIZATION/CORR_TYPE."""
+    _require_casacore()
     t_pol = table(f"{msname}/POLARIZATION", readonly=True)
     corr_types = t_pol.getcell('CORR_TYPE', 0)
     t_pol.close()
@@ -24,6 +36,7 @@ def get_corr_label_indices(msname: str):
 
 
 def get_channel_lambdas(ms):
+    _require_casacore()
     spw_path = f"{ms}/SPECTRAL_WINDOW"
     tf = table(spw_path, readonly=True)
     if tf.nrows() == 0 and ms.endswith(".uvsub.ms"):
@@ -43,6 +56,7 @@ def get_unique_times(msname: str, time_col: str) -> tuple[np.ndarray, np.ndarray
     """
     Get sorted unique times and scan numbers efficiently using TaQL.
     """
+    _require_casacore()
     t = table(msname, readonly=True)
     has_scan = 'SCAN_NUMBER' in set(t.colnames())
     if has_scan:
@@ -171,6 +185,7 @@ def get_phase_center(msname: str, field_name: str | None = None):
     Returns (ra0_rad, dec0_rad, selected_field_name).
     If field_name is None, uses the first row in FIELD.
     """
+    _require_casacore()
     t_field = table(f"{msname}/FIELD", readonly=True)
     names = t_field.getcol("NAME")          # shape: (nfield,)
     phase_dir = t_field.getcol("PHASE_DIR") # shape: (nfield, 2, n_poly) in radians

@@ -1,5 +1,14 @@
 from typing import Tuple, Optional, Union
-from numba import njit, prange
+try:
+    from numba import njit, prange
+except ImportError:
+    def njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]):
+            return args[0]
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
 import numpy as np
 from scipy.ndimage import uniform_filter
 
