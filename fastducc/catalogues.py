@@ -1,6 +1,9 @@
 from __future__ import annotations
+import logging
 import os
 from importlib import resources
+
+logger = logging.getLogger(__name__)
 
 ENV_PSRCAT = "FASTDUCC_PSRCAT_CSV"
 ENV_RACS   = "FASTDUCC_RACS_VOT"
@@ -75,7 +78,7 @@ def get_cached_psrcat_coords(psrcat_csv_path: str | None = None):
                 if len(ra_deg) > 0:
                     _CACHED_PSRCAT_COORDS = SkyCoord(ra_deg, dec_deg, unit="deg", frame="icrs")
         except Exception as e:
-            print(f"[Catalogues] Warning: Failed to load local PSRCAT from '{path}': {e}")
+            logger.warning(f"Failed to load local PSRCAT from '{path}': {e}")
     return _CACHED_PSRCAT_COORDS
 
 def get_cached_racs_coords(
@@ -103,7 +106,7 @@ def get_cached_racs_coords(
                         unit="deg", frame="icrs"
                     )
             except Exception as e:
-                print(f"[Catalogues] Warning: Failed to load local RACS from '{path}': {e}")
+                logger.warning(f"Failed to load local RACS from '{path}': {e}")
 
     if _CACHED_RACS_COORDS is not None and center_coord is not None:
         import astropy.units as u

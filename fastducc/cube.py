@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import inspect
+import logging
 import math
 import os
 import shutil
@@ -23,6 +24,8 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astropy.io import fits
 from astropy.time import Time
+
+logger = logging.getLogger(__name__)
 try:
     from tqdm import tqdm
 except ImportError:
@@ -868,7 +871,7 @@ def make_dirty_cube(
 
     gap_str = f"gaps={len(time_info['blank_indices'])} blanks" if time_info["has_gaps"] else "no gaps"
     dm_str = f" | DM: {dm:.2f} pc/cm^3 (delay_sweep={max_delay_samps} samps, exact_uvw={exact_uvw})" if dm != 0.0 else ""
-    print(f"[fastducc cube] MS: {msname} | Observed Frames: {total_frames} (indices {start_idx}..{end_idx}) | Output Planes: {total_planes} | Spacing: {time_info['spacing_type']} ({gap_str}, dt={time_info['dt_nominal']:.4f}s) | Targets: {'save-uv (uv-only)' if uv_only else ('save-uv (dirty+uv)' if save_uv else 'dirty-only')}{dm_str} | Chunks: {len(chunk_tasks)} | Mode: {parallel_mode} (workers={n_workers})")
+    logger.info(f"MS: {msname} | Observed Frames: {total_frames} (indices {start_idx}..{end_idx}) | Output Planes: {total_planes} | Spacing: {time_info['spacing_type']} ({gap_str}, dt={time_info['dt_nominal']:.4f}s) | Targets: {'save-uv (uv-only)' if uv_only else ('save-uv (dirty+uv)' if save_uv else 'dirty-only')}{dm_str} | Chunks: {len(chunk_tasks)} | Mode: {parallel_mode} (workers={n_workers})")
 
     # In-memory streaming initialization
     header_size = init_empty_fits_cube(out_cube, hdr3d, (total_planes, ny_out, nx_out), dtype=np_dtype, overwrite=overwrite, blank_indices=time_info["blank_indices"] if create_blanks else None) if write_dirty else 0
@@ -954,10 +957,10 @@ def make_dirty_cube(
             if flag and p and os.path.exists(p):
                 append_timestamps_extension(p, table_hdu)
 
-    if write_dirty: print(f"[fastducc cube] Successfully written dirty cube -> {out_cube}")
+    if write_dirty: logger.info(f"Successfully written dirty cube -> {out_cube}")
     if save_uv:
-        print(f"[fastducc cube] Successfully written UV real cube -> {out_cube_real}")
-        print(f"[fastducc cube] Successfully written UV imag cube -> {out_cube_imag}")
+        logger.info(f"Successfully written UV real cube -> {out_cube_real}")
+        logger.info(f"Successfully written UV imag cube -> {out_cube_imag}")
 
     return out_cube_real if uv_only else out_cube
 

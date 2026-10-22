@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 from typing import List, Dict, Any, Optional
 
 import numpy as np
 
 from fastducc.filters import is_zero_flux_candidate
 from fastducc import kernels
+
+logger = logging.getLogger(__name__)
 
 
 def make_stdmap_snippet(
@@ -310,7 +313,7 @@ def save_candidate_lightcurves(
         raise ValueError("times length must match cube time axis")
 
     if is_zero_flux_candidate(candidate, cube):
-        print(f"[Warning] Skipping lightcurves for zero-flux candidate {candidate.get('srcname', '')}")
+        logger.warning(f"Skipping lightcurves for zero-flux candidate {candidate.get('srcname', '')}")
         return {}
 
     y = int(candidate["y"])

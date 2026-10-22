@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Any, Tuple
 
@@ -19,6 +20,8 @@ except Exception as e:
 
 from fastducc import ms_utils
 from fastducc.constants import c as c_light
+
+logger = logging.getLogger(__name__)
 
 def continuum_image(
     msname: str,
@@ -66,10 +69,8 @@ def continuum_image(
     list[tuple[float, np.ndarray]]
         A list of (time_value, dirty_image) for each processed time sample.
     """
-    #print("hi")
-
     if t_main is None:
-        print("reading table from msname {msname}")
+        logger.debug(f"reading table from msname {msname}")
         t_main = table(msname, readonly=True)
         
     # Frequencies
@@ -100,7 +101,7 @@ def continuum_image(
         wgt_row = t_main.getcol('WEIGHT')
         wgt = np.broadcast_to(wgt_row[:, None, :], data.shape)
 
-    print("applying flags")
+    logger.debug("applying flags")
         
     # Apply flags -> zero weights
     good = ~flags
@@ -174,7 +175,6 @@ def continuum_image(
     if chan_freq.shape[0] != vis.shape[1]:
             raise ValueError('Channel count mismatch between CHAN_FREQ and VIS')
 
-    #print(np.max(wgt_2d), np.median(wgt_2d), np.min(wgt_2d))
     wgt_2d /= np.max(wgt_2d)
         
     dirty = ducc0.wgridder.vis2dirty(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import glob
+import logging
 import subprocess
 import socket
 import getpass
@@ -13,6 +14,8 @@ import numpy as np
 
 import matplotlib
 matplotlib.use('Agg')
+
+logger = logging.getLogger(__name__)
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.offsetbox import AnchoredText
@@ -74,7 +77,7 @@ def save_candidate_summary(
         raise ValueError("Provide npix_x/npix_y and ra0_rad/dec0_rad/pix_rad for WCS.")
 
     if is_zero_flux_candidate(candidate, cube):
-        print(f"[Warning] Skipping summary plot for zero-flux candidate {candidate.get('srcname', '')}")
+        logger.warning(f"Skipping summary plot for zero-flux candidate {candidate.get('srcname', '')}")
         return {}
 
     y = int(candidate["y"])
@@ -175,7 +178,7 @@ def save_candidate_summary(
     if continuum_dir:
         meta_guess = parse_candidate_filename(out_prefix)
         beam_lbl = meta_guess.get("beam", "") if isinstance(meta_guess, dict) else ""
-        print(f"Looking for continuum FITS in '{continuum_dir}' with beam label '{beam_lbl}'...")
+        logger.debug(f"Looking for continuum FITS in '{continuum_dir}' with beam label '{beam_lbl}'...")
         fits_cands = sorted(glob.glob(os.path.join(continuum_dir, f"*{beam_lbl}*.fits")))
         if len(fits_cands) == 0:
             fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits")))

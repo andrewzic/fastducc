@@ -17,7 +17,6 @@ def get_corr_label_indices(msname: str):
     """Return (labels_list, label->index dict) from POLARIZATION/CORR_TYPE."""
     t_pol = table(f"{msname}/POLARIZATION", readonly=True)
     corr_types = t_pol.getcell('CORR_TYPE', 0)
-    #print(f"found corr_types {corr_types} in {msname}")
     t_pol.close()
     labels = [ _CORR_CODE_TO_NAME.get(int(c), str(c)) for c in corr_types ]
     lbl2idx = {lab: i for i, lab in enumerate(labels)}
@@ -185,7 +184,6 @@ def get_phase_center(msname: str, field_name: str | None = None):
         idx = int(matches[0])
 
     # Usually polynomial degree n_poly=1. Use the 0th term.
-    print(phase_dir[idx])
     ra0_rad  = float(phase_dir[idx][ 0, 0])
     dec0_rad = float(phase_dir[idx][ 0, 1])  #phase_dir[idx]: [[-1.67134852 -0.41158857]]
     return ra0_rad, dec0_rad, str(names[idx])

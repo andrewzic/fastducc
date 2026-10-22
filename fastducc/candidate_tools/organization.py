@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 import os
 import glob
 import shutil
@@ -19,6 +20,8 @@ from fastducc.candidate_tools.utils import (
     _unmask_table,
     parse_candidate_filename,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def organize_candidate_outputs(
@@ -39,7 +42,7 @@ def organize_candidate_outputs(
     """
     kind = kind.lower().strip()
     if out_tab is None or len(out_tab) == 0:
-        print(f"[ObsOrganize] No candidates in output table for kind={kind}; skipping organization.")
+        logger.info(f"[ObsOrganize] No candidates in output table for kind={kind}; skipping organization.")
         return
 
     kind_dir = os.path.join(out_dir, kind)
@@ -107,7 +110,7 @@ def organize_candidate_outputs(
         except Exception:
             continue
 
-    print(f"[ObsOrganize] Indexed {len(all_artefacts)} artefact paths and {len(all_comp_rows)} component candidate entries under {obs_root}")
+    logger.info(f"[ObsOrganize] Indexed {len(all_artefacts)} artefact paths and {len(all_comp_rows)} component candidate entries under {obs_root}")
 
     cand_name_to_indices: Dict[str, List[int]] = collections.defaultdict(list)
     for idx, row in enumerate(out_tab):
@@ -181,7 +184,7 @@ def organize_candidate_outputs(
                 for c_i, comp_v_i in zip(idx_cand, idx_comp_valid):
                     comp_matches_by_cand[int(c_i)].append(all_comp_rows[valid_comp_indices[comp_v_i]])
         except Exception as e:
-            print(f"[ObsOrganize] WARNING: Spatial component pre-matching failed: {e}")
+            logger.warning(f"[ObsOrganize] Spatial component pre-matching failed: {e}")
 
     created_dirs = set()
     def _ensure_dir(dpath: str) -> None:
@@ -255,7 +258,7 @@ def organize_candidate_outputs(
                         shutil.copy2(src_path, dest_path)
                 linked_files_count += 1
             except Exception as e:
-                print(f"[ObsOrganize] WARNING: Failed to {link_mode} '{src_path}' -> '{dest_path}': {e}")
+                logger.warning(f"[ObsOrganize] Failed to {link_mode} '{src_path}' -> '{dest_path}': {e}")
 
         # Write observation-level summary table (1 row for this candidate) directly as CSV
         try:
@@ -275,7 +278,7 @@ def organize_candidate_outputs(
                     writer.writeheader()
                     writer.writerow(obs_row_dict)
         except Exception as e:
-            print(f"[ObsOrganize] WARNING: Could not write obs summary table for {srcname}: {e}")
+            logger.warning(f"[ObsOrganize] Could not write obs summary table for {srcname}: {e}")
 
         # Agglomerate & write all component candidate entries matching this source
         try:
@@ -328,10 +331,10 @@ def organize_candidate_outputs(
                         writer.writeheader()
                         writer.writerows(clean_matched)
         except Exception as e:
-            print(f"[ObsOrganize] WARNING: Could not write full candidate list table for {srcname}: {e}")
+            logger.warning(f"[ObsOrganize] Could not write full candidate list table for {srcname}: {e}")
 
         organized_count += 1
         if (idx + 1) % 500 == 0 or (idx + 1) == len(out_tab):
-            print(f"[ObsOrganize] Processed {idx + 1}/{len(out_tab)} candidates ({linked_files_count} links/files created)...", flush=True)
+            logger.info(f"[ObsOrganize] Processed {idx + 1}/{len(out_tab)} candidates ({linked_files_count} links/files created)...")
 
-    print(f"[ObsOrganize] Organized {organized_count} candidates ({linked_files_count} files/links created) under {kind_dir}")
+    logger.info(f"[ObsOrganize] Organized {organized_count} candidates ({linked_files_count} files/links created) under {kind_dir}")

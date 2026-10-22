@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import os
 from typing import List
 
@@ -10,6 +11,8 @@ from fastducc.fd_types import Config
 from fastducc import filters, kernels, candidates, detection, imaging, catalogues
 from astropy.coordinates import SkyCoord
 import astropy.units as u
+
+logger = logging.getLogger(__name__)
 
 
 def welford_combine_aggregates(count_a, mean_a, M2_a, count_b, mean_b, M2_b):
@@ -161,7 +164,7 @@ def finalise_welford_parallel(
     full_std_fits = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}{scan_tag}{dm_suffix}_std_map_full.fits")
     hdr["DM"] = dm_val
     fits.writeto(full_std_fits, data=std_map_full.astype(np.float32), header=hdr, overwrite=True)
-    print(f"[Final] wrote full std-map (DM={dm_val:.2f}) -> {full_std_fits}")
+    logger.info(f"[Final] Wrote full std-map (DM={dm_val:.2f}) -> {full_std_fits}")
 
     # --- 3b) Optional per-scan variance search on aggregated Welford maps within each scan ---
     if cfg.enable_var and cfg.enable_var_scan:
@@ -224,7 +227,7 @@ def finalise_welford_parallel(
                     csv_path=f"{var_root}_candidates.csv",
                     vot_path=f"{var_root}_candidates.vot"
                 )
-                print(f"[Final] wrote per-scan variance candidates for scan {sid} (DM={dm_val:.2f}) -> {var_root}_candidates.csv")
+                logger.info(f"[Final] Wrote per-scan variance candidates for scan {sid} (DM={dm_val:.2f}) -> {var_root}_candidates.csv")
 
     # --- 4) Optional final variance search on the full std-map ---
     if cfg.enable_var_obs and cfg.enable_var:
@@ -315,7 +318,7 @@ def finalise_welford_parallel(
             spatial_size=50
         )
     except Exception as e:
-        print(f"[FinaliseWelford] Note: Obs variance products generation: {e}")
+        logger.warning(f"[FinaliseWelford] Note: Obs variance products generation: {e}")
 
     return std_map_full
 
@@ -363,7 +366,7 @@ def _load_plot_only_candidates(
     if os.path.exists(vot_path):
         return candidates.astropy_table_to_candidates(vot_path)
 
-    print(f"[Warning] No candidates found for plotting: no vot files at {root_path}_candidates.vot or {vot_path}")
+    logger.warning(f"No candidates found for plotting: no vot files at {root_path}_candidates.vot or {vot_path}")
     return []
 
 
@@ -406,7 +409,7 @@ def _export_variance_chunk_products(
                     rms_full=rms_full,
                 )
             else:
-                print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
+                logger.warning(f"Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
         if cfg.save_var_snippets:
             std_snip = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
             candidates.save_candidate_snippet_products(
@@ -471,7 +474,7 @@ def _export_boxcar_chunk_products(
                     ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=6, dpi=180
                 )
         else:
-            print(f"[Warning] Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
+            logger.warning(f"Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
 
 
 def _process_variance_chunk_dm(

@@ -42,9 +42,9 @@ def log_memory(stage: str):
         virtual_mem = psutil.virtual_memory()
         sys_used = virtual_mem.used / (1024 * 1024)
         sys_total = virtual_mem.total / (1024 * 1024)
-        print(f"[MEM PROFILE] Stage: {stage} | Self RSS: {self_mb:.2f} MB | Children RSS: {child_mb:.2f} MB | System Used: {sys_used:.2f}/{sys_total:.2f} MB", flush=True)
+        logger.debug(f"[MEM PROFILE] Stage: {stage} | Self RSS: {self_mb:.2f} MB | Children RSS: {child_mb:.2f} MB | System Used: {sys_used:.2f}/{sys_total:.2f} MB")
     except Exception as e:
-        print(f"[MEM PROFILE ERROR] Could not log memory at {stage}: {e}", flush=True)
+        logger.debug(f"[MEM PROFILE ERROR] Could not log memory at {stage}: {e}")
 
 
 def _add_bool_flag(
@@ -513,13 +513,13 @@ def run_pipeline(args):
     log_memory("After get_unique_times (casacore)")
     total_chunks = len(unique_times)
         
-    print(f"Found {total_chunks} time chunks in MS: {cfg.msname}")
-    print(f"Found time resolution {dt}s")
+    logger.info(f"Found {total_chunks} time chunks in MS: {cfg.msname}")
+    logger.info(f"Found time resolution {dt}s")
 
     # Determine DM trial grid
     if args.dm_list is not None and len(args.dm_list) > 0:
         dm_trials = [float(d) for d in args.dm_list]
-        print(f"Explicit DM Trial List: {len(dm_trials)} trial DMs: {dm_trials}")
+        logger.info(f"Explicit DM Trial List: {len(dm_trials)} trial DMs: {dm_trials}")
     elif args.dm is not None:
         dm_trials = [float(args.dm)]
     elif args.dm_max > args.dm_min:
@@ -533,7 +533,7 @@ def run_pipeline(args):
             tolerance_samples=args.dm_tol,
         )
         dm_trials = [float(d) for d in plan.trial_dms]
-        print(f"Dedispersion Plan: {len(dm_trials)} trial DMs from {dm_trials[0]:.2f} to {dm_trials[-1]:.2f} pc cm^-3 (step ~ {plan.dm_step:.3f})")
+        logger.info(f"Dedispersion Plan: {len(dm_trials)} trial DMs from {dm_trials[0]:.2f} to {dm_trials[-1]:.2f} pc cm^-3 (step ~ {plan.dm_step:.3f})")
     else:
         dm_trials = [0.0]
 
@@ -551,17 +551,17 @@ def run_pipeline(args):
         max_delay_samps = dedisp.get_dm_samps(channel_freqs, max_dm, dt)
         if max_delay_samps + 1 > buffer_overlap_samps:
             buffer_overlap_samps = max_delay_samps + 1
-            print(f"Adjusted buffer_overlap_samps to {buffer_overlap_samps} samples ({buffer_overlap_samps * dt:.2f} s) to accommodate max trial DM {max_dm:.2f}")
+            logger.info(f"Adjusted buffer_overlap_samps to {buffer_overlap_samps} samples ({buffer_overlap_samps * dt:.2f} s) to accommodate max trial DM {max_dm:.2f}")
 
     chunk_size = max(1, args.chunk_size)
     if chunk_size < 2 * buffer_overlap_samps:
-        print(f"WARNING: chunk_size {chunk_size} is smaller than 2 * buffer_overlap_samps {2*buffer_overlap_samps}.")
+        logger.warning(f"chunk_size {chunk_size} is smaller than 2 * buffer_overlap_samps {2*buffer_overlap_samps}.")
     
     chunk_bounds, scan_per_time_idx = ms_utils.get_scan_aware_chunk_bounds(
         cfg.msname, time_col, chunk_size, buffer_overlap_samps
     )
     log_memory("After get_scan_aware_chunk_bounds (casacore)")
-    print(f"Defined {len(chunk_bounds)} scan-aware chunks across {len(np.unique(scan_per_time_idx))} scans.")
+    logger.info(f"Defined {len(chunk_bounds)} scan-aware chunks across {len(np.unique(scan_per_time_idx))} scans.")
 
     # Pre-compute scan_id_str for each chunk
     chunk_scan_ids = []
@@ -583,24 +583,24 @@ def run_pipeline(args):
             if str(args.scan_id) in str(s)
         ]
         if len(filtered) == 0:
-            print(f"WARNING: No chunks matched scan_id '{args.scan_id}'. Available scans: {set(chunk_scan_ids)}")
+            logger.warning(f"No chunks matched scan_id '{args.scan_id}'. Available scans: {set(chunk_scan_ids)}")
         else:
             chunk_bounds = [b for b, s in filtered]
             chunk_scan_ids = [s for b, s in filtered]
-            print(f"Filtered to {len(chunk_bounds)} chunks matching scan '{args.scan_id}'.")
+            logger.info(f"Filtered to {len(chunk_bounds)} chunks matching scan '{args.scan_id}'.")
 
     if args.max_chunks > 0 and len(chunk_bounds) > args.max_chunks:
         chunk_bounds = chunk_bounds[:args.max_chunks]
         chunk_scan_ids = chunk_scan_ids[:args.max_chunks]
-        print(f"Limited to first {len(chunk_bounds)} chunks.")
+        logger.info(f"Limited to first {len(chunk_bounds)} chunks.")
 
     def _process_chunks(client=None):
-        print(f"\n{'='*70}\nProcessing {len(chunk_bounds)} chunk(s) across {len(dm_trials)} DM trial(s) ({dm_trials[0]:.2f}..{dm_trials[-1]:.2f} pc cm^-3)\n{'='*70}", flush=True)
+        logger.info(f"Processing {len(chunk_bounds)} chunk(s) across {len(dm_trials)} DM trial(s) ({dm_trials[0]:.2f}..{dm_trials[-1]:.2f} pc cm^-3)")
         if client is None:
             # Serial execution
             agg_list = []
             for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
-                print(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...", flush=True)
+                logger.info(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...")
                 chunk_times = unique_times[start:end+1]
                 res = fd_core.process_chunk_task(
                     cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
@@ -614,7 +614,7 @@ def run_pipeline(args):
             futures = [client.submit(fd_core.process_chunk_task, cfg, ms_base, candidates_dir, s, e, scan_id_str, unique_times[s:e+1])
                        for ((s, e), scan_id_str) in zip(chunk_bounds, chunk_scan_ids)]
             total = len(futures)
-            print(f"[Dask] Submitted {total} chunk tasks across {len(dm_trials)} DM trials. Monitoring progress...", flush=True)
+            logger.info(f"[Dask] Submitted {total} chunk tasks across {len(dm_trials)} DM trials. Monitoring progress...")
             completed = 0
             t_start = time.time()
             fut_to_idx = {f: i for i, f in enumerate(futures)}
@@ -626,7 +626,7 @@ def run_pipeline(args):
                     try:
                         n_workers = len(client.scheduler_info().get("workers", {}))
                         elapsed = int(time.time() - t_start)
-                        print(f"[Dask Heartbeat] {completed}/{total} chunks completed | {n_workers} worker(s) online ({elapsed}s elapsed)", flush=True)
+                        logger.info(f"[Dask Heartbeat] {completed}/{total} chunks completed | {n_workers} worker(s) online ({elapsed}s elapsed)")
                     except Exception:
                         pass
 
@@ -646,7 +646,7 @@ def run_pipeline(args):
                     elapsed = time.time() - t_start
                     (s, e), sid = chunk_bounds[idx], chunk_scan_ids[idx]
                     n_workers = len(client.scheduler_info().get("workers", {}))
-                    print(f"[Dask Progress] [{completed}/{total}] Chunk {s}..{e} (scan {sid}) finished ({elapsed:.1f}s elapsed, {n_workers} worker(s) online)", flush=True)
+                    logger.info(f"[Dask Progress] [{completed}/{total}] Chunk {s}..{e} (scan {sid}) finished ({elapsed:.1f}s elapsed, {n_workers} worker(s) online)")
             finally:
                 stop_heartbeat.set()
 
@@ -740,7 +740,7 @@ def run_pipeline(args):
             n_workers = max(1, len(chunk_bounds))
 
         cluster.adapt(minimum=0, maximum=n_workers)
-        print(f"[Dask-SLURM] Dynamically adapted cluster (0..{n_workers} workers).", flush=True)
+        logger.info(f"[Dask-SLURM] Dynamically adapted cluster (0..{n_workers} workers).")
         log_memory(f"After cluster.adapt ({n_workers})")
 
         # Connect the client and run
@@ -748,7 +748,7 @@ def run_pipeline(args):
         with Client(cluster) as client:
             log_memory("After Client(cluster) context creation")
             n_init = len(client.scheduler_info()["workers"])
-            print(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready.", flush=True)
+            logger.info(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready.")
             agg_list = _process_chunks(client=client)
             if cfg.enable_var:
                 for trial_dm in dm_trials:
@@ -789,6 +789,14 @@ def run_pipeline(args):
 
 
 def main():
+    log_level = logging.INFO
+    if "-v" in sys.argv or "--verbose" in sys.argv or any(arg.startswith("--verbosity") for arg in sys.argv):
+        log_level = logging.DEBUG
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     log_memory("Main Startup")
 
     if len(sys.argv) > 1 and sys.argv[1] == "aggregate":

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import math
 import time
@@ -39,6 +40,8 @@ from fastducc import constants
 
 C = constants.c
 K_DM = constants.K_DM
+
+logger = logging.getLogger(__name__)
 
 
 def next_pow2(n: int) -> int:
@@ -192,7 +195,7 @@ def _process_block_helper(kw: dict) -> dict:
         return _process_block_and_save(**kw)
     except Exception as e:
         import traceback
-        print(f"[Worker Error Block {kw.get('block_id')}] Exception: {e}", flush=True)
+        logger.error(f"[Worker Error Block {kw.get('block_id')}] Exception: {e}")
         traceback.print_exc()
         raise e
 
@@ -275,17 +278,15 @@ def run_periodicity(args=None) -> str:
     metas: List[Dict] = []
     num_blocks = len(bounds)
 
-    print(f"\n==================================================", flush=True)
-    print(f"[Periodicity] Starting NUFFT Periodicity Search", flush=True)
-    print(f"[Periodicity] Target MS         : {args.msname}", flush=True)
-    print(f"[Periodicity] Total Rows        : {nrows}", flush=True)
-    print(f"[Periodicity] Unique Timestamps : {ut.size} (dt = {dt:.4f} s, total T = {ut[-1]-ut[0]:.2f} s)", flush=True)
-    print(f"[Periodicity] Frequency Grid   : Nf = {Nf}, df = {df:.6f} Hz", flush=True)
-    print(f"[Periodicity] Keeping Spin Freqs: {nkeep} bins in range [{fkeep[0]:.4f}, {fkeep[-1]:.4f}] Hz (fmin={args.fmin} Hz)", flush=True)
-    print(f"[Periodicity] Spatial Grid      : {npix}x{npix} @ {args.pixscale_arcsec}\" ({dl*206265:.1f}\"/pix)", flush=True)
-    print(f"[Periodicity] DM Search Value   : {args.dm} pc cm^-3", flush=True)
-    print(f"[Periodicity] Partitioning      : {num_blocks} block(s) of ~{args.block_rows} rows (nthreads={args.nthreads})", flush=True)
-    print(f"==================================================\n", flush=True)
+    logger.info("Starting NUFFT Periodicity Search")
+    logger.info(f"Target MS         : {args.msname}")
+    logger.info(f"Total Rows        : {nrows}")
+    logger.info(f"Unique Timestamps : {ut.size} (dt = {dt:.4f} s, total T = {ut[-1]-ut[0]:.2f} s)")
+    logger.info(f"Frequency Grid   : Nf = {Nf}, df = {df:.6f} Hz")
+    logger.info(f"Keeping Spin Freqs: {nkeep} bins in range [{fkeep[0]:.4f}, {fkeep[-1]:.4f}] Hz (fmin={args.fmin} Hz)")
+    logger.info(f"Spatial Grid      : {npix}x{npix} @ {args.pixscale_arcsec}\" ({dl*206265:.1f}\"/pix)")
+    logger.info(f"DM Search Value   : {args.dm} pc cm^-3")
+    logger.info(f"Partitioning      : {num_blocks} block(s) of ~{args.block_rows} rows (nthreads={args.nthreads})")
 
     t_start = time.time()
 
@@ -306,7 +307,7 @@ def run_periodicity(args=None) -> str:
             if free_bytes >= 10 * (1024**3):
                 has_enough_jobfs = True
             else:
-                print(f"[Periodicity] Notice: $JOBFS ({jobfs}) has only {free_bytes / (1024**2):.1f} MB free. Falling back to project storage on /fred.", flush=True)
+                logger.warning(f"[Periodicity] Notice: $JOBFS ({jobfs}) has only {free_bytes / (1024**2):.1f} MB free. Falling back to project storage on /fred.")
         except Exception:
             pass
 
@@ -330,7 +331,7 @@ def run_periodicity(args=None) -> str:
             avail_ram = max(0.0, total_ram_gb - main_ram_gb)
             max_safe_workers = max(1, int(avail_ram / worker_ram_gb))
             if workers > max_safe_workers:
-                print(f"[Periodicity] Auto-scaling worker processes from {workers} to {max_safe_workers} to fit {total_ram_gb:.1f} GB RAM safely ({worker_ram_gb} GB/worker)...", flush=True)
+                logger.info(f"[Periodicity] Auto-scaling worker processes from {workers} to {max_safe_workers} to fit {total_ram_gb:.1f} GB RAM safely ({worker_ram_gb} GB/worker)...")
                 workers = max_safe_workers
         except Exception:
             pass
@@ -361,7 +362,7 @@ def run_periodicity(args=None) -> str:
 
             import multiprocessing as mp
             ctx = mp.get_context('forkserver')
-            print(f"[Periodicity] Launching {workers} parallel worker processes (mp_context=forkserver) for {num_blocks} blocks...", flush=True)
+            logger.info(f"[Periodicity] Launching {workers} parallel worker processes (mp_context=forkserver) for {num_blocks} blocks...")
             with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
                 futures = {executor.submit(_process_block_helper, kw): kw["block_id"] for kw in tasks}
                 completed = 0
@@ -387,7 +388,7 @@ def run_periodicity(args=None) -> str:
                     completed += 1
                     elapsed_tot = time.time() - t_start
                     eta_tot = (elapsed_tot / completed) * (num_blocks - completed)
-                    print(f"[Periodicity] Completed {completed:02d}/{num_blocks:02d} blocks (block_id={blk_id:02d}) | Elapsed: {elapsed_tot:6.1f}s | ETA: {eta_tot:6.1f}s", flush=True)
+                    logger.info(f"[Periodicity] Completed {completed:02d}/{num_blocks:02d} blocks (block_id={blk_id:02d}) | Elapsed: {elapsed_tot:6.1f}s | ETA: {eta_tot:6.1f}s")
         else:
             for i, (lo, hi) in enumerate(bounds):
                 t_blk_0 = time.time()
@@ -417,14 +418,14 @@ def run_periodicity(args=None) -> str:
                 dt_blk = time.time() - t_blk_0
                 elapsed_tot = time.time() - t_start
                 eta_tot = (elapsed_tot / (i + 1)) * (num_blocks - (i + 1))
-                print(f"[Periodicity] Block {i+1:02d}/{num_blocks:02d} done (rows {lo:7d}..{hi:7d}) in {dt_blk:5.2f}s | Elapsed: {elapsed_tot:6.1f}s | ETA: {eta_tot:6.1f}s", flush=True)
+                logger.info(f"[Periodicity] Block {i+1:02d}/{num_blocks:02d} done (rows {lo:7d}..{hi:7d}) in {dt_blk:5.2f}s | Elapsed: {elapsed_tot:6.1f}s | ETA: {eta_tot:6.1f}s")
 
     elif args.parallel_mode in ["dask-local", "dask-slurm"]:
         from dask.distributed import Client, LocalCluster, as_completed
 
         cluster = None
         if args.scheduler_address is not None:
-            print(f"[Periodicity] Connecting to existing Dask scheduler at {args.scheduler_address}...", flush=True)
+            logger.info(f"[Periodicity] Connecting to existing Dask scheduler at {args.scheduler_address}...")
             client = Client(args.scheduler_address)
         elif args.parallel_mode == "dask-slurm":
             try:
@@ -441,7 +442,7 @@ def run_periodicity(args=None) -> str:
                         slurm_interface = 'ib0'
                 except Exception:
                     pass
-            print(f"[Periodicity] Launching Dask SLURMCluster (mem={args.slurm_mem}, cores={args.slurm_cores_per_worker}, interface={slurm_interface})...", flush=True)
+            logger.info(f"[Periodicity] Launching Dask SLURMCluster (mem={args.slurm_mem}, cores={args.slurm_cores_per_worker}, interface={slurm_interface})...")
             scheduler_opts = {"dashboard_address": ":0"}
             if slurm_interface:
                 scheduler_opts["interface"] = slurm_interface
@@ -483,7 +484,7 @@ def run_periodicity(args=None) -> str:
                 except Exception:
                     n_workers = 2
             n_workers = min(n_workers, num_blocks)
-            print(f"[Periodicity] Launching Dask LocalCluster with {n_workers} worker processes...", flush=True)
+            logger.info(f"[Periodicity] Launching Dask LocalCluster with {n_workers} worker processes...")
             cluster = LocalCluster(
                 n_workers=n_workers,
                 threads_per_worker=args.threads_per_worker,
@@ -531,21 +532,21 @@ def run_periodicity(args=None) -> str:
                 completed += 1
                 elapsed_tot = time.time() - t_start
                 eta_tot = (elapsed_tot / completed) * (num_blocks - completed)
-                print(f"[Periodicity] Completed {completed:02d}/{num_blocks:02d} blocks (block_id={blk_id:02d}) | Elapsed: {elapsed_tot:6.1f}s | ETA: {eta_tot:6.1f}s", flush=True)
+                logger.info(f"[Periodicity] Completed {completed:02d}/{num_blocks:02d} blocks (block_id={blk_id:02d}) | Elapsed: {elapsed_tot:6.1f}s | ETA: {eta_tot:6.1f}s")
 
         if cluster is not None:
             cluster.close()
     else:
         raise ValueError(f"Unknown parallel-mode: {args.parallel_mode}")
 
-    print(f"\n[Periodicity] NUFFT block computations & accumulation completed in {time.time() - t_start:.2f}s.", flush=True)
+    logger.info(f"NUFFT block computations & accumulation completed in {time.time() - t_start:.2f}s.")
 
     t_stitch_0 = time.time()
-    print(f"[Periodicity] Computing 3D power cube |X(l,m,f)|^2 and spatial FFTShift...", flush=True)
+    logger.info("Computing 3D power cube |X(l,m,f)|^2 and spatial FFTShift...")
     # power cube (fftshift spatial axes so zero-frequency is centered at (npix/2, npix/2))
     P = np.fft.fftshift((np.abs(mm) ** 2), axes=(0, 1)).astype(np.float32)
     del mm
-    print(f"[Periodicity] Phase stitching and power cube construction done in {time.time() - t_stitch_0:.2f}s.", flush=True)
+    logger.info(f"Phase stitching and power cube construction done in {time.time() - t_stitch_0:.2f}s.")
 
     # --- write 3D FITS cube (power) ---
     w2 = ducc_wcs._build_fullframe_wcs(
@@ -582,11 +583,11 @@ def run_periodicity(args=None) -> str:
 
     out_cube_fits = os.path.join(candidates_dir, args.out_cube_fits)
     hdu.writeto(out_cube_fits, overwrite=True)
-    print(f"[Periodicity] Wrote 3D power FITS cube -> {out_cube_fits}", flush=True)
+    logger.info(f"Wrote 3D power FITS cube -> {out_cube_fits}")
 
     # --- optional quicklook products ---
     if args.write_products:
-        print(f"[Periodicity] Generating quicklook max-power & best-frequency maps...", flush=True)
+        logger.info("Generating quicklook max-power & best-frequency maps...")
         # max over f
         maxpow = np.max(P, axis=2) if P.shape[2] > 0 else np.zeros((npix, npix), dtype=np.float32)
         argmax = np.argmax(P, axis=2).astype(np.int32) if P.shape[2] > 0 else np.zeros((npix, npix), dtype=np.int32)
@@ -614,7 +615,7 @@ def run_periodicity(args=None) -> str:
 
     # --- detection + catalogues ---
     if args.detect:
-        print(f"[Periodicity] Running spatial SNR detection (threshold={args.threshold_sigma} sigma, nharm={args.nharm})...", flush=True)
+        logger.info(f"Running spatial SNR detection (threshold={args.threshold_sigma} sigma, nharm={args.nharm})...")
         dets, _ = detection.detect_periodicity_spatial_snr(
             P, fkeep,
             threshold_sigma=float(args.threshold_sigma),
@@ -644,8 +645,9 @@ def run_periodicity(args=None) -> str:
         out_csv = args.out_csv or os.path.join(candidates_dir, f"{ms_base}_periodicity_all.csv")
         out_vot = args.out_vot or os.path.join(candidates_dir, f"{ms_base}_periodicity_all.vot")
         cand_mod.save_periodicity_candidates_table(tab, out_csv, out_vot)
-        print(f"[Periodicity] Detection complete: Found {len(annotated)} candidate(s). Written to {out_csv}", flush=True)
+        logger.info(f"Detection complete: Found {len(annotated)} candidate(s). Written to {out_csv}")
 
     total_time = time.time() - t_start
-    print(f"[Periodicity] Finished fastducc periodicity search in {total_time:.2f}s.\n", flush=True)
+    logger.info(f"Finished fastducc periodicity search in {total_time:.2f}s.")
+    return out_cube_fits
     return out_cube_fits

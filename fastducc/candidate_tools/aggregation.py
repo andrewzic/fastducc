@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 import os
 import glob
 import re
@@ -27,6 +28,8 @@ try:
 except Exception:
     def reticle(which='rt'):
         return 'o'
+
+logger = logging.getLogger(__name__)
 
 from fastducc.candidate_tools.utils import (
     parse_candidate_filename,
@@ -65,7 +68,7 @@ def consolidate_chunk_catalogues(
         var_csv_files = [f for f in var_csv_files if "_dm" not in os.path.basename(f)]
         box_csv_files = [f for f in box_csv_files if "_dm" not in os.path.basename(f)]
 
-    print(f"[Consolidation] Found {len(var_csv_files)} variance CSVs and {len(box_csv_files)} boxcar CSVs.")
+    logger.info(f"[Consolidation] Found {len(var_csv_files)} variance CSVs and {len(box_csv_files)} boxcar CSVs.")
 
     var_tables = _read_csv_tables(var_csv_files)
     box_tables = _read_csv_tables(box_csv_files)
@@ -83,13 +86,13 @@ def consolidate_chunk_catalogues(
     t_box_all.write(box_out_csv, format="csv", overwrite=True)
     t_box_all.write(box_out_vot, format="votable", overwrite=True)
 
-    print(f"[Consolidation] Wrote {len(t_var_all)} variance candidates -> {var_out_csv}, {var_out_vot}")
-    print(f"[Consolidation] Wrote {len(t_box_all)} boxcar candidates   -> {box_out_csv}, {box_out_vot}")
+    logger.info(f"[Consolidation] Wrote {len(t_var_all)} variance candidates -> {var_out_csv}, {var_out_vot}")
+    logger.info(f"[Consolidation] Wrote {len(t_box_all)} boxcar candidates   -> {box_out_csv}, {box_out_vot}")
 
     try:
         generate_obs_variance_candidate_products(ms_base=ms_base, candidates_dir=out_dir)
     except Exception as e:
-        print(f"[Consolidation] Note: Obs variance products generation: {e}")
+        logger.warning(f"[Consolidation] Note: Obs variance products generation: {e}")
 
     if remove_chunk_catalogues:
         var_vot_files = sorted(glob.glob(var_csv_pattern.replace(".csv", ".vot")))
@@ -103,8 +106,8 @@ def consolidate_chunk_catalogues(
                 os.remove(p)
                 removed += 1
             except Exception as e:
-                print(f"[Consolidation] Could not remove '{p}': {e}")
-        print(f"[Consolidation] Removed {removed} per-chunk catalogue files.")
+                logger.warning(f"[Consolidation] Could not remove '{p}': {e}")
+        logger.info(f"[Consolidation] Removed {removed} per-chunk catalogue files.")
 
 
 def generate_obs_variance_candidate_products(
@@ -157,7 +160,7 @@ def generate_obs_variance_candidate_products(
             std_hdr = hdul[0].header.copy()
             std_wcs = WCS(std_hdr).celestial
     except Exception as e:
-        print(f"[ObsVarProducts] Error reading std_map {std_fits}: {e}")
+        logger.warning(f"[ObsVarProducts] Error reading std_map {std_fits}: {e}")
         return []
 
     generated = []
@@ -323,7 +326,7 @@ def generate_obs_variance_candidate_products(
             generated.append(out_lc)
 
     if generated:
-        print(f"[ObsVarProducts] Generated {len(generated)} products for obs-level variance candidates in {ms_base}.")
+        logger.info(f"[ObsVarProducts] Generated {len(generated)} products for obs-level variance candidates in {ms_base}.")
     return generated
 
 
@@ -385,7 +388,7 @@ def aggregate_beam_candidate_tables(
         try:
             t = Table.read(p, format="votable")
         except Exception as e:
-            print(f"[Aggregate] Skipping '{p}' (read error: {e})")
+            logger.warning(f"[Aggregate] Skipping '{p}' (read error: {e})")
             continue
         meta = parse_candidate_filename(p, require="all")
         field_name = meta["field"]
@@ -688,7 +691,7 @@ def aggregate_observation(
         out_dir = obs_root
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"[Aggregate] Found {len(files)} '{kind}' tables under '{obs_root}'")
+    logger.info(f"[Aggregate] Found {len(files)} '{kind}' tables under '{obs_root}'")
 
     return aggregate_beam_candidate_tables(
         files,
@@ -747,7 +750,7 @@ def aggregate_observation_from_super_summaries(
         vot_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.vot")
         T.write(csv_out, format="csv", overwrite=True)
         T.write(vot_out, format="votable", overwrite=True)
-        print(f"[ObsSuper] No input VOTs found. Wrote empty outputs to {out_dir}")
+        logger.info(f"[ObsSuper] No input VOTs found. Wrote empty outputs to {out_dir}")
         return T
 
     rows: List[Dict[str, Any]] = []
@@ -786,12 +789,12 @@ def aggregate_observation_from_super_summaries(
             tab = Table.read(p, format="votable")
             tab = _unmask_table(tab)
         except Exception as e:
-            print(f"[ObsSuper] Skipping '{p}' (read error: {e})")
+            logger.warning(f"[ObsSuper] Skipping '{p}' (read error: {e})")
             continue
 
         missing = [c for c in required if c not in tab.colnames]
         if missing:
-            print(f"[ObsSuper] '{p}' missing required columns {missing}; skipping.")
+            logger.warning(f"[ObsSuper] '{p}' missing required columns {missing}; skipping.")
             continue
 
         for r in tab:
@@ -820,7 +823,7 @@ def aggregate_observation_from_super_summaries(
             rows.append(d)
 
     if len(rows) == 0:
-        print("[ObsSuper] No valid rows after reading inputs; writing empty outputs.")
+        logger.info("[ObsSuper] No valid rows after reading inputs; writing empty outputs.")
         empty_cols = [
             "source_id","srcname","ra_deg","dec_deg","ra_hms","dec_dms","dm","dm_all",
             "max_snr","max_snr_time_center","max_snr_beam","n_scans",
@@ -935,7 +938,7 @@ def aggregate_observation_from_super_summaries(
             simbad_enable=simbad_enable,
         )
     except Exception as e:
-        print(f"[ObsSuper] WARNING: Crossmatch step failed. Continuing without: {e}")
+        logger.warning(f"[ObsSuper] Crossmatch step failed. Continuing without: {e}")
 
     field = field_for_name or "field"
     sbid = sbid_for_name or os.path.basename(os.path.abspath(obs_root))
@@ -943,7 +946,7 @@ def aggregate_observation_from_super_summaries(
     vot_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.vot")
     out_tab.write(csv_out, format="csv", overwrite=True)
     out_tab.write(vot_out, format="votable", overwrite=True)
-    print(f"[ObsSuper] Wrote {len(out_tab)} sources -> {csv_out}, {vot_out}")
+    logger.info(f"[ObsSuper] Wrote {len(out_tab)} sources -> {csv_out}, {vot_out}")
 
     write_obs_region_files(
         out_tab,
@@ -971,6 +974,6 @@ def aggregate_observation_from_super_summaries(
                 max_n_candidates_per_source=max_n_candidates_per_source,
             )
         except Exception as e:
-            print(f"[ObsSuper] WARNING: Candidate output organization failed: {e}")
+            logger.warning(f"[ObsSuper] Candidate output organization failed: {e}")
 
     return out_tab

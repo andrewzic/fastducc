@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 import os
 import re
 import math
@@ -9,6 +10,8 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 from astropy.table import Table, MaskedColumn, vstack
 from fastducc import wcs as ducc_wcs
+
+logger = logging.getLogger(__name__)
 
 
 def _unmask_table(tab: Table) -> Table:
@@ -197,7 +200,7 @@ def _read_csv_tables(paths: List[str]) -> List[Table]:
             t = Table.read(p, format="csv")
             tables.append(t)
         except Exception as e:
-            print(f"[Consolidation] Skipping '{p}' (read error: {e})")
+            logger.warning(f"Skipping '{p}' (read error: {e})")
     return tables
 
 
