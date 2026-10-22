@@ -3,12 +3,11 @@ import numpy as np
 
 from scipy.ndimage import maximum_filter
 
-try:
-    import ducc0
-except Exception as e:
-    raise RuntimeError('ducc0 is required') from e
-
-def is_zero_flux_candidate(det: Dict[str, Any], cube: Optional[np.ndarray]) -> bool:
+def is_zero_flux_candidate(
+    det: Dict[str, Any],
+    cube: Optional[np.ndarray],
+    zero_frames: Optional[np.ndarray] = None,
+) -> bool:
     """
     Check if candidate has identically 0.0 or NaN flux at its central detection frame,
     or over its boxcar detection window in the given image cube, or if the frame is zero-padded.
@@ -39,7 +38,10 @@ def is_zero_flux_candidate(det: Dict[str, Any], cube: Optional[np.ndarray]) -> b
         return True
 
     # If the central detection frame is entirely zero-padded (all pixels in frame == 0.0)
-    if np.all(cube[c_idx] == 0.0):
+    if zero_frames is not None:
+        if zero_frames[c_idx]:
+            return True
+    elif np.all(cube[c_idx] == 0.0):
         return True
 
     # If any pixel values in the detection window at (y,x) are 0.0 or NaN
@@ -47,7 +49,10 @@ def is_zero_flux_candidate(det: Dict[str, Any], cube: Optional[np.ndarray]) -> b
         return True
 
     # If any frame in the detection window is entirely zero-padded
-    if np.any(np.all(cube[t0:t1] == 0.0, axis=(1, 2))):
+    if zero_frames is not None:
+        if np.any(zero_frames[t0:t1]):
+            return True
+    elif np.any(np.all(cube[t0:t1] == 0.0, axis=(1, 2))):
         return True
 
     return False
@@ -103,6 +108,14 @@ def nms_snr_map_2d(
     # NMS suppression and merge metadata
     detections: List[Dict[str, Any]] = []
     occ = np.ones((Ny, Nx), dtype=bool)
+
+    # Precompute zero and valid frame masks once if cube is provided
+    zero_frames = None
+    valid_frames = None
+    if cube is not None:
+        zero_frames = np.all(cube == 0.0, axis=(1, 2))
+        valid_frames = ~zero_frames
+
     for y, x, s in zip(ys, xs, snr_vals):
         if not occ[y, x]:
             continue
@@ -125,7 +138,7 @@ def nms_snr_map_2d(
         # Optional: derive a representative time from the full cube
         if (time_tag_policy != "none") and (times is not None) and (cube is not None):
             lc = cube[:, y, x].astype(np.float64, copy=False)
-            valid_t = (lc != 0.0) & np.isfinite(lc) & (~np.all(cube == 0.0, axis=(1, 2)))
+            valid_t = (lc != 0.0) & np.isfinite(lc) & valid_frames
             if np.any(valid_t):
                 valid_indices = np.where(valid_t)[0]
                 if time_tag_policy == "peak_absdev":
@@ -150,7 +163,7 @@ def nms_snr_map_2d(
                 det["center_idx"] = k
                 det["time_center"] = float(times[k])
 
-        if cube is not None and is_zero_flux_candidate(det, cube):
+        if cube is not None and is_zero_flux_candidate(det, cube, zero_frames=zero_frames):
             continue
 
         detections.append(det)
@@ -180,6 +193,8 @@ def nms_snr_maps_per_width(
     dt = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
     detections_by_width: Dict[int, List[Dict[str, Any]]] = {}
 
+    zero_frames = np.all(cube == 0.0, axis=(1, 2)) if cube is not None else None
+
     for w, snr_w in snr_cubes.items():
         T_eff, Ny, Nx = snr_w.shape
         if valid_mask is not None and valid_mask.shape != (Ny, Nx):
@@ -205,8 +220,8 @@ def nms_snr_maps_per_width(
             # temporal occupancy gate
             if occ_time is not None:
                 gate = np.ones((Ny, Nx), dtype=bool)
-                for dt in range(-time_radius, time_radius + 1):
-                    t2 = t0 + dt
+                for dt_step in range(-time_radius, time_radius + 1):
+                    t2 = t0 + dt_step
                     if 0 <= t2 < T_eff:
                         gate &= occ_time[t2] #bitwise and assignment
                 snr_slice = np.where(gate, snr_slice, -np.inf)
@@ -254,7 +269,7 @@ def nms_snr_maps_per_width(
                     "duration": float(duration),
                 }
 
-                if cube is not None and is_zero_flux_candidate(det, cube):
+                if cube is not None and is_zero_flux_candidate(det, cube, zero_frames=zero_frames):
                     snr_w[t0, y0:y1, x0:x1] = -np.inf
                     continue
 
@@ -263,8 +278,8 @@ def nms_snr_maps_per_width(
                 # suppress neighborhood in current time
                 snr_w[t0, y0:y1, x0:x1] = -np.inf
                 if occ_time is not None:
-                    for dt in range(-time_radius, time_radius + 1):
-                        t2 = t0 + dt
+                    for dt_step in range(-time_radius, time_radius + 1):
+                        t2 = t0 + dt_step
                         if 0 <= t2 < T_eff:
                             snr_w[t2, y0:y1, x0:x1] = -np.inf
                             occ_time[t2][y0:y1, x0:x1] = False
@@ -287,10 +302,11 @@ def group_filter_across_widths(
 ) -> List[Dict[str, Any]]:
 
     # 1) Flatten all detections across widths
+    zero_frames = np.all(cube == 0.0, axis=(1, 2)) if cube is not None else None
     all_dets: List[Dict[str, Any]] = []
     for dets in detections_by_width.values():
         if cube is not None:
-            dets = [d for d in dets if not is_zero_flux_candidate(d, cube)]
+            dets = [d for d in dets if not is_zero_flux_candidate(d, cube, zero_frames=zero_frames)]
         all_dets.extend(dets)
     if not all_dets:
         return []

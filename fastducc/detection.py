@@ -1,11 +1,6 @@
 from typing import Iterable, Tuple, List, Dict, Any, Optional
 import numpy as np
 
-try:
-    import ducc0
-except Exception:
-    ducc0 = None
-
 from fastducc import kernels
 
 def boxcar_search_time(
@@ -73,6 +68,9 @@ def boxcar_search_time(
 
     mask3 = valid_mask[None, :, :]  # broadcast helper
 
+    # Precompute all-zero frames once across time axis
+    is_zero_frame = np.all(cube == 0.0, axis=(1, 2))
+
     for w in widths_samples:
         if w > T:
             continue
@@ -92,10 +90,11 @@ def boxcar_search_time(
                     # Zero out SNR for zero-padded or invalid frames/pixels
                     c_idx = t0 + (w // 2)
                     t1 = t0 + w
-                    if np.all(cube[c_idx] == 0.0) or np.any(np.all(cube[t0:t1] == 0.0, axis=(1, 2))):
+                    if is_zero_frame[c_idx] or np.any(is_zero_frame[t0:t1]):
                         snr[t0, :, :] = 0.0
                     else:
-                        zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (np.mean(cube[t0:t1], axis=0) == 0.0) | np.isnan(np.mean(cube[t0:t1], axis=0))
+                        mean_w = np.mean(cube[t0:t1], axis=0)
+                        zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (mean_w == 0.0) | np.isnan(mean_w)
                         snr[t0, zero_pix] = 0.0
             else:
                 # Compute a spatial sigma per time window
@@ -116,10 +115,11 @@ def boxcar_search_time(
                     # Zero out SNR for zero-padded or invalid frames/pixels
                     c_idx = t0 + (w // 2)
                     t1 = t0 + w
-                    if np.all(cube[c_idx] == 0.0) or np.any(np.all(cube[t0:t1] == 0.0, axis=(1, 2))):
+                    if is_zero_frame[c_idx] or np.any(is_zero_frame[t0:t1]):
                         snr[t0, :, :] = 0.0
                     else:
-                        zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (np.mean(cube[t0:t1], axis=0) == 0.0) | np.isnan(np.mean(cube[t0:t1], axis=0))
+                        mean_w = np.mean(cube[t0:t1], axis=0)
+                        zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (mean_w == 0.0) | np.isnan(mean_w)
                         snr[t0, zero_pix] = 0.0
 
         elif std_mode == "temporal_per_pixel":
@@ -128,10 +128,11 @@ def boxcar_search_time(
             for t0 in range(T_eff):
                 c_idx = t0 + (w // 2)
                 t1 = t0 + w
-                if np.all(cube[c_idx] == 0.0) or np.any(np.all(cube[t0:t1] == 0.0, axis=(1, 2))):
+                if is_zero_frame[c_idx] or np.any(is_zero_frame[t0:t1]):
                     snr[t0, :, :] = 0.0
                 else:
-                    zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (np.mean(cube[t0:t1], axis=0) == 0.0) | np.isnan(np.mean(cube[t0:t1], axis=0))
+                    mean_w = np.mean(cube[t0:t1], axis=0)
+                    zero_pix = (cube[c_idx] == 0.0) | np.isnan(cube[c_idx]) | (mean_w == 0.0) | np.isnan(mean_w)
                     snr[t0, zero_pix] = 0.0
         else:
             raise ValueError(f"Unknown std_mode='{std_mode}'")
