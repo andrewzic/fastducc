@@ -24,6 +24,7 @@ __all__ = [
     "catalogues",
     "core",
     "cli",
+    "constants",
     "cube",
     "dedisp",
     "imaging",
@@ -33,7 +34,7 @@ __all__ = [
     "ms_utils",
     "wcs",
     "candidates",
-    "types"
+    "fd_types",
 ]
 
 __version__ = "0.1.0"

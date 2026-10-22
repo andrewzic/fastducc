@@ -77,6 +77,8 @@ def build_cli_aggregate_obs(argv: Sequence[str] | None = None) -> argparse.Names
     p.add_argument("--max-n-candidates-per-source", "--max-candidates-per-source", "--max-N-candidates-per-source",
                    type=int, default=100,
                    help="Maximum events per candidate source to output in full candidate list (default: 100)")
+    p.add_argument("--psrcat-path", default=None, help="Override path to PSRCAT CSV catalogue (default: packaged file)")
+    p.add_argument("--racs-path", default=None, help="Override path to RACS VOTable catalogue (default: packaged file)")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
     return p.parse_args(argv)
 
@@ -229,8 +231,8 @@ def run_aggregate_obs(argv: Sequence[str]) -> int:
         sky_tol_arcsec=args.sky_tol_arcsec,
         out_dir=args.outdir,
         pattern=args.pattern,
-        psrcat_csv_path=get_psrcat_csv_path(),
-        racs_vot_path=get_racs_vot_path(),
+        psrcat_csv_path=args.psrcat_path or get_psrcat_csv_path(),
+        racs_vot_path=args.racs_path or get_racs_vot_path(),
         match_radius_arcsec=40.0,
         simbad_enable=False,
         organize=args.organize,

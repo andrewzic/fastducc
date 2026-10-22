@@ -44,10 +44,17 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(args.max_n_candidates_per_source, 100)
 
     def test_build_cli_aggregate_obs(self):
-        args = cli.build_cli_aggregate_obs(["--obs-root", "/tmp/test_sbid", "--no-organize"])
+        args = cli.build_cli_aggregate_obs([
+            "--obs-root", "/tmp/test_sbid",
+            "--no-organize",
+            "--psrcat-path", "/custom/psrcat.csv",
+            "--racs-path", "/custom/racs.xml",
+        ])
         self.assertEqual(args.obs_root, "/tmp/test_sbid")
         self.assertFalse(args.organize)
         self.assertEqual(args.link_mode, "symlink")
+        self.assertEqual(args.psrcat_path, "/custom/psrcat.csv")
+        self.assertEqual(args.racs_path, "/custom/racs.xml")
 
     def test_build_cli_periodicity(self):
         args = cli.build_cli_periodicity(["--msname", "test.ms", "--fmin", "1.5", "--dm", "25.0"])

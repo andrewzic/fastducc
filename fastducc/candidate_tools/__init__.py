@@ -30,10 +30,11 @@ from fastducc.candidate_tools.plotting import (
     save_candidate_summary,
     save_candidate_snippet_products,
 )
-from fastducc.candidate_tools.catalogs import (
+from fastducc.candidate_tools.catalogues import (
     _load_psrcat_csv,
     _load_racs_votable,
     _nearest_within_radius,
+    annotate_observation_with_catalogues,
     annotate_observation_with_catalogs,
 )
 from fastducc.candidate_tools.clustering import (
