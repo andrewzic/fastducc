@@ -431,14 +431,23 @@ def grid_chunk_cube(
     freq_scale = (eff_freq[None, :, None] / c_light) if use_exact else None
 
     # Vectorized precomputation of valid channel count per time snapshot
-    has_valid_wgts = np.any(wgt_dedisp > 0.0, axis=0)  # (nchan, nt)
-    valid_chans_per_t = np.count_nonzero(has_valid_wgts, axis=0)  # (nt,)
+    has_valid_raw_wgts = np.any(wgt_3d > 0.0, axis=0)  # (nchan, nt)
+    raw_valid_chans_per_t = np.count_nonzero(has_valid_raw_wgts, axis=0)  # (nt,)
+    req_chans = min(min_valid_channels, nchan) if min_valid_channels > 0 else 1
+
+    has_valid_dedisp_wgts = np.any(wgt_dedisp > 0.0, axis=0)
+    dedisp_valid_chans_per_t = np.count_nonzero(has_valid_dedisp_wgts, axis=0)
 
     cube = np.empty((nt, npix_y, npix_x), dtype=np.float64)
     for t_idx in range(nt):
-        if valid_chans_per_t[t_idx] < min_valid_channels:
-            cube[t_idx, :, :] = 0.0
-            continue
+        if collapse_channels:
+            if (raw_valid_chans_per_t[t_idx] < req_chans) or (dedisp_valid_chans_per_t[t_idx] < 1):
+                cube[t_idx, :, :] = 0.0
+                continue
+        else:
+            if dedisp_valid_chans_per_t[t_idx] < req_chans:
+                cube[t_idx, :, :] = 0.0
+                continue
 
         vis_snap = vis_dedisp[:, :, t_idx]
         wgt_snap = wgt_dedisp[:, :, t_idx]

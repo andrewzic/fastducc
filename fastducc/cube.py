@@ -880,7 +880,7 @@ def make_dirty_cube(
     use_fitscube = cfg.use_fitscube
     create_blanks = cfg.create_blanks
     floating = cfg.floating
-    """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes."""
+
     if not os.path.exists(msname):
         raise FileNotFoundError(f"Measurement Set '{msname}' not found.")
 
@@ -1164,5 +1164,5 @@ def main(argv: Optional[List[str]] = None) -> int:
     for trial_dm in dm_trials:
         out_cube = args.out_cube if len(dm_trials) == 1 else None
         cfg = CubeConfig.from_namespace(args, dm=float(trial_dm), out_cube=out_cube)
-        make_dirty_cube(cfg=cfg)
+        make_dirty_cube(cfg=cfg, dm=float(trial_dm))
     return 0
