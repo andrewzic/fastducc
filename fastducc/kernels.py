@@ -456,7 +456,11 @@ def welford_finalise_std(count, M2, ddof=1):
     for y in prange(Ny):
         for x in range(Nx):
             denom = count[y, x] - ddof
-            out[y, x] = np.sqrt(M2[y, x] / denom) if denom > 0 else np.nan
+            if denom > 0:
+                m2_val = M2[y, x]
+                out[y, x] = np.sqrt(m2_val / denom) if m2_val >= 0.0 else 0.0
+            else:
+                out[y, x] = np.nan
     return out
 
 

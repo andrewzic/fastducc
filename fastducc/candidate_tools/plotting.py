@@ -134,7 +134,8 @@ def save_candidate_summary(
     wcs_full = ducc_wcs._build_fullframe_wcs(
         npix_x=npix_x, npix_y=npix_y,
         ra0_rad=ra0_rad, dec0_rad=dec0_rad,
-        pixscale_rad=pix_rad, ra_sign=ra_sign, radesys=radesys, equinox=equinox
+        pixscale_rad=pix_rad, ra_sign=ra_sign, dec_sign=dec_sign,
+        radesys=radesys, equinox=equinox
     )
 
     if "ra_rad" in candidate and "dec_rad" in candidate:
@@ -171,7 +172,8 @@ def save_candidate_summary(
     wcs_cut = ducc_wcs._build_tan_wcs_for_snippet(
         spatial_size=spatial_size,
         ra_rad=ra_c, dec_rad=dec_c,
-        pixscale_rad=pix_rad, ra_sign=ra_sign, radesys=radesys, equinox=equinox
+        pixscale_rad=pix_rad, ra_sign=ra_sign, dec_sign=dec_sign,
+        radesys=radesys, equinox=equinox
     )
 
     cont_im, cont_wcs, cont_vmin, cont_vmax = None, None, None, None

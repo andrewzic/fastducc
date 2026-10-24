@@ -118,36 +118,76 @@ def generate_obs_variance_candidate_products(
     spatial_size: int = 50,
     dpi: int = 180,
     cmap: str = "viridis",
+    dm: Optional[float] = None,
+    scan_id: Optional[str] = None,
+    std_fits_path: Optional[str] = None,
 ) -> List[str]:
     """
     Ensure all scan-level / observation-level variance candidates (time_center >= 9000.0)
     have their cutout FITS, fullframe FITS, summary plot, and lightcurve products generated
     directly from std_map_full.fits in candidates_dir.
     """
-    std_fits = os.path.join(candidates_dir, f"{ms_base}_std_map_full.fits")
-    if not os.path.exists(std_fits):
-        cands_matches = glob.glob(os.path.join(candidates_dir, f"*{ms_base}*std_map_full.fits"))
-        if not cands_matches:
-            cands_matches = glob.glob(os.path.join(candidates_dir, "*std_map_full.fits"))
-        if cands_matches:
-            std_fits = cands_matches[0]
-        else:
-            return []
+    dm_suffix = f"_dm{dm:06.2f}" if (dm is not None and dm != 0.0) else ("_dm000.00" if dm == 0.0 else "")
+    scan_tag = f"_scan_{scan_id}" if scan_id else ""
+
+    # Locate full observation std map FITS
+    if std_fits_path and os.path.exists(std_fits_path):
+        std_fits = std_fits_path
+    else:
+        candidate_std_paths = [
+            os.path.join(candidates_dir, f"{ms_base}{scan_tag}{dm_suffix}_std_map_full.fits"),
+            os.path.join(candidates_dir, f"{ms_base}{dm_suffix}_std_map_full.fits"),
+            os.path.join(candidates_dir, f"{ms_base}_std_map_full.fits"),
+        ]
+        std_fits = None
+        for p in candidate_std_paths:
+            if os.path.exists(p):
+                std_fits = p
+                break
+        if std_fits is None:
+            cands_matches = sorted(glob.glob(os.path.join(candidates_dir, f"*{ms_base}*{dm_suffix}*std_map_full.fits")))
+            if not cands_matches:
+                cands_matches = sorted(glob.glob(os.path.join(candidates_dir, f"*{ms_base}*std_map_full.fits")))
+            if not cands_matches:
+                cands_matches = sorted(glob.glob(os.path.join(candidates_dir, "*std_map_full.fits")))
+            if cands_matches:
+                std_fits = cands_matches[0]
+            else:
+                return []
 
     cand_tab = None
-    for tab_name in [
+    tab_names = [
+        f"{ms_base}{scan_tag}{dm_suffix}_var_candidates.vot",
+        f"{ms_base}{scan_tag}{dm_suffix}_var_candidates.csv",
+        f"{ms_base}{dm_suffix}_var_candidates.vot",
+        f"{ms_base}{dm_suffix}_var_candidates.csv",
         f"{ms_base}_variance_all.vot",
         f"{ms_base}_variance_all.csv",
         f"{ms_base}_var_candidates.vot",
         f"{ms_base}_var_candidates.csv",
-    ]:
+    ]
+    for tab_name in tab_names:
         tab_path = os.path.join(candidates_dir, tab_name)
         if os.path.exists(tab_path):
             try:
                 fmt = "votable" if tab_name.endswith(".vot") else "csv"
                 cand_tab = Table.read(tab_path, format=fmt)
                 cand_tab = _unmask_table(cand_tab)
-                break
+                if len(cand_tab) > 0:
+                    break
+            except Exception:
+                continue
+
+    if cand_tab is None or len(cand_tab) == 0:
+        glob_tabs = sorted(glob.glob(os.path.join(candidates_dir, f"*{ms_base}*{dm_suffix}*var*.vot"))) + \
+                    sorted(glob.glob(os.path.join(candidates_dir, f"*{ms_base}*{dm_suffix}*var*.csv")))
+        for tab_path in glob_tabs:
+            try:
+                fmt = "votable" if tab_path.endswith(".vot") else "csv"
+                cand_tab = Table.read(tab_path, format=fmt)
+                cand_tab = _unmask_table(cand_tab)
+                if len(cand_tab) > 0:
+                    break
             except Exception:
                 continue
 
@@ -162,6 +202,10 @@ def generate_obs_variance_candidate_products(
     except Exception as e:
         logger.warning(f"[ObsVarProducts] Error reading std_map {std_fits}: {e}")
         return []
+
+    valid_std = std_data[np.isfinite(std_data) & (std_data > 0)]
+    std_vmin = float(np.nanpercentile(valid_std, 5.0)) if valid_std.size > 0 else 0.0
+    std_vmax = float(np.nanpercentile(valid_std, 99.5)) if valid_std.size > 0 else 1.0
 
     generated = []
     meta = parse_candidate_filename(ms_base)
@@ -226,7 +270,7 @@ def generate_obs_variance_candidate_products(
         # 2. Cutout FITS
         cutout_obj = None
         if not os.path.exists(out_cut) or not os.path.exists(out_fig):
-            cutout_obj = Cutout2D(std_data, (x, y), (spatial_size, spatial_size), wcs=std_wcs, mode="partial", fill_value=0.0)
+            cutout_obj = Cutout2D(std_data, (x, y), (spatial_size, spatial_size), wcs=std_wcs, mode="partial", fill_value=np.nan)
             if not os.path.exists(out_cut):
                 hdr_cut = cutout_obj.wcs.to_header()
                 hdr_cut["BUNIT"] = std_hdr.get("BUNIT", "JY/BEAM")
@@ -240,9 +284,14 @@ def generate_obs_variance_candidate_products(
         # 3. Summary PDF
         if not os.path.exists(out_fig):
             if cutout_obj is None:
-                cutout_obj = Cutout2D(std_data, (x, y), (spatial_size, spatial_size), wcs=std_wcs, mode="partial", fill_value=0.0)
+                cutout_obj = Cutout2D(std_data, (x, y), (spatial_size, spatial_size), wcs=std_wcs, mode="partial", fill_value=np.nan)
             fig = plt.figure(figsize=(18, 12), dpi=dpi)
             gs = GridSpec(nrows=2, ncols=3, figure=fig, height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0])
+
+            c_valid = cutout_obj.data[np.isfinite(cutout_obj.data) & (cutout_obj.data > 0)]
+            val_at_pix = float(std_data[y, x]) if (0 <= y < std_data.shape[0] and 0 <= x < std_data.shape[1]) else 0.0
+            cut_vmin = float(np.nanpercentile(c_valid, 5.0)) if c_valid.size > 0 else std_vmin
+            cut_vmax = max(val_at_pix, float(np.nanpercentile(c_valid, 99.5))) if c_valid.size > 0 else std_vmax
 
             if cont_wcs is not None and cont_im is not None:
                 try:
@@ -251,6 +300,9 @@ def generate_obs_variance_candidate_products(
                     ax_c = fig.add_subplot(gs[0, 0], projection=c_cut.wcs)
                     im_c = ax_c.imshow(c_cut.data, origin="lower", cmap=cmap, vmin=cont_vmin, vmax=cont_vmax)
                     ax_c.set_title("Continuum")
+                    ax_c.set_xlabel("RA (J2000)")
+                    ax_c.set_ylabel("Dec (J2000)")
+                    ax_c.set_aspect('equal', adjustable='box')
                     ax_c.plot([ra_deg], [dec_deg], marker=reticle(which='rt'), ms=36, mec="white", mew=1.5, mfc="none", transform=ax_c.get_transform('world'))
                     fig.colorbar(im_c, ax=ax_c, orientation="horizontal", fraction=0.046, pad=0.10, label="Flux density")
                 except Exception:
@@ -258,19 +310,29 @@ def generate_obs_variance_candidate_products(
                     ax_c.axis("off")
             else:
                 ax_c = fig.add_subplot(gs[0, 0], projection=std_wcs)
-                ax_c.imshow(std_data, origin="lower", cmap=cmap)
+                im_c = ax_c.imshow(std_data, origin="lower", cmap=cmap, vmin=std_vmin, vmax=std_vmax)
                 ax_c.set_title("Full Obs Std Map")
+                ax_c.set_xlabel("RA (J2000)")
+                ax_c.set_ylabel("Dec (J2000)")
+                ax_c.set_aspect('equal', adjustable='box')
                 ax_c.plot([x], [y], marker=reticle(which='rt'), ms=36, mec="white", mew=1.5, mfc="none")
+                fig.colorbar(im_c, ax=ax_c, orientation="horizontal", fraction=0.046, pad=0.10, label="Std (Jy/beam)")
 
             ax_mid = fig.add_subplot(gs[0, 1], projection=std_wcs)
-            im_mid = ax_mid.imshow(std_data, origin="lower", cmap=cmap)
+            im_mid = ax_mid.imshow(std_data, origin="lower", cmap=cmap, vmin=std_vmin, vmax=std_vmax)
             ax_mid.set_title("Std Map (Full Field)")
+            ax_mid.set_xlabel("RA (J2000)")
+            ax_mid.set_ylabel("Dec (J2000)")
+            ax_mid.set_aspect('equal', adjustable='box')
             ax_mid.plot([x], [y], marker=reticle(which='rt'), ms=36, mec="red", mew=1.5, mfc="none")
             fig.colorbar(im_mid, ax=ax_mid, orientation="horizontal", fraction=0.046, pad=0.10, label="Std (Jy/beam)")
 
             ax_cut = fig.add_subplot(gs[0, 2], projection=cutout_obj.wcs)
-            im_cut = ax_cut.imshow(cutout_obj.data, origin="lower", cmap=cmap)
+            im_cut = ax_cut.imshow(cutout_obj.data, origin="lower", cmap=cmap, vmin=cut_vmin, vmax=cut_vmax)
             ax_cut.set_title(f"Detection Cutout: {srcname}")
+            ax_cut.set_xlabel("RA (J2000)")
+            ax_cut.set_ylabel("Dec (J2000)")
+            ax_cut.set_aspect('equal', adjustable='box')
             cx, cy = spatial_size // 2, spatial_size // 2
             ax_cut.plot([cx], [cy], marker=reticle(which='rt'), ms=36, mec="red", mew=1.5, mfc="none")
             fig.colorbar(im_cut, ax=ax_cut, orientation="horizontal", fraction=0.046, pad=0.10, label="Std (Jy/beam)")

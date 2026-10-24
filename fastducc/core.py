@@ -15,10 +15,33 @@ import astropy.units as u
 logger = logging.getLogger(__name__)
 
 
-def welford_combine_aggregates(count_a, mean_a, M2_a, count_b, mean_b, M2_b):
+def welford_combine_aggregates(
+    count_a: np.ndarray,
+    mean_a: np.ndarray,
+    M2_a: np.ndarray,
+    count_b: np.ndarray,
+    mean_b: np.ndarray,
+    M2_b: np.ndarray,
+    include_cross_term: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Combine two Welford aggregates (array-wise) into one.
     All inputs are (Ny, Nx) arrays: count=int64, mean=float64, M2=float64.
+
+    Parameters
+    ----------
+    count_a, count_b : np.ndarray
+        Per-pixel sample counts.
+    mean_a, mean_b : np.ndarray
+        Per-pixel sample means.
+    M2_a, M2_b : np.ndarray
+        Per-pixel sums of squared deviations from the sample mean.
+    include_cross_term : bool, default=False
+        Whether to add Chan's cross-term delta^2 * (count_a * count_b / total).
+        For astronomical time-chunked dirty images, within-chunk local means drift
+        with sky rotation and parallactic angle; adding this cross-term injects
+        between-chunk sidelobe shifts into the observation variance map.
+        Setting to False computes the pooled within-chunk variance.
     """
     total = count_a + count_b
     # Where no samples, keep zeros
@@ -33,11 +56,16 @@ def welford_combine_aggregates(count_a, mean_a, M2_a, count_b, mean_b, M2_b):
         # delta = mean_b - mean_a
         delta = np.zeros_like(mean_a)
         delta[mask] = mean_b[mask] - mean_a[mask]
-        # mean = mean_a + delta * (count_b / total)
+        # Weighted mean: mean_a + delta * (count_b / total)
         mean_out[mask] = mean_a[mask] + delta[mask] * (count_b[mask] / total[mask])
-        # M2 = M2_a + M2_b + delta^2 * count_a * count_b / total
-        M2_out[mask] = (M2_a[mask] + M2_b[mask] +
-                        (delta[mask] * delta[mask]) * (count_a[mask] * count_b[mask] / total[mask]))
+        if include_cross_term:
+            # Full sample variance (including between-chunk mean drift)
+            M2_out[mask] = (M2_a[mask] + M2_b[mask] +
+                            (delta[mask] * delta[mask]) * (count_a[mask] * count_b[mask] / total[mask]))
+        else:
+            # Pooled within-chunk variance (rejects between-chunk mean drift and sidelobes)
+            M2_out[mask] = M2_a[mask] + M2_b[mask]
+
     # Where only one side has samples, just take that side
     only_a = (count_a > 0) & (count_b == 0)
     mean_out[only_a] = mean_a[only_a]
@@ -315,7 +343,10 @@ def finalise_welford_parallel(
             ms_base=cfg.ms_base,
             candidates_dir=cfg.candidates_dir,
             continuum_dir=cfg.continuum_dir,
-            spatial_size=50
+            spatial_size=50,
+            dm=dm_val,
+            scan_id=cfg.scan_id,
+            std_fits_path=full_std_fits,
         )
     except Exception as e:
         logger.warning(f"[FinaliseWelford] Note: Obs variance products generation: {e}")
