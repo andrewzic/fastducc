@@ -145,78 +145,72 @@ def prepare_baseline_series(
         eff_freq = chan_freq
 
     # 2. Format baselines vs pseudo-baselines
-    if collapse_channels:
-        # vis_dedisp: (nbl, nsubbands, nt) -> if nsubbands==1, squeeze to (nbl, nt)
-        if vis_dedisp.ndim == 3 and vis_dedisp.shape[1] == 1:
-            vis_2d = np.ascontiguousarray(vis_dedisp[:, 0, :], dtype=np.complex64)
-            wgt_2d = np.ascontiguousarray(wgt_dedisp[:, 0, :], dtype=np.float32)
-        else:
-            vis_2d = np.ascontiguousarray(vis_dedisp.reshape(-1, nt), dtype=np.complex64)
-            wgt_2d = np.ascontiguousarray(wgt_dedisp.reshape(-1, nt), dtype=np.float32)
-        uvw_track = uvw_3d  # (nbl, 3, nt)
+    if collapse_channels and nsubbands == 1:
+        # Full collapse to 1 channel
+        vis_2d = np.ascontiguousarray(vis_dedisp[:, 0, :], dtype=np.complex64)
+        wgt_2d = np.ascontiguousarray(wgt_dedisp[:, 0, :], dtype=np.float32)
+        uvw_track = uvw_3d  # (nbl, 3, nt) in meters
         freq_out = np.asarray(eff_freq, dtype=np.float64)
     else:
-        # Pseudo-baseline expansion: flatten (nbl, nchan) -> N_pseudo
-        if exact_uvw and (dm != 0.0) and (engine is not None):
-            # Compute physical dispersion time shifts per channel
-            delays = engine.delays  # (nchan,)
-            t_phys = np.clip(np.arange(nt)[None, :] + delays[:, None], 0, nt - 1)  # (nchan, nt)
-            
-            # Broadcast uvw_3d: (nbl, 3, nt) -> index for each channel (nbl, 3, nchan, nt)
-            # Efficient vectorized indexing:
-            uvw_exact = np.zeros((nbl, 3, nchan, nt), dtype=np.float64)
-            for c in range(nchan):
-                uvw_exact[:, :, c, :] = uvw_3d[:, :, t_phys[c, :]]
-            
-            # Convert to dimensionless wavelengths: u_lambda = u * (freq / c)
-            freq_scale = (eff_freq[None, None, :, None] / c_light)  # (1, 1, nchan, 1)
-            uvw_lambda = uvw_exact * freq_scale  # (nbl, 3, nchan, nt)
-            
-            # Flatten (nbl, nchan) into pseudo-baselines: (nbl * nchan, 3, nt)
-            uvw_track = uvw_lambda.transpose(0, 2, 1, 3).reshape(nbl * nchan, 3, nt)
-            vis_2d = np.ascontiguousarray(vis_dedisp.reshape(nbl * nchan, nt), dtype=np.complex64)
-            wgt_2d = np.ascontiguousarray(wgt_dedisp.reshape(nbl * nchan, nt), dtype=np.float32)
-            freq_out = np.array([c_light], dtype=np.float64)
+        # Pseudo-baseline expansion:
+        # Either N_sub subbands (collapse_channels=True, nsubbands > 1)
+        # or N_chan channels (collapse_channels=False)
+        n_freqs = vis_dedisp.shape[1]
+        freqs = eff_freq  # length n_freqs
+
+        if dm != 0.0:
+            delays = dedisp.get_dm_delays(freqs, dm, dt, align_to=align_to)
         else:
-            # Flatten without dispersion baseline tracking
-            vis_2d = np.ascontiguousarray(vis_dedisp.reshape(nbl * nchan, nt), dtype=np.complex64)
-            wgt_2d = np.ascontiguousarray(wgt_dedisp.reshape(nbl * nchan, nt), dtype=np.float32)
-            # Replicate baseline UVW across all channels: (nbl, 1, 3, nt) -> (nbl, nchan, 3, nt)
-            uvw_rep = np.repeat(uvw_3d[:, None, :, :], nchan, axis=1)
-            # Convert to wavelengths:
-            freq_scale = (eff_freq[None, :, None, None] / c_light)
-            uvw_lambda = uvw_rep * freq_scale
-            uvw_track = uvw_lambda.reshape(nbl * nchan, 3, nt)
-            freq_out = np.array([c_light], dtype=np.float64)
+            delays = np.zeros(n_freqs, dtype=np.int64)
+
+        uvw_lambda = np.empty((nbl, n_freqs, 3, nt), dtype=np.float64)
+        for ifreq in range(n_freqs):
+            fk = freqs[ifreq]
+            if exact_uvw and (dm != 0.0):
+                d = int(delays[ifreq])
+                t_phys = np.clip(np.arange(nt) + d, 0, nt - 1)
+                uvw_k = uvw_3d[:, :, t_phys]  # (nbl, 3, nt)
+            else:
+                uvw_k = uvw_3d
+            uvw_lambda[:, ifreq, :, :] = uvw_k * (fk / c_light)
+
+        uvw_track = uvw_lambda.reshape(nbl * n_freqs, 3, nt)
+        vis_2d = np.ascontiguousarray(vis_dedisp.reshape(nbl * n_freqs, nt), dtype=np.complex64)
+        wgt_2d = np.ascontiguousarray(wgt_dedisp.reshape(nbl * n_freqs, nt), dtype=np.float32)
+        freq_out = np.array([c_light], dtype=np.float64)
 
     return vis_2d, wgt_2d, uvw_track, freq_out, dt
 
 
-def shift_profile_phase_fourier(profile_2d: np.ndarray, delta_phase: np.ndarray) -> np.ndarray:
+def shift_profile_phase_fourier(profile: np.ndarray, delta_phase: np.ndarray) -> np.ndarray:
     """
     Apply fractional circular phase shifts to folded profiles using Fourier phase rotation.
 
     Parameters
     ----------
-    profile_2d : np.ndarray
-        Shape (N_periods, nbins), complex64.
+    profile : np.ndarray
+        Shape (N_periods, nbins) or (M, N_periods, nbins), complex64.
     delta_phase : np.ndarray
         Shape (N_periods,), fractional phase shift in range [0, 1).
 
     Returns
     -------
     shifted_profile : np.ndarray
-        Shape (N_periods, nbins), complex64.
+        Same shape as profile, complex64.
     """
-    nbins = profile_2d.shape[1]
-    # FFT along phase axis (axis 1)
-    spec = np.fft.fft(profile_2d, axis=1)
+    nbins = profile.shape[-1]
+    spec = np.fft.fft(profile, axis=-1)
     k = np.fft.fftfreq(nbins)  # integer / nbins frequencies
-    # Phase rotator: exp(-2pi * i * k * (delta_phase * nbins)) = exp(-2pi * i * k * shift_bins)
-    # k has shape (nbins,), delta_phase has shape (N_periods,)
-    phase_rot = np.exp(-2j * np.pi * delta_phase[:, None] * (k * nbins)[None, :])
-    shifted_spec = spec * phase_rot
-    return np.fft.ifft(shifted_spec, axis=1).astype(np.complex64)
+
+    if profile.ndim == 2:
+        phase_rot = np.exp(-2j * np.pi * delta_phase[:, None] * (k * nbins)[None, :])
+    elif profile.ndim == 3:
+        phase_rot = np.exp(-2j * np.pi * delta_phase[None, :, None] * (k * nbins)[None, None, :])
+    else:
+        raise ValueError(f"Expected 2D or 3D profile array, got shape {profile.shape}")
+
+    shifted_spec = spec * phase_rot.astype(np.complex64)
+    return np.fft.ifft(shifted_spec, axis=-1).astype(np.complex64)
 
 
 def fold_baselines_option_b(
@@ -364,11 +358,9 @@ def fold_baselines_option_a(
         # Phase shift: delta_phi = (t_ref_s / Period) mod 1
         delta_phase = (t_ref_s / periods) % 1.0  # (N_periods,)
 
-        # Rotate phase axis for each baseline:
+        # Rotate phase axis across all baselines vectorized:
         # folded_s has shape (N_series, N_periods, base_period_bins)
-        aligned_s = np.empty_like(folded_s)
-        for b in range(n_series):
-            aligned_s[b] = shift_profile_phase_fourier(folded_s[b], delta_phase)
+        aligned_s = shift_profile_phase_fourier(folded_s, delta_phase)
 
         all_uvw.append(uvw_eff_s)
         all_wgt.append(wgt_eff_s)
@@ -596,6 +588,7 @@ def search_baseline_ffa(
     bins_max: int = 64,
     dm: float = 0.0,
     collapse_channels: bool = True,
+    nsubbands: int = 1,
     exact_uvw: bool = False,
     segment_duration_s: Optional[float] = None,
     npix_x: int = 384,
@@ -627,6 +620,8 @@ def search_baseline_ffa(
     collapse_channels : bool
         If True, sum across channels before folding (standard mode).
         If False, fold pseudo-baselines with exact wavelength coordinates.
+    nsubbands : int
+        Number of subbands when collapse_channels is True (default 1 for full collapse).
     exact_uvw : bool
         If True and collapse_channels is False, compute exact per-channel UVW delay tracks.
     segment_duration_s : float, optional
@@ -677,7 +672,7 @@ def search_baseline_ffa(
     # 2. Prepare baseline time series and coordinates
     vis_2d, wgt_2d, uvw_track, eff_freq, dt = prepare_baseline_series(
         vis_3d, wgt_3d, uvw_3d, chan_freq, dt,
-        dm=dm, collapse_channels=collapse_channels, exact_uvw=exact_uvw
+        dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands, exact_uvw=exact_uvw
     )
 
     # 3. Generate FFA Plan
