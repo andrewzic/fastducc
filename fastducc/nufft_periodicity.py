@@ -43,6 +43,7 @@ from fastducc import wcs as ducc_wcs
 from fastducc import detection
 from fastducc import candidates as cand_mod
 from fastducc import constants
+from fastducc.wgridded_nufft import wstacked_3d_nufft_block
 
 C = constants.c
 K_DM = constants.K_DM
@@ -80,12 +81,16 @@ def _process_block_and_save(
     dm_pc_cm3: float,
     out_dir: Optional[str],
     block_id: int,
+    do_wstacking: bool = True,
+    supp_w: int = 4,
+    w_oversampling: float = 1.5,
 ) -> Dict:
     """
     Per-block worker:
       - Load rows for this block.
-      - For each channel: DM time shift; UV scale by lambda; build omega in radians.
-      - Run adjoint 3-D NUFFT to (l,m,f), keep f>=fmin on +ve side; sum across channels.
+      - If do_wstacking=True: run Numba-accelerated wstacked_3d_nufft_block for all channels.
+      - Otherwise: run coplanar 3-D NUFFT channel-by-channel.
+      - Output complex partials X(l, m, f>=fmin).
     """
     T = table(ms_path, readonly=True)
     colnames = set(T.colnames())
@@ -121,47 +126,68 @@ def _process_block_and_save(
     fkeep = fgrid[pos][kmin:]
     nkeep = fkeep.size
 
-    X_blk_keep = np.zeros((npix, npix, nkeep), dtype=np.complex64)
-    out_buf = np.zeros((npix, npix, Nf), dtype=np.complex64)
     eps_use = max(float(eps), 1e-5)
-
     nu_mhz = freqs_hz * 1e-6
     tau_dm = (K_DM * dm_pc_cm3 / (nu_mhz ** 2)) * 1e-3  # seconds
 
-    for ic in range(nchan):
-        good = ~flg[:, ic]
-        if not np.any(good):
-            continue
-
-        u_m = uvw_m[good, 0]
-        v_m = uvw_m[good, 1]
-        nu = float(freqs_hz[ic])
-        lam = C / nu
-        u = u_m / lam
-        v = v_m / lam
-
-        t_rel_dm = t_rel[good] - float(tau_dm[ic])
-
-        omega_u = 2.0 * math.pi * u * dl
-        omega_v = 2.0 * math.pi * v * dl
-        omega_f = -2.0 * math.pi * t_rel_dm * df
-        coord = np.stack([wrap_pi(omega_u), wrap_pi(omega_v), wrap_pi(omega_f)], axis=1).astype(np.float64)
-
-        y = vis[good, ic]
-
-        out_buf.fill(0.0)
-        ducc_nufft.nu2u(
-            points=y,
-            coord=coord,
-            forward=False,
+    if do_wstacking:
+        X_blk_keep = wstacked_3d_nufft_block(
+            uvw_m=uvw_m,
+            times=t_rel,
+            vis=vis,
+            flags=flg,
+            freqs_hz=freqs_hz,
+            tau_dm=tau_dm,
+            npix=npix,
+            pixsize_rad=dl,
+            Nf=Nf,
+            dt=dt,
+            df=df,
+            kmin=kmin,
+            nkeep=nkeep,
+            supp_w=supp_w,
+            ofactor=w_oversampling,
             epsilon=eps_use,
-            nthreads=1,
-            out=out_buf,
-            fft_order=True
+            nthreads=nthreads,
         )
+    else:
+        X_blk_keep = np.zeros((npix, npix, nkeep), dtype=np.complex64)
+        out_buf = np.zeros((npix, npix, Nf), dtype=np.complex64)
 
-        # Use basic slicing [kmin : Nf//2] to create a zero-copy view instead of boolean advanced indexing
-        X_blk_keep += out_buf[:, :, kmin : Nf // 2]
+        for ic in range(nchan):
+            good = ~flg[:, ic]
+            if not np.any(good):
+                continue
+
+            u_m = uvw_m[good, 0]
+            v_m = uvw_m[good, 1]
+            nu = float(freqs_hz[ic])
+            lam = C / nu
+            u = u_m / lam
+            v = v_m / lam
+
+            t_rel_dm = t_rel[good] - float(tau_dm[ic])
+
+            omega_u = 2.0 * math.pi * u * dl
+            omega_v = 2.0 * math.pi * v * dl
+            omega_f = -2.0 * math.pi * t_rel_dm * df
+            coord = np.stack([wrap_pi(omega_u), wrap_pi(omega_v), wrap_pi(omega_f)], axis=1).astype(np.float64)
+
+            y = vis[good, ic]
+
+            out_buf.fill(0.0)
+            ducc_nufft.nu2u(
+                points=y,
+                coord=coord,
+                forward=False,
+                epsilon=eps_use,
+                nthreads=1,
+                out=out_buf,
+                fft_order=True
+            )
+
+            X_blk_keep += out_buf[:, :, kmin : Nf // 2]
+        del out_buf
 
     part_path = None
     if out_dir:
@@ -169,7 +195,9 @@ def _process_block_and_save(
         part_name = f"periodicity_block_{block_id:06d}_{uuid.uuid4().hex}.npy"
         part_path = os.path.join(out_dir, part_name)
         np.save(part_path, X_blk_keep)
-        del out_buf, X_blk_keep
+        del X_blk_keep
+        if 'out_buf' in locals():
+            del out_buf
         import gc
         gc.collect()
         try:
@@ -284,6 +312,10 @@ def run_periodicity(args=None) -> str:
     metas: List[Dict] = []
     num_blocks = len(bounds)
 
+    do_wstacking = getattr(args, "do_wstacking", True)
+    supp_w = getattr(args, "supp_w", 4)
+    w_oversampling = getattr(args, "w_oversampling", 1.5)
+
     logger.info("Starting NUFFT Periodicity Search")
     logger.info(f"Target MS         : {args.msname}")
     logger.info(f"Total Rows        : {nrows}")
@@ -292,6 +324,7 @@ def run_periodicity(args=None) -> str:
     logger.info(f"Keeping Spin Freqs: {nkeep} bins in range [{fkeep[0]:.4f}, {fkeep[-1]:.4f}] Hz (fmin={args.fmin} Hz)")
     logger.info(f"Spatial Grid      : {npix}x{npix} @ {args.pixscale_arcsec}\" ({dl*206265:.1f}\"/pix)")
     logger.info(f"DM Search Value   : {args.dm} pc cm^-3")
+    logger.info(f"W-Stacking Mode   : {do_wstacking} (supp_w={supp_w}, oversampling={w_oversampling})")
     logger.info(f"Partitioning      : {num_blocks} block(s) of ~{args.block_rows} rows (nthreads={args.nthreads})")
 
     t_start = time.time()
@@ -330,10 +363,10 @@ def run_periodicity(args=None) -> str:
         try:
             import psutil
             total_ram_gb = psutil.virtual_memory().total / (1024**3)
-            # Each worker needs ~18-20 GB peak RAM (9.6GB out_buf + 4.6GB X_blk + C++ NUFFT workspace).
+            # Each worker needs ~8 GB with w-stacking (4.6GB X_blk + workspace) or ~20 GB without.
             # The main accumulation process needs ~8 GB.
             main_ram_gb = 8.0
-            worker_ram_gb = 20.0
+            worker_ram_gb = 8.0 if do_wstacking else 20.0
             avail_ram = max(0.0, total_ram_gb - main_ram_gb)
             max_safe_workers = max(1, int(avail_ram / worker_ram_gb))
             if workers > max_safe_workers:
@@ -363,6 +396,9 @@ def run_periodicity(args=None) -> str:
                     dm_pc_cm3=float(args.dm),
                     out_dir=out_partials_dir,
                     block_id=i,
+                    do_wstacking=do_wstacking,
+                    supp_w=supp_w,
+                    w_oversampling=w_oversampling,
                 )
                 tasks.append(kw)
 
@@ -414,6 +450,9 @@ def run_periodicity(args=None) -> str:
                     dm_pc_cm3=float(args.dm),
                     out_dir=None,
                     block_id=i,
+                    do_wstacking=do_wstacking,
+                    supp_w=supp_w,
+                    w_oversampling=w_oversampling,
                 )
                 X_blk = meta["X"]
                 t0 = meta["t0"]
@@ -511,7 +550,10 @@ def run_periodicity(args=None) -> str:
                     float(args.eps), 1,
                     float(args.dm),
                     out_partials_dir,
-                    i
+                    i,
+                    do_wstacking,
+                    supp_w,
+                    w_oversampling,
                 )
                 futures.append(fut)
 

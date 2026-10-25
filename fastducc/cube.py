@@ -48,7 +48,7 @@ except ImportError:
     ducc0 = None
 
 from fastducc.fd_types import CubeConfig
-from fastducc import ms_utils, imaging, dedisp
+from fastducc import ms_utils, imaging, dedisp, timeshift
 from fastducc import wcs as ducc_wcs
 
 
@@ -539,6 +539,9 @@ def process_chunk_task(
     nsubbands: int = 1,
     exact_uvw: bool = True,
     align_to: str = "fmax",
+    shift_samps: float = 0.0,
+    shift_method: str = "fft",
+    shift_domain: str = "native",
     **kwargs,
 ) -> Tuple[int, int, int, Any]:
     """Worker task: load visibilities, apply dedispersion, grid snapshots, compute UV FFT, and stream to cubes."""
@@ -546,6 +549,12 @@ def process_chunk_task(
         msname=msname, chunk_times=chunk_times, data_column=data_column,
         corr_mode=corr_mode, basis=basis, single_pol=single_pol,
     )
+
+    if abs(shift_samps) > 1e-7 and shift_domain == "native":
+        vis_3d = timeshift.shift_time_series(vis_3d, shift_samps, method=shift_method, axis=-1)
+        wgt_3d = timeshift.shift_time_series(wgt_3d, shift_samps, method=shift_method, axis=-1)
+        wgt_3d = np.maximum(wgt_3d, 0.0)
+        uvw_3d = timeshift.shift_time_series(uvw_3d, shift_samps, method=shift_method, axis=-1)
 
     cube_chunk = imaging.grid_chunk_cube(
         vis_3d=vis_3d, wgt_3d=wgt_3d, uvw_3d=uvw_3d, chan_freq=chunk_freq, dt=dt,
@@ -556,6 +565,9 @@ def process_chunk_task(
         divide_by_n=divide_by_n, sigma_min=sigma_min, sigma_max=sigma_max,
         min_valid_channels=min_valid_channels,
     )
+
+    if abs(shift_samps) > 1e-7 and shift_domain == "gridded":
+        cube_chunk = timeshift.shift_time_series(cube_chunk, shift_samps, method=shift_method, axis=0)
 
     if n_target_samples is not None and len(cube_chunk) > n_target_samples:
         cube_chunk = cube_chunk[:n_target_samples]
@@ -771,6 +783,10 @@ def make_dirty_cube(
     use_fitscube: bool = False,
     create_blanks: bool = False,
     floating: int = 32,
+    regularize_time: bool = False,
+    sync_tolerance: float = 0.05,
+    shift_method: str = "fft",
+    shift_domain: str = "native",
     **kwargs,
 ) -> str:
     """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes."""
@@ -804,6 +820,8 @@ def make_dirty_cube(
             slurm_walltime=slurm_walltime, slurm_job_extra=slurm_job_extra,
             slurm_interface=slurm_interface, use_fitscube=use_fitscube,
             create_blanks=create_blanks, floating=floating,
+            regularize_time=regularize_time, sync_tolerance=sync_tolerance,
+            shift_method=shift_method, shift_domain=shift_domain,
         )
     else:
         if msname:
@@ -880,6 +898,10 @@ def make_dirty_cube(
     use_fitscube = cfg.use_fitscube
     create_blanks = cfg.create_blanks
     floating = cfg.floating
+    regularize_time = cfg.regularize_time
+    sync_tolerance = cfg.sync_tolerance
+    shift_method = cfg.shift_method
+    shift_domain = cfg.shift_domain
 
     if not os.path.exists(msname):
         raise FileNotFoundError(f"Measurement Set '{msname}' not found.")
@@ -887,14 +909,30 @@ def make_dirty_cube(
     ms_base = os.path.basename(msname.rstrip("/")).replace(".ms", "")
     t_main = table(msname, readonly=True)
     time_col = "TIME_CENTROID" if "TIME_CENTROID" in t_main.colnames() else "TIME"
-    unique_times = np.sort(np.unique(t_main.getcol(time_col)))
+    has_scan = "SCAN_NUMBER" in t_main.colnames()
+    time_vals = t_main.getcol(time_col)
+    scan_vals = t_main.getcol("SCAN_NUMBER") if has_scan else None
     t_main.close()
+
+    unique_times, u_idx = np.unique(time_vals, return_index=True)
+    scan_per_time = scan_vals[u_idx] if scan_vals is not None else np.zeros(len(unique_times), dtype=int)
 
     start_idx, end_idx = resolve_time_bounds(unique_times, start_time_idx, end_time_idx, start_time, end_time)
     sel_times = unique_times[start_idx : end_idx + 1]
+    sel_scans = scan_per_time[start_idx : end_idx + 1]
     total_frames = len(sel_times)
 
-    time_info = analyze_time_axis(sel_times, create_blanks=create_blanks, dt_nominal=time_step, tolerance=time_tolerance, max_blank_factor=max_blank_factor)
+    if regularize_time:
+        create_blanks = True
+        time_info = timeshift.regularize_time_grid(
+            sel_times,
+            dt_nominal=time_step,
+            sync_tolerance=sync_tolerance,
+            scan_numbers=sel_scans,
+            max_blank_factor=max_blank_factor,
+        )
+    else:
+        time_info = analyze_time_axis(sel_times, create_blanks=create_blanks, dt_nominal=time_step, tolerance=time_tolerance, max_blank_factor=max_blank_factor)
     total_planes = time_info["total_planes"]
 
     save_uv = save_uv or uv_only
@@ -945,8 +983,18 @@ def make_dirty_cube(
         hdr3d.update({"CUBELET": True, "TARG_RA": float(target_coord.ra.deg), "TARG_DEC": float(target_coord.dec.deg), "CUB_RAD": float(r_arcsec)})
     if dm != 0.0:
         hdr3d.update({"DEDISP": True, "COLLCHAN": bool(collapse_channels), "NSUBBAND": int(nsubbands), "EXACTUVW": bool(exact_uvw), "ALIGNDM": str(align_to)})
+    if regularize_time:
+        hdr3d.update({
+            "TIMEREG": True,
+            "SYNCTOL": float(sync_tolerance),
+            "SHIFTMET": str(shift_method),
+            "SHIFTDOM": str(shift_domain),
+            "NBLOCKS": int(len(time_info.get("blocks", []))),
+            "NSHIFTED": int(time_info.get("n_shifted_blocks", 0)),
+        })
     if time_info["has_gaps"] and create_blanks:
         hdr3d["BLANKS"] = True
+        hdr3d["NBLANKS"] = len(time_info["blank_indices"])
     elif not time_info["is_regular"] or (time_info["has_gaps"] and not create_blanks):
         hdr3d["IRREGTIM"] = True
 
@@ -970,13 +1018,26 @@ def make_dirty_cube(
         max_delay_samps = dedisp.get_dm_samps(chan_freq, abs(dm), time_info["dt_nominal"])
 
     chunk_tasks = []
-    for c_start in range(start_idx, end_idx + 1, chunk_size):
-        c_end = min(c_start + chunk_size - 1, end_idx)
-        n_target = c_end - c_start + 1
-        c_end_pad = min(len(unique_times) - 1, c_end + max_delay_samps) if dm != 0.0 and max_delay_samps > 0 else c_end
-        c_times = unique_times[c_start : c_end_pad + 1]
-        c_g_idx = time_info["grid_indices"][c_start - start_idx : c_end - start_idx + 1]
-        chunk_tasks.append((c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target))
+    if regularize_time and "blocks" in time_info:
+        for b in time_info["blocks"]:
+            b_start = start_idx + b["start_sample"]
+            b_end = start_idx + b["end_sample"]
+            b_shift = float(b["shift_samps"])
+            for c_start in range(b_start, b_end + 1, chunk_size):
+                c_end = min(c_start + chunk_size - 1, b_end)
+                n_target = c_end - c_start + 1
+                c_end_pad = min(b_end, c_end + max_delay_samps) if dm != 0.0 and max_delay_samps > 0 else c_end
+                c_times = unique_times[c_start : c_end_pad + 1]
+                c_g_idx = time_info["grid_indices"][c_start - start_idx : c_end - start_idx + 1]
+                chunk_tasks.append((c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, b_shift))
+    else:
+        for c_start in range(start_idx, end_idx + 1, chunk_size):
+            c_end = min(c_start + chunk_size - 1, end_idx)
+            n_target = c_end - c_start + 1
+            c_end_pad = min(len(unique_times) - 1, c_end + max_delay_samps) if dm != 0.0 and max_delay_samps > 0 else c_end
+            c_times = unique_times[c_start : c_end_pad + 1]
+            c_g_idx = time_info["grid_indices"][c_start - start_idx : c_end - start_idx + 1]
+            chunk_tasks.append((c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, 0.0))
 
     parallel_mode = parallel_mode or ("processes" if max_workers and max_workers > 1 else "serial")
     n_workers = max_workers if max_workers and max_workers > 0 else (os.cpu_count() or 4 if parallel_mode in ("processes", "threads", "dask-local") else 1)
@@ -985,7 +1046,8 @@ def make_dirty_cube(
 
     gap_str = f"gaps={len(time_info['blank_indices'])} blanks" if time_info["has_gaps"] else "no gaps"
     dm_str = f" | DM: {dm:.2f} pc/cm^3 (delay_sweep={max_delay_samps} samps, exact_uvw={exact_uvw})" if dm != 0.0 else ""
-    logger.info(f"MS: {msname} | Observed Frames: {total_frames} (indices {start_idx}..{end_idx}) | Output Planes: {total_planes} | Spacing: {time_info['spacing_type']} ({gap_str}, dt={time_info['dt_nominal']:.4f}s) | Targets: {'save-uv (uv-only)' if uv_only else ('save-uv (dirty+uv)' if save_uv else 'dirty-only')}{dm_str} | Chunks: {len(chunk_tasks)} | Mode: {parallel_mode} (workers={n_workers})")
+    reg_str = f" | Regularized time (blocks={len(time_info.get('blocks', []))}, shifted={time_info.get('n_shifted_blocks', 0)}, method={shift_method}, domain={shift_domain})" if regularize_time else ""
+    logger.info(f"MS: {msname} | Observed Frames: {total_frames} (indices {start_idx}..{end_idx}) | Output Planes: {total_planes} | Spacing: {time_info['spacing_type']} ({gap_str}, dt={time_info['dt_nominal']:.4f}s){reg_str} | Targets: {'save-uv (uv-only)' if uv_only else ('save-uv (dirty+uv)' if save_uv else 'dirty-only')}{dm_str} | Chunks: {len(chunk_tasks)} | Mode: {parallel_mode} (workers={n_workers})")
 
     # In-memory streaming initialization
     header_size = init_empty_fits_cube(out_cube, hdr3d, (total_planes, ny_out, nx_out), dtype=np_dtype, overwrite=overwrite, blank_indices=time_info["blank_indices"] if create_blanks else None) if write_dirty else 0
@@ -1006,6 +1068,7 @@ def make_dirty_cube(
         dtype_str=dtype_str, save_uv=save_uv, out_cube_real=out_cube_real, out_cube_imag=out_cube_imag,
         header_size_uv_real=header_size_uv_r, header_size_uv_imag=header_size_uv_i, write_dirty=write_dirty,
         cutout_bbox=cutout_bbox, direct_write=True,
+        shift_method=shift_method, shift_domain=shift_domain,
     )
 
     def _driver_write_chunk(path, arr, c_g_idx, off_s):
@@ -1026,16 +1089,16 @@ def make_dirty_cube(
 
     pbar = tqdm(total=total_frames, desc=f"Streaming snapshots to cube(s) ({parallel_mode})", unit="frame")
     if parallel_mode == "serial" or len(chunk_tasks) <= 1 or n_workers <= 1:
-        for _, _, c_times, c_g_idx, off_s, off_e, n_target in chunk_tasks:
-            _, _, n_done, chunk_arr = process_chunk_task(chunk_times=c_times, grid_indices=c_g_idx, offset_start=off_s, offset_end=off_e, n_target_samples=n_target, **task_kwargs)
+        for _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift in chunk_tasks:
+            _, _, n_done, chunk_arr = process_chunk_task(chunk_times=c_times, grid_indices=c_g_idx, offset_start=off_s, offset_end=off_e, n_target_samples=n_target, shift_samps=b_shift, **task_kwargs)
             _handle_worker_result(chunk_arr, c_g_idx, off_s)
             pbar.update(n_done)
     elif parallel_mode in ("threads", "processes"):
         ExecutorClass = ThreadPoolExecutor if parallel_mode == "threads" else ProcessPoolExecutor
         with ExecutorClass(max_workers=n_workers) as executor:
             future_to_task = {
-                executor.submit(process_chunk_task, chunk_times=c_times, grid_indices=c_g_idx, offset_start=off_s, offset_end=off_e, n_target_samples=n_target, **task_kwargs): (c_g_idx, off_s)
-                for (_, _, c_times, c_g_idx, off_s, off_e, n_target) in chunk_tasks
+                executor.submit(process_chunk_task, chunk_times=c_times, grid_indices=c_g_idx, offset_start=off_s, offset_end=off_e, n_target_samples=n_target, shift_samps=b_shift, **task_kwargs): (c_g_idx, off_s)
+                for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
             }
             for fut in as_completed(future_to_task):
                 c_g_idx, off_s = future_to_task[fut]
@@ -1055,8 +1118,8 @@ def make_dirty_cube(
             client_ctx = Client(cluster)
         with client_ctx as client:
             future_to_task = {
-                client.submit(process_chunk_task, chunk_times=c_times, grid_indices=c_g_idx, offset_start=off_s, offset_end=off_e, n_target_samples=n_target, **task_kwargs): (c_g_idx, off_s)
-                for (_, _, c_times, c_g_idx, off_s, off_e, n_target) in chunk_tasks
+                client.submit(process_chunk_task, chunk_times=c_times, grid_indices=c_g_idx, offset_start=off_s, offset_end=off_e, n_target_samples=n_target, shift_samps=b_shift, **task_kwargs): (c_g_idx, off_s)
+                for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
             }
             for fut in dask_as_completed(list(future_to_task.keys())):
                 c_g_idx, off_s = future_to_task[fut]
@@ -1141,6 +1204,10 @@ def build_cli_cube(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--scratch-dir", default=None)
     parser.add_argument("--keep-planes", action="store_true", default=False)
     parser.add_argument("--create-blanks", action="store_true", default=False)
+    parser.add_argument("--regularize-time", "--grid-time", dest="regularize_time", action="store_true", default=False, help="Grid data onto a strictly regular time grid, padding inter-scan gaps and shifting out-of-sync blocks")
+    parser.add_argument("--sync-tolerance", type=float, default=0.05, help="Offset tolerance in units of offset/time_resolution (default: 0.05 = 5%%). Blocks with offset > tolerance are shifted")
+    parser.add_argument("--shift-method", choices=["fft", "sinc"], default="fft", help="Method to shift out-of-sync blocks: Fourier domain phase gradient shift ('fft') or windowed sinc interpolation ('sinc')")
+    parser.add_argument("--shift-domain", choices=["native", "gridded"], default="native", help="Domain to apply shifting: native visibilities ('native', faster) or gridded UV/dirty cubes ('gridded')")
     parser.add_argument("--time-step", "--dt", dest="time_step", type=float, default=None)
     parser.add_argument("--time-tolerance", type=float, default=1e-3)
     parser.add_argument("--max-blank-factor", type=float, default=10.0)

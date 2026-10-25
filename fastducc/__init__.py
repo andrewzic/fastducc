@@ -35,6 +35,9 @@ __all__ = [
     "wcs",
     "candidates",
     "fd_types",
+    "timeshift",
+    "baseline_ffa",
+    "wgridded_nufft",
 ]
 
 __version__ = "0.1.0"

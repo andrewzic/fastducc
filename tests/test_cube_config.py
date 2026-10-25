@@ -54,7 +54,7 @@ class TestCubeConfig(unittest.TestCase):
             "max_workers", "threads_per_worker", "dask_scheduler", "slurm_partition",
             "slurm_account", "slurm_cores_per_worker", "slurm_mem", "slurm_walltime",
             "slurm_job_extra", "slurm_interface", "use_fitscube", "create_blanks",
-            "floating",
+            "floating", "regularize_time", "sync_tolerance", "shift_method", "shift_domain",
         ]
         for param in expected_params:
             self.assertIn(param, sig.parameters, f"Missing parameter {param} in make_dirty_cube signature")

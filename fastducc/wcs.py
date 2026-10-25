@@ -197,3 +197,10 @@ def _build_fullframe_wcs(npix_x: int, npix_y: int,
     return wcs_full
 
 
+def get_ms_wcs(msname: str, npix_x: int, npix_y: int, pixsize_x: float, pixsize_y: float = None, field_name: str = None) -> WCS:
+    """Convenience helper to build a full-frame TAN WCS from Measurement Set phase center."""
+    ra0_rad, dec0_rad, _ = ms_utils.get_phase_center(msname, field_name)
+    return _build_fullframe_wcs(npix_x, npix_y, ra0_rad, dec0_rad, pixsize_x)
+
+
+

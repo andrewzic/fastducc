@@ -246,6 +246,14 @@ def build_cli(argv=None):
     parser.add_argument('--end-time', type=float, default=None, help='End time in seconds or MJD')
     parser.add_argument('--create-blanks', action='store_true', default=False,
                         help='Create blank NaN planes for missing time intervals on a regular grid (following fitscube)')
+    parser.add_argument('--regularize-time', '--grid-time', dest='regularize_time', action='store_true', default=False,
+                        help='Grid data onto a strictly regular time grid, padding inter-scan gaps and shifting out-of-sync blocks')
+    parser.add_argument('--sync-tolerance', type=float, default=0.05,
+                        help='Offset tolerance in units of offset/time_resolution (default: 0.05 = 5%%). Blocks with offset > tolerance are shifted')
+    parser.add_argument('--shift-method', choices=['fft', 'sinc'], default='fft',
+                        help='Method to shift out-of-sync blocks: Fourier domain phase gradient shift (\'fft\') or windowed sinc interpolation (\'sinc\')')
+    parser.add_argument('--shift-domain', choices=['native', 'gridded'], default='native',
+                        help='Domain to apply shifting: native visibilities (\'native\', faster) or gridded UV/dirty cubes (\'gridded\')')
     parser.add_argument('--time-step', '--dt', dest='time_step', type=float, default=None,
                         help='Nominal time step / integration time in seconds (auto-detected if omitted)')
     parser.add_argument('--max-blank-factor', type=float, default=10.0,

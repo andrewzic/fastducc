@@ -136,6 +136,10 @@ class CubeConfig:
     use_fitscube: bool = False
     create_blanks: bool = False
     floating: int = 32
+    regularize_time: bool = False
+    sync_tolerance: float = 0.05
+    shift_method: str = "fft"
+    shift_domain: str = "native"
 
     @classmethod
     def from_namespace(cls, args: Any, **overrides) -> CubeConfig:

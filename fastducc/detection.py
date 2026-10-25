@@ -335,7 +335,7 @@ def detect_periodicity_spatial_snr(
     f_hz: np.ndarray,             # (Nf,)
     *,
     threshold_sigma: float = 7.0,
-    nharm: int = 8,
+    nharm: int = 2,
     spatial_estimator: str = "clipped_rms",   # "mad" | "clipped_rms"
     clip_sigma: float = 3.0,
     valid_mask: Optional[np.ndarray] = None,  # (Ny,Nx) True=valid
