@@ -128,7 +128,7 @@ def _process_block_and_save(
 
     eps_use = max(float(eps), 1e-5)
     nu_mhz = freqs_hz * 1e-6
-    tau_dm = (K_DM * dm_pc_cm3 / (nu_mhz ** 2)) * 1e-3  # seconds
+    tau_dm = (K_DM * dm_pc_cm3 / (nu_mhz ** 2))  # seconds (K_DM = 4.148808e3 s * MHz^2 / (pc cm^-3))
 
     if do_wstacking:
         X_blk_keep = wstacked_3d_nufft_block(
