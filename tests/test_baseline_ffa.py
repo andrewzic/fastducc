@@ -7,6 +7,7 @@ import os
 import pytest
 import numpy as np
 
+from fastducc.constants import c as c_light
 from fastducc.baseline_ffa import (
     prepare_baseline_series,
     shift_profile_phase_fourier,
@@ -80,6 +81,14 @@ def test_prepare_baseline_series(synthetic_vis_data):
     assert wgt_sub.shape == (nbl * nsub, nt)
     assert uvw_sub.shape == (nbl * nsub, 3, nt)
     assert len(eff_freq_sub) == 1  # [c_light] for dimensionless wavelengths
+
+    # 4. Default mode (Option 1 pseudo-baselines with exact UVW)
+    vis_def, wgt_def, uvw_def, eff_freq_def, _ = prepare_baseline_series(
+        vis_3d, wgt_3d, uvw_3d, chan_freq, dt
+    )
+    assert vis_def.shape == (nbl * nchan, nt)
+    assert uvw_def.shape == (nbl * nchan, 3, nt)
+    assert eff_freq_def[0] == c_light
 
 
 def test_fourier_phase_shift():

@@ -82,10 +82,10 @@ def prepare_baseline_series(
     dt: float,
     *,
     dm: float = 0.0,
-    collapse_channels: bool = True,
+    collapse_channels: bool = False,
     nsubbands: int = 1,
     align_to: str = "fmax",
-    exact_uvw: bool = False,
+    exact_uvw: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Format raw/chunk visibility arrays into baseline time series ready for FFA folding.
@@ -106,13 +106,13 @@ def prepare_baseline_series(
         Dispersion measure trial in pc/cm^3.
     collapse_channels : bool
         If True, collapse frequency channels into an effective single-channel visibility series.
-        If False, flatten (nbl, nchan) into pseudo-baselines with exact per-channel coordinates.
+        If False (default), flatten (nbl, nchan) into pseudo-baselines with exact per-channel coordinates.
     nsubbands : int
         Number of subbands when collapsing channels (default 1).
     align_to : str
         Reference frequency alignment ('fmax' or 'fmin').
     exact_uvw : bool
-        If True and collapse_channels is False, compute exact dimensionless wavelength coordinates
+        If True (default) and collapse_channels is False, compute exact dimensionless wavelength coordinates
         accounting for dispersion delay baseline migration.
 
     Returns
@@ -587,9 +587,9 @@ def search_baseline_ffa(
     bins_min: int = 16,
     bins_max: int = 64,
     dm: float = 0.0,
-    collapse_channels: bool = True,
+    collapse_channels: bool = False,
     nsubbands: int = 1,
-    exact_uvw: bool = False,
+    exact_uvw: bool = True,
     segment_duration_s: Optional[float] = None,
     npix_x: int = 384,
     npix_y: int = 384,
@@ -619,11 +619,11 @@ def search_baseline_ffa(
         Dispersion measure in pc/cm^3.
     collapse_channels : bool
         If True, sum across channels before folding (standard mode).
-        If False, fold pseudo-baselines with exact wavelength coordinates.
+        If False (default), fold pseudo-baselines with exact wavelength coordinates (Option 1).
     nsubbands : int
         Number of subbands when collapse_channels is True (default 1 for full collapse).
     exact_uvw : bool
-        If True and collapse_channels is False, compute exact per-channel UVW delay tracks.
+        If True (default) and collapse_channels is False, compute exact per-channel UVW delay tracks.
     segment_duration_s : float, optional
         Option A segment duration in seconds. If provided, partitions time series into
         segments where UV tracks are approximately stationary, then synthesizes across segments.
