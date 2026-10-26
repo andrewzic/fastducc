@@ -164,3 +164,127 @@ def test_wstacked_3d_nufft_block_execution():
     )
     assert cube.shape == (npix, npix, 20)
     assert np.all(np.isfinite(cube))
+
+
+@pytest.mark.skipif(not HAS_DUCC, reason="ducc0 not installed")
+def test_wstacked_3d_nufft_high_dm_1deg_offaxis_recovery():
+    """
+    Verify that wstacked_3d_nufft_block coherently recovers a high-DM (DM = 1000 pc cm^-3),
+    1-degree off-axis periodic source in the presence of large non-coplanar w-baselines.
+    """
+    np.random.seed(7)
+    nbl = 24
+    nt = 64
+    nrows = nbl * nt
+    nchan = 16
+    npix = 128
+    pixsize_rad = 0.0004  # ~82.5 arcsec/pix -> ~2.93 deg FoV
+    dt = 0.1
+    Nf = nt
+    df = 1.0 / (Nf * dt)
+    c_light = 299792458.0
+
+    # Place source ~1.00 degree from phase centre:
+    # (dx, dy) = (+35, -26) pixels -> sqrt(35^2 + 26^2) * 0.0004 = 0.01744 rad (~1.00 deg)
+    dx_pix, dy_pix = 35, -26
+    l0 = dx_pix * pixsize_rad
+    m0 = dy_pix * pixsize_rad
+    nm1 = math.sqrt(1.0 - l0 * l0 - m0 * m0) - 1.0
+    assert 0.98 <= math.degrees(math.asin(math.hypot(l0, m0))) <= 1.02
+
+    # Expected DUCC fft_order spatial indices
+    expected_ix = dx_pix if dx_pix >= 0 else npix + dx_pix
+    expected_iy = dy_pix if dy_pix >= 0 else npix + dy_pix
+
+    # Periodic modulation at exact harmonic bin k_harm = 8 (f_spin = 1.25 Hz, P = 0.8 s)
+    k_harm = 8
+    f_spin = k_harm * df
+    kmin = 2
+    nkeep = 16
+    expected_ik = k_harm - kmin
+
+    # High dispersion measure: DM = 1000 pc cm^-3 across 1.15 - 1.45 GHz
+    dm = 1000.0
+    freqs_hz = np.linspace(1.15e9, 1.45e9, nchan)
+    k_dm = 4.148808e-3  # s * GHz^2 * pc^-1 * cm^3
+    f_ghz = freqs_hz * 1e-9
+    ref_ghz = np.max(f_ghz)
+    tau_dm = k_dm * dm * (1.0 / (f_ghz ** 2) - 1.0 / (ref_ghz ** 2))
+    assert np.max(tau_dm) > 1.0  # >1.19 s dispersion sweep (>1.4 pulse periods)
+
+    # Generate 3D non-coplanar baselines (w up to +/- 600 m)
+    bl_uvw = np.random.uniform(-1200.0, 1200.0, size=(nbl, 3))
+    bl_uvw[:, 2] = np.random.uniform(-600.0, 600.0, size=nbl)
+    uvw_m = np.tile(bl_uvw, (nt, 1))
+    times = np.repeat(np.arange(nt, dtype=np.float64) * dt, nbl)
+    flags = np.zeros((nrows, nchan), dtype=bool)
+
+    # Synthesize dispersed non-coplanar visibilities:
+    #Prepare_visibilities_and_coords maps om_u = +2*pi*u*dl, om_v = +2*pi*v*dl, om_f = -2*pi*(t - tau_dm)*df
+    # and ducc0.nufft.nu2u(forward=False) evaluates sum pts * exp(+i * (om_u*ix + om_v*iy + om_f*ik))
+    # followed by w-screen exp(+2*pi*i * w * nm1).
+    # Therefore a point source at (l0, m0, f_spin) has visibility phase:
+    #   phi = -2*pi * (u_lam * l0 + v_lam * m0 + w_lam * nm1) + 2*pi * f_spin * (t - tau_dm)
+    vis = np.empty((nrows, nchan), dtype=np.complex64)
+    for ic in range(nchan):
+        inv_lam = freqs_hz[ic] / c_light
+        u_lam = uvw_m[:, 0] * inv_lam
+        v_lam = uvw_m[:, 1] * inv_lam
+        w_lam = uvw_m[:, 2] * inv_lam
+        t_emit = times - tau_dm[ic]
+        phase = -2.0 * np.pi * (u_lam * l0 + v_lam * m0 + w_lam * nm1) + 2.0 * np.pi * f_spin * t_emit
+        vis[:, ic] = np.exp(1j * phase).astype(np.complex64)
+
+    # 1. Reconstruct with exact DM=1000 delays and W-stacking
+    cube_dedisp = wstacked_3d_nufft_block(
+        uvw_m=uvw_m,
+        times=times,
+        vis=vis,
+        flags=flags,
+        freqs_hz=freqs_hz,
+        tau_dm=tau_dm,
+        npix=npix,
+        pixsize_rad=pixsize_rad,
+        Nf=Nf,
+        dt=dt,
+        df=df,
+        kmin=kmin,
+        nkeep=nkeep,
+        supp_w=6,
+        ofactor=1.5,
+        epsilon=1e-5,
+        nthreads=2,
+    )
+
+    # 2. Reconstruct without DM correction (tau_dm = 0)
+    cube_uncorrected = wstacked_3d_nufft_block(
+        uvw_m=uvw_m,
+        times=times,
+        vis=vis,
+        flags=flags,
+        freqs_hz=freqs_hz,
+        tau_dm=np.zeros_like(tau_dm),
+        npix=npix,
+        pixsize_rad=pixsize_rad,
+        Nf=Nf,
+        dt=dt,
+        df=df,
+        kmin=kmin,
+        nkeep=nkeep,
+        supp_w=6,
+        ofactor=1.5,
+        epsilon=1e-5,
+        nthreads=2,
+    )
+
+    amp_dedisp = np.abs(cube_dedisp)
+    peak_loc = np.unravel_index(np.argmax(amp_dedisp), amp_dedisp.shape)
+    peak_val = float(amp_dedisp[peak_loc])
+    uncorrected_val = float(np.abs(cube_uncorrected[expected_ix, expected_iy, expected_ik]))
+
+    assert peak_loc == (expected_ix, expected_iy, expected_ik), (
+        f"Expected 3D peak at {(expected_ix, expected_iy, expected_ik)}, got {peak_loc}"
+    )
+    assert peak_val > 3.0 * uncorrected_val, (
+        f"Dedispersed peak ({peak_val:.1f}) should far exceed uncorrected peak ({uncorrected_val:.1f}) at DM=1000"
+    )

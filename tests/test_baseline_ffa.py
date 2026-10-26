@@ -266,3 +266,125 @@ def test_dispersed_offaxis_recovery():
     # Exact tracking preserves candidate coherence without bandwidth smearing
     assert peak_exact > 8.0, f"Expected high SNR with exact UVW, got {peak_exact}"
     assert peak_exact > 1.25 * peak_collapsed, f"Exact SNR ({peak_exact}) should significantly exceed collapsed ({peak_collapsed})"
+
+
+def test_high_dm_1deg_offaxis_recovery():
+    """
+    Injection and recovery test for a high-DM (DM = 1000 pc cm^-3),
+    highly off-axis (~1 degree from phase centre) periodic source with non-coplanar UVW tracks.
+    """
+    np.random.seed(123)
+    nbl = 16
+    nchan = 16
+    nt = 400
+    dt = 0.05  # 20.0 s observation
+    period = 1.05
+    dm = 1000.0  # High dispersion measure (pc cm^-3)
+    chan_freq = np.linspace(1.15e9, 1.45e9, nchan)
+    c_light = 299792458.0
+
+    # Image grid covering ~2.93 deg FoV so 1 deg off-axis is well within the field
+    npix_x, npix_y = 128, 128
+    pixsize_x = 0.0004  # ~82.5 arcsec/pixel
+    pixsize_y = 0.0004
+
+    # Place source ~1.00 degree (0.01745 rad) from phase centre:
+    # sqrt(35^2 + (-26)^2) * 0.0004 = 43.60 * 0.0004 = 0.01744 rad (0.9994 deg)
+    dx_pix, dy_pix = 35, -26
+    target_x = npix_x // 2 + dx_pix
+    target_y = npix_y // 2 + dy_pix
+    l0 = dx_pix * pixsize_x
+    m0 = dy_pix * pixsize_y
+    nm1 = np.sqrt(1.0 - l0**2 - m0**2) - 1.0
+    offset_deg = np.degrees(np.arcsin(np.hypot(l0, m0)))
+    assert 0.98 <= offset_deg <= 1.02
+
+    from fastducc.dedisp import get_dm_delays
+    delays = get_dm_delays(chan_freq, dm, dt, align_to="fmax")
+    # Verify dispersion sweep exceeds a full pulse period (>21 samples = 1.05 s)
+    assert np.max(delays) * dt > period
+
+    vis_3d = np.zeros((nbl, nchan, nt), dtype=np.complex64)
+    wgt_3d = np.ones((nbl, nchan, nt), dtype=np.float32)
+    uvw_3d = np.zeros((nbl, 3, nt), dtype=np.float64)
+
+    # Synthesize 3D non-coplanar UVW tracks with realistic Earth-rotation drift (~7.3e-5 rad/s * 20 s)
+    theta = np.linspace(0.0, 0.0015, nt)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    for b in range(nbl):
+        u0 = 90.0 * (b + 1) * np.cos(0.7 * b)
+        v0 = 90.0 * (b + 1) * np.sin(0.7 * b)
+        w0 = 25.0 * (b - nbl / 2.0)
+        uvw_3d[b, 0, :] = u0 * cos_t - v0 * sin_t
+        uvw_3d[b, 1, :] = u0 * sin_t + v0 * cos_t
+        uvw_3d[b, 2, :] = w0 + 0.02 * np.arange(nt)
+
+    t_obs = np.arange(nt) * dt
+    for c in range(nchan):
+        lam = c_light / chan_freq[c]
+        t_emit = t_obs - delays[c] * dt
+        phase = (t_emit / period) % 1.0
+        pulse = np.exp(-0.5 * ((phase - 0.5) / 0.03) ** 2).astype(np.float32)
+
+        sp_phase = (2.0 * np.pi / lam) * (
+            uvw_3d[:, 0, :] * l0 + uvw_3d[:, 1, :] * m0 - uvw_3d[:, 2, :] * nm1
+        )
+        noise = 0.05 * (
+            np.random.randn(nbl, nt) + 1j * np.random.randn(nbl, nt)
+        )
+        vis_3d[:, c, :] = (8.0 * pulse[None, :] * np.exp(-1j * sp_phase) + noise).astype(np.complex64)
+
+    # 1. Search with exact per-channel UVW tracking & w-gridding
+    res_exact = search_baseline_ffa(
+        (vis_3d, wgt_3d, uvw_3d, chan_freq, dt),
+        period_min=1.0,
+        period_max=1.1,
+        bins_min=16,
+        bins_max=20,
+        dm=dm,
+        collapse_channels=False,
+        exact_uvw=True,
+        segment_duration_s=None,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_x=pixsize_x,
+        pixsize_y=pixsize_y,
+        snr_thresh=5.0,
+    )
+
+    # 2. Search with collapsed channels (suffers severe radial bandwidth smearing at 1 deg off-axis)
+    res_collapsed = search_baseline_ffa(
+        (vis_3d, wgt_3d, uvw_3d, chan_freq, dt),
+        period_min=1.0,
+        period_max=1.1,
+        bins_min=16,
+        bins_max=20,
+        dm=dm,
+        collapse_channels=True,
+        segment_duration_s=None,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_x=pixsize_x,
+        pixsize_y=pixsize_y,
+        snr_thresh=5.0,
+    )
+
+    peak_exact = float(np.max(res_exact.snr_periodogram))
+    peak_collapsed = float(np.max(res_collapsed.snr_periodogram))
+    best_idx = int(np.argmax(res_exact.snr_periodogram))
+    recovered_period = float(res_exact.periods[best_idx])
+    peak_yx = np.unravel_index(np.argmax(res_exact.best_snr_plane), res_exact.best_snr_plane.shape)
+
+    assert peak_exact > 12.0, f"Expected high SNR at DM=1000, 1 deg off-axis, got {peak_exact:.2f}"
+    assert peak_exact > 2.0 * peak_collapsed, (
+        f"Exact UVW SNR ({peak_exact:.2f}) should far exceed channel-collapsed SNR ({peak_collapsed:.2f}) at 1 deg off-axis"
+    )
+    assert abs(recovered_period - period) / period < 0.005, (
+        f"Recovered period {recovered_period:.5f} s deviates from injected {period:.5f} s"
+    )
+    assert peak_yx == (target_y, target_x), (
+        f"Recovered (y, x) pixel {peak_yx} does not match injected 1-deg off-axis location ({target_y}, {target_x})"
+    )
+    assert res_exact.best_candidate is not None
+    assert (res_exact.best_candidate.x, res_exact.best_candidate.y) == (target_x, target_y)

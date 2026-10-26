@@ -578,10 +578,17 @@ def evaluate_period_snr(
                 w = int(max(w + 1, round(wtsp * w)))
             widths = np.asarray(w_list, dtype=int)
 
-    # 1. Continuum phase-mean subtraction in float32 to halve memory bandwidth
+    # 1. Continuum phase-median subtraction in float32:
+    # Using the phase median (rather than phase mean) removes steady continuum emission
+    # without leaking the pulsed source's dirty-beam sidelobes into off-pulse phase bins.
     phase_f32 = phase_images.astype(np.float32, copy=False)
-    mean_img = np.mean(phase_f32, axis=0)  # (ny, nx)
-    diff = phase_f32 - mean_img[None, :, :]  # (nbins, ny, nx)
+    med_img = np.median(phase_f32, axis=0)  # (ny, nx)
+    diff = phase_f32 - med_img[None, :, :]  # (nbins, ny, nx)
+
+    # Off-pulse single-bin spatial noise floor via Median Absolute Deviation (MAD)
+    med_xy = np.median(diff, axis=(1, 2), keepdims=True)
+    sigma_per_bin = 1.4826 * np.median(np.abs(diff - med_xy), axis=(1, 2))
+    sigma_base = float(np.median(sigma_per_bin))
 
     # 2. Circular prefix sum along phase axis for fast boxcar evaluation
     max_w = int(np.max(widths)) if len(widths) > 0 else 1
@@ -590,7 +597,6 @@ def evaluate_period_snr(
 
     snr_plane = np.full((ny, nx), -1e9, dtype=np.float32)
     box_buf = np.empty((nbins, ny, nx), dtype=np.float32)
-    abs_buf = np.empty((nbins, ny, nx), dtype=np.float32)
     max_snr_w = np.empty((ny, nx), dtype=np.float32)
 
     best_snr = -1e9
@@ -607,13 +613,8 @@ def evaluate_period_snr(
         # Boxcar sum for all nbins starting phases in-place: (nbins, ny, nx)
         np.subtract(cumsum[w_int : w_int + nbins], cumsum[:nbins], out=box_buf)
 
-        # Robust spatial noise per phase bin using Median Absolute Deviation (MAD)
-        med_xy = np.median(box_buf, axis=(1, 2), keepdims=True)
-        np.subtract(box_buf, med_xy, out=abs_buf)
-        np.abs(abs_buf, out=abs_buf)
-        sigma_xy = 1.4826 * np.median(abs_buf, axis=(1, 2), keepdims=True)
-        inv_sigma = np.where(sigma_xy > 1e-12, 1.0 / sigma_xy, 0.0).astype(np.float32)
-
+        sigma_w = sigma_base * math.sqrt(float(w_int))
+        inv_sigma = np.float32(1.0 / sigma_w if sigma_w > 1e-12 else 0.0)
         box_buf *= inv_sigma  # snr_w in-place: (nbins, ny, nx)
 
         # Max over starting phase bins for this width in-place:
