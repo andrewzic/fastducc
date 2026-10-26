@@ -9,9 +9,10 @@ Key Capabilities:
 1. Baseline-Domain FFA:
    Folds individual baseline time series (or frequency-resolved pseudo-baselines)
    into (period, phase) profiles without prior UV gridding, preserving phase coherence.
-2. Direct Imaging & Option A (Segmented / Two-Pass FFA):
-   Supports both direct baseline-folded imaging and time-segmented FFA where UV tracks
-   are approximately stationary per segment, phase-aligned, and synthesized in wgridder.
+2. Full-Observation & Segmented Two-Pass FFA Imaging:
+   Supports both direct full-observation baseline-folded imaging and time-segmented FFA
+   where Earth-rotation UV tracks are approximately stationary per segment, Fourier
+   phase-aligned to reference epoch t=0, and synthesized in wgridder.
 3. Memory-Efficient Streaming Architecture:
    Streams period trials and phase bins directly to wgridder and spatial SNR evaluation,
    evaluating candidates on-the-fly without allocating massive 4D image cubes.
@@ -156,23 +157,15 @@ def prepare_baseline_series(
         # Either N_sub subbands (collapse_channels=True, nsubbands > 1)
         # or N_chan channels (collapse_channels=False)
         n_freqs = vis_dedisp.shape[1]
-        freqs = eff_freq  # length n_freqs
+        freqs = np.asarray(eff_freq, dtype=np.float64)  # (n_freqs,)
+        freq_scale = freqs[None, :, None, None] / c_light  # (1, n_freqs, 1, 1)
 
-        if dm != 0.0:
+        if exact_uvw and (dm != 0.0):
             delays = dedisp.get_dm_delays(freqs, dm, dt, align_to=align_to)
+            t_phys = np.clip(np.arange(nt)[None, :] + delays[:, None], 0, nt - 1)  # (n_freqs, nt)
+            uvw_lambda = uvw_3d[:, :, t_phys].transpose(0, 2, 1, 3) * freq_scale
         else:
-            delays = np.zeros(n_freqs, dtype=np.int64)
-
-        uvw_lambda = np.empty((nbl, n_freqs, 3, nt), dtype=np.float64)
-        for ifreq in range(n_freqs):
-            fk = freqs[ifreq]
-            if exact_uvw and (dm != 0.0):
-                d = int(delays[ifreq])
-                t_phys = np.clip(np.arange(nt) + d, 0, nt - 1)
-                uvw_k = uvw_3d[:, :, t_phys]  # (nbl, 3, nt)
-            else:
-                uvw_k = uvw_3d
-            uvw_lambda[:, ifreq, :, :] = uvw_k * (fk / c_light)
+            uvw_lambda = uvw_3d[:, None, :, :] * freq_scale
 
         uvw_track = uvw_lambda.reshape(nbl * n_freqs, 3, nt)
         vis_2d = np.ascontiguousarray(vis_dedisp.reshape(nbl * n_freqs, nt), dtype=np.complex64)
@@ -213,7 +206,7 @@ def shift_profile_phase_fourier(profile: np.ndarray, delta_phase: np.ndarray) ->
     return np.fft.ifft(shifted_spec, axis=-1).astype(np.complex64)
 
 
-def fold_baselines_option_b(
+def fold_baselines_full(
     vis_2d: np.ndarray,
     wgt_2d: np.ndarray,
     uvw_track: np.ndarray,
@@ -223,21 +216,38 @@ def fold_baselines_option_b(
     downsample_factor: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Option B: Direct Baseline-Folded Imaging.
+    Full-Observation Baseline-Domain Fast Folding Algorithm (FFA).
 
-    Performs FFA folding directly across the full time series for each baseline,
-    associating folded visibilities with their time-averaged UVW coordinates.
+    Folds baseline or pseudo-baseline visibility time series across the entire observation,
+    associating folded visibilities with their time-averaged UVW baseline coordinates.
+
+    Parameters
+    ----------
+    vis_2d : np.ndarray
+        Shape (N_series, nt), complex64 baseline time series.
+    wgt_2d : np.ndarray
+        Shape (N_series, nt), float32 visibility weights.
+    uvw_track : np.ndarray
+        Shape (N_series, 3, nt), float64 baseline coordinates (meters or wavelengths).
+    base_period_bins : int
+        Number of phase bins at base period.
+    tsamp : float
+        Sampling interval in seconds.
+    rows_eval : int
+        Number of FFA transform rows to evaluate (0 for full).
+    downsample_factor : float
+        Time downsampling factor for this base period block.
 
     Returns
     -------
     uvw_eff : np.ndarray
         Shape (N_series, 3), effective time-averaged coordinates.
     wgt_eff : np.ndarray
-        Shape (N_series, 1), effective weights.
+        Shape (N_series, 1), effective time-averaged weights.
     folded_vis : np.ndarray
-        Shape (N_series, N_periods, base_period_bins), complex64.
+        Shape (N_series, N_periods, base_period_bins), complex64 folded visibilities.
     periods : np.ndarray
-        1D array of trial periods in seconds.
+        1D array of evaluated trial periods in seconds.
     """
     if libcpp is None:
         raise ImportError("riptide.libcpp is required for baseline FFA folding.")
@@ -266,7 +276,11 @@ def fold_baselines_option_b(
     return uvw_eff, wgt_eff, folded_vis, periods
 
 
-def fold_baselines_option_a(
+# Alias for backward compatibility
+fold_baselines_option_b = fold_baselines_full
+
+
+def fold_baselines_segmented(
     vis_2d: np.ndarray,
     wgt_2d: np.ndarray,
     uvw_track: np.ndarray,
@@ -277,12 +291,31 @@ def fold_baselines_option_a(
     downsample_factor: float = 1.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Option A: Segmented / Two-Pass Baseline FFA.
+    Segmented Baseline-Domain Fast Folding Algorithm (FFA) with Fourier Phase Alignment.
 
-    Partitions the observation into time segments of length segment_duration_s where
-    (u, v) tracks are approximately stationary. Folds each segment independently,
-    phase-aligns folded profiles to reference time t=0, and concatenates effective
-    segments along the baseline axis for synthesized wgridder imaging.
+    Partitions the observation into short time segments of length segment_duration_s where
+    Earth-rotation UV tracks are approximately stationary. Folds each segment independently,
+    circularly shifts folded profiles to align to reference epoch t=0 via Fourier rotation,
+    and concatenates effective segment baselines for coherent spatial synthesis in wgridder.
+
+    Parameters
+    ----------
+    vis_2d : np.ndarray
+        Shape (N_series, nt), complex64.
+    wgt_2d : np.ndarray
+        Shape (N_series, nt), float32.
+    uvw_track : np.ndarray
+        Shape (N_series, 3, nt), float64.
+    base_period_bins : int
+        Number of phase bins.
+    tsamp : float
+        Sampling interval in seconds.
+    segment_duration_s : float
+        Stationary segment duration in seconds.
+    rows_eval : int
+        FFA rows to evaluate.
+    downsample_factor : float
+        Time downsampling factor.
 
     Returns
     -------
@@ -299,9 +332,6 @@ def fold_baselines_option_a(
         raise ImportError("riptide.libcpp is required for baseline FFA folding.")
 
     n_series, nt = vis_2d.shape
-    total_duration_s = nt * tsamp
-    effective_tau = tsamp * downsample_factor
-
     effective_tau = tsamp * downsample_factor
     base_period_s = effective_tau * base_period_bins
 
@@ -313,8 +343,8 @@ def fold_baselines_option_a(
 
     n_segments = max(1, nt // seg_samples_native)
     if n_segments <= 1:
-        # Fall back to Option B (single segment across observation) if observation fits in <= 1 segment
-        return fold_baselines_option_b(
+        # Fall back to full-observation folding if observation fits in <= 1 segment
+        return fold_baselines_full(
             vis_2d, wgt_2d, uvw_track, base_period_bins, tsamp,
             rows_eval=rows_eval, downsample_factor=downsample_factor
         )
@@ -343,7 +373,6 @@ def fold_baselines_option_a(
         wgt_eff_s = np.where(has_w_s, wsum_s / seg_len, 0.0).astype(np.float32)
 
         # Fold segment
-        effective_tau = float(tsamp) * float(downsample_factor)
         folded_s, periods = libcpp.vis_ffa_transform_basep(
             vis_s,
             int(base_period_bins),
@@ -374,6 +403,10 @@ def fold_baselines_option_a(
     return uvw_eff, wgt_eff, folded_vis, periods_out
 
 
+# Alias for backward compatibility
+fold_baselines_option_a = fold_baselines_segmented
+
+
 def image_phase_bins_wgridder(
     uvw: np.ndarray,
     freq: np.ndarray,
@@ -389,6 +422,11 @@ def image_phase_bins_wgridder(
     divide_by_n: bool = True,
     center_x: float = 0.0,
     center_y: float = 0.0,
+    *,
+    wgt_norm: Optional[np.ndarray] = None,
+    n_valid: Optional[int] = None,
+    dirty_buf: Optional[np.ndarray] = None,
+    out: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Synthesize dirty images for all phase bins at a single trial period using ducc0.wgridder.
@@ -396,15 +434,35 @@ def image_phase_bins_wgridder(
     Parameters
     ----------
     uvw : np.ndarray
-        Shape (M, 3), baseline coordinates (in meters or wavelengths).
+        Shape (M, 3), baseline coordinates in meters or wavelengths.
     freq : np.ndarray
         Frequency array (Hz or [c_light]).
     vis_period : np.ndarray
-        Shape (M, nbins), complex64. Folded visibilities for this period across M baselines.
+        Shape (M, nbins), complex64 folded visibilities for this period across M baselines.
     wgt : np.ndarray, optional
-        Shape (M, 1) or (M,).
+        Shape (M, 1) or (M,) visibility weights.
     npix_x, npix_y : int
         Image dimensions.
+    pixsize_x, pixsize_y : float
+        Angular pixel sizes in radians.
+    epsilon : float
+        Gridding accuracy tolerance.
+    do_wgridding : bool
+        Whether to perform w-gridding.
+    nthreads : int
+        Number of threads for wgridder.
+    divide_by_n : bool
+        Whether to divide dirty image pixels by direction cosine n.
+    center_x, center_y : float
+        Image center shift in radians.
+    wgt_norm : np.ndarray, optional
+        Pre-normalized weights shape (M, 1) to amortize normalization overhead across periods.
+    n_valid : int, optional
+        Precomputed number of valid non-zero weight baselines.
+    dirty_buf : np.ndarray, optional
+        Pre-allocated work buffer of shape (npix_x, npix_y), float64, passed to vis2dirty.
+    out : np.ndarray, optional
+        Pre-allocated output array of shape (nbins, npix_y, npix_x), float64.
 
     Returns
     -------
@@ -415,27 +473,36 @@ def image_phase_bins_wgridder(
         raise ImportError("ducc0 is required for wgridder imaging.")
 
     M, nbins = vis_period.shape
-    if wgt is None:
-        wgt_in = np.ones((M, 1), dtype=np.float32)
-    elif wgt.ndim == 1:
-        wgt_in = wgt[:, None].astype(np.float32, copy=False)
+    if wgt_norm is None:
+        if wgt is None:
+            wgt_in = np.ones((M, 1), dtype=np.float32)
+        elif wgt.ndim == 1:
+            wgt_in = wgt[:, None].astype(np.float32, copy=False)
+        else:
+            wgt_in = wgt.astype(np.float32, copy=False)
+
+        wgt_max = float(np.max(wgt_in)) if wgt_in.size > 0 else 1.0
+        if wgt_max > 0:
+            wgt_norm = (wgt_in / wgt_max).astype(np.float32, copy=False)
+        else:
+            wgt_norm = wgt_in
+        n_valid = int(np.count_nonzero(wgt_norm))
+    elif n_valid is None:
+        n_valid = int(np.count_nonzero(wgt_norm))
+
+    dirty_dtype = np.float32 if vis_period.dtype == np.complex64 else np.float64
+    if dirty_buf is None or dirty_buf.dtype != dirty_dtype or dirty_buf.shape != (npix_x, npix_y):
+        dirty_buf = np.empty((npix_x, npix_y), dtype=dirty_dtype)
+
+    if out is None:
+        phase_images = np.empty((nbins, npix_y, npix_x), dtype=np.float64)
     else:
-        wgt_in = wgt.astype(np.float32, copy=False)
-
-    wgt_max = float(np.max(wgt_in)) if wgt_in.size > 0 else 1.0
-    if wgt_max > 0:
-        wgt_norm = (wgt_in / wgt_max).astype(np.float32, copy=False)
-    else:
-        wgt_norm = wgt_in
-
-    n_valid = int(np.count_nonzero(wgt_norm))
-
-    phase_images = np.empty((nbins, npix_y, npix_x), dtype=np.float64)
+        phase_images = out
 
     for k in range(nbins):
-        vis_bin = np.ascontiguousarray(vis_period[:, k:k+1], dtype=np.complex64)
+        vis_bin = np.ascontiguousarray(vis_period[:, k : k + 1], dtype=np.complex64)
 
-        dirty = ducc0.wgridder.vis2dirty(
+        ducc0.wgridder.vis2dirty(
             uvw=uvw,
             freq=freq,
             vis=vis_bin,
@@ -450,13 +517,13 @@ def image_phase_bins_wgridder(
             divide_by_n=divide_by_n,
             center_x=center_x,
             center_y=center_y,
+            dirty=dirty_buf,
         )
-        # Transpose DUCC (x, y) -> (y, x) convention
-        dirty = dirty.T
+        # Transpose DUCC (x, y) -> (y, x) convention into phase_images[k]
         if divide_by_n and n_valid > 0:
-            dirty = dirty / n_valid
-
-        phase_images[k] = dirty
+            phase_images[k] = dirty_buf.T / n_valid
+        else:
+            phase_images[k] = dirty_buf.T
 
     return phase_images
 
@@ -511,17 +578,21 @@ def evaluate_period_snr(
                 w = int(max(w + 1, round(wtsp * w)))
             widths = np.asarray(w_list, dtype=int)
 
-    # 1. Continuum phase-mean subtraction
-    mean_img = np.mean(phase_images, axis=0)  # (ny, nx)
-    diff = phase_images - mean_img[None, :, :]  # (nbins, ny, nx)
+    # 1. Continuum phase-mean subtraction in float32 to halve memory bandwidth
+    phase_f32 = phase_images.astype(np.float32, copy=False)
+    mean_img = np.mean(phase_f32, axis=0)  # (ny, nx)
+    diff = phase_f32 - mean_img[None, :, :]  # (nbins, ny, nx)
 
     # 2. Circular prefix sum along phase axis for fast boxcar evaluation
     max_w = int(np.max(widths)) if len(widths) > 0 else 1
-    # Concatenate to wrap circularly: (nbins + max_w, ny, nx)
     diff_wrap = np.concatenate([diff, diff[:max_w]], axis=0)
-    cumsum = np.concatenate([np.zeros((1, ny, nx), dtype=diff.dtype), np.cumsum(diff_wrap, axis=0)], axis=0)
+    cumsum = np.concatenate([np.zeros((1, ny, nx), dtype=np.float32), np.cumsum(diff_wrap, axis=0, dtype=np.float32)], axis=0)
 
     snr_plane = np.full((ny, nx), -1e9, dtype=np.float32)
+    box_buf = np.empty((nbins, ny, nx), dtype=np.float32)
+    abs_buf = np.empty((nbins, ny, nx), dtype=np.float32)
+    max_snr_w = np.empty((ny, nx), dtype=np.float32)
+
     best_snr = -1e9
     best_w = 1
     best_k = 0
@@ -533,29 +604,27 @@ def evaluate_period_snr(
         if w_int >= nbins or w_int <= 0:
             continue
 
-        # Boxcar sum for all nbins starting phases: (nbins, ny, nx)
-        # box[k] = sum_{j=0}^{w-1} diff[(k+j) % nbins]
-        box_w = cumsum[w_int : w_int + nbins] - cumsum[:nbins]
+        # Boxcar sum for all nbins starting phases in-place: (nbins, ny, nx)
+        np.subtract(cumsum[w_int : w_int + nbins], cumsum[:nbins], out=box_buf)
 
-        # Robust spatial noise per phase bin (using Median Absolute Deviation to prevent
-        # bright point source and PSF sidelobes from inflating sigma and suppressing candidate SNR):
-        med_xy = np.median(box_w, axis=(1, 2), keepdims=True)
-        sigma_xy = 1.4826 * np.median(np.abs(box_w - med_xy), axis=(1, 2), keepdims=True)
-        inv_sigma = np.where(sigma_xy > 1e-12, 1.0 / sigma_xy, 0.0)
+        # Robust spatial noise per phase bin using Median Absolute Deviation (MAD)
+        med_xy = np.median(box_buf, axis=(1, 2), keepdims=True)
+        np.subtract(box_buf, med_xy, out=abs_buf)
+        np.abs(abs_buf, out=abs_buf)
+        sigma_xy = 1.4826 * np.median(abs_buf, axis=(1, 2), keepdims=True)
+        inv_sigma = np.where(sigma_xy > 1e-12, 1.0 / sigma_xy, 0.0).astype(np.float32)
 
-        snr_w = (box_w * inv_sigma).astype(np.float32)  # (nbins, ny, nx)
+        box_buf *= inv_sigma  # snr_w in-place: (nbins, ny, nx)
 
-        # Max over starting phase bins for this width:
-        max_snr_w = np.max(snr_w, axis=0)  # (ny, nx)
-        snr_plane = np.maximum(snr_plane, max_snr_w)
+        # Max over starting phase bins for this width in-place:
+        np.max(box_buf, axis=0, out=max_snr_w)
+        np.maximum(snr_plane, max_snr_w, out=snr_plane)
 
-        # Check peak
         peak_w_val = float(np.max(max_snr_w))
         if peak_w_val > best_snr:
             best_snr = peak_w_val
             best_w = w_int
-            # Find phase bin and spatial pixel
-            best_k, best_y, best_x = np.unravel_index(np.argmax(snr_w), snr_w.shape)
+            best_k, best_y, best_x = np.unravel_index(np.argmax(box_buf), box_buf.shape)
 
     cand = None
     if best_snr >= snr_thresh:
@@ -619,15 +688,15 @@ def search_baseline_ffa(
         Dispersion measure in pc/cm^3.
     collapse_channels : bool
         If True, sum across channels before folding (standard mode).
-        If False (default), fold pseudo-baselines with exact wavelength coordinates (Option 1).
+        If False (default), fold pseudo-baselines with exact wavelength coordinates.
     nsubbands : int
         Number of subbands when collapse_channels is True (default 1 for full collapse).
     exact_uvw : bool
         If True (default) and collapse_channels is False, compute exact per-channel UVW delay tracks.
     segment_duration_s : float, optional
-        Option A segment duration in seconds. If provided, partitions time series into
+        Stationary segment duration in seconds. If provided, partitions time series into
         segments where UV tracks are approximately stationary, then synthesizes across segments.
-        If None, runs Option B (direct baseline-folded imaging).
+        If None, runs full-observation baseline-folded imaging.
     npix_x, npix_y : int
         Image grid dimensions.
     pixsize_x, pixsize_y : float
@@ -694,18 +763,17 @@ def search_baseline_ffa(
     for i_bp, bp_info in enumerate(plan):
         b_bins = int(bp_info["bins"])
         ds_factor = float(bp_info["downsample_factor"])
-        tau = float(bp_info["tau"])
         rows_eval = int(bp_info["rows_eval"])
 
         # Fold baselines
         if segment_duration_s is not None and segment_duration_s > 0:
-            uvw_eff, wgt_eff, folded_vis, trial_periods = fold_baselines_option_a(
+            uvw_eff, wgt_eff, folded_vis, trial_periods = fold_baselines_segmented(
                 vis_2d, wgt_2d, uvw_track, b_bins, dt,
                 segment_duration_s=segment_duration_s,
                 rows_eval=rows_eval, downsample_factor=ds_factor
             )
         else:
-            uvw_eff, wgt_eff, folded_vis, trial_periods = fold_baselines_option_b(
+            uvw_eff, wgt_eff, folded_vis, trial_periods = fold_baselines_full(
                 vis_2d, wgt_2d, uvw_track, b_bins, dt,
                 rows_eval=rows_eval, downsample_factor=ds_factor
             )
@@ -716,17 +784,38 @@ def search_baseline_ffa(
             f"evaluating {n_periods_bp} periods [{trial_periods[0]:.4f} - {trial_periods[-1]:.4f}] s"
         )
 
+        # Precompute normalized weights and valid baseline count once per base period block
+        m_eff = uvw_eff.shape[0]
+        if wgt_eff is None:
+            wgt_in = np.ones((m_eff, 1), dtype=np.float32)
+        elif wgt_eff.ndim == 1:
+            wgt_in = wgt_eff[:, None].astype(np.float32, copy=False)
+        else:
+            wgt_in = wgt_eff.astype(np.float32, copy=False)
+
+        wgt_max = float(np.max(wgt_in)) if wgt_in.size > 0 else 1.0
+        wgt_norm = (wgt_in / wgt_max).astype(np.float32, copy=False) if wgt_max > 0 else wgt_in
+        n_valid = int(np.count_nonzero(wgt_norm))
+
+        # Pre-allocate reusable imaging work buffer and phase images output buffer
+        dirty_dtype = np.float32 if folded_vis.dtype == np.complex64 else np.float64
+        dirty_work_buf = np.empty((npix_x, npix_y), dtype=dirty_dtype)
+        phase_imgs_buf = np.empty((b_bins, npix_y, npix_x), dtype=np.float64)
+
         # 5. Stream through trial periods and image phase bins
         for r, period in enumerate(trial_periods):
             # folded_vis: (M, N_periods, b_bins) -> extract period r: (M, b_bins)
             vis_period = folded_vis[:, r, :]
 
-            # Image phase bins
+            # Image phase bins with zero in-loop buffer allocations
             phase_imgs = image_phase_bins_wgridder(
                 uvw=uvw_eff,
                 freq=eff_freq,
                 vis_period=vis_period,
-                wgt=wgt_eff,
+                wgt_norm=wgt_norm,
+                n_valid=n_valid,
+                dirty_buf=dirty_work_buf,
+                out=phase_imgs_buf,
                 npix_x=npix_x,
                 npix_y=npix_y,
                 pixsize_x=pixsize_x,

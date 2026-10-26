@@ -22,7 +22,6 @@ import math
 import time
 import uuid
 from typing import Optional, Tuple, List, Dict
-from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 try:
@@ -92,20 +91,19 @@ def _process_block_and_save(
       - Otherwise: run coplanar 3-D NUFFT channel-by-channel.
       - Output complex partials X(l, m, f>=fmin).
     """
-    T = table(ms_path, readonly=True)
-    colnames = set(T.colnames())
-    time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
+    with table(ms_path, readonly=True, ack=False) as T:
+        colnames = set(T.colnames())
+        time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
 
-    min_row = int(np.min(row_ids_block))
-    max_row = int(np.max(row_ids_block))
-    num_rows = max_row - min_row + 1
-    rel_rows = row_ids_block - min_row
+        min_row = int(np.min(row_ids_block))
+        max_row = int(np.max(row_ids_block))
+        num_rows = max_row - min_row + 1
+        rel_rows = row_ids_block - min_row
 
-    uvw_m = T.getcol('UVW', startrow=min_row, nrow=num_rows)[rel_rows]
-    times = T.getcol(time_col, startrow=min_row, nrow=num_rows)[rel_rows]
-    data = T.getcol(data_col, startrow=min_row, nrow=num_rows)[rel_rows]
-    flags = T.getcol('FLAG', startrow=min_row, nrow=num_rows)[rel_rows]
-    T.close()
+        uvw_m = T.getcol('UVW', startrow=min_row, nrow=num_rows)[rel_rows]
+        times = T.getcol(time_col, startrow=min_row, nrow=num_rows)[rel_rows]
+        data = T.getcol(data_col, startrow=min_row, nrow=num_rows)[rel_rows]
+        flags = T.getcol('FLAG', startrow=min_row, nrow=num_rows)[rel_rows]
 
     if chan_sel is None:
         vis = data[:, :, pol].astype(np.complex64)
@@ -186,7 +184,7 @@ def _process_block_and_save(
                 fft_order=True
             )
 
-            X_blk_keep += out_buf[:, :, kmin : Nf // 2]
+            X_blk_keep += out_buf[:, :, kmin : kmin + nkeep]
         del out_buf
 
     part_path = None
@@ -243,12 +241,11 @@ def run_periodicity(args=None) -> str:
         args = build_cli_periodicity()
 
     # --- prepare MS row ordering ---
-    T = table(args.msname, readonly=True, lockoptions='usernoread')
-    colnames = set(T.colnames())
-    time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
-    all_times = T.getcol(time_col)
-    row_ids_sorted = np.argsort(all_times)
-    T.close()
+    with table(args.msname, readonly=True, lockoptions='usernoread', ack=False) as T:
+        colnames = set(T.colnames())
+        time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
+        all_times = T.getcol(time_col)
+        row_ids_sorted = np.argsort(all_times)
 
     # --- global time/frequency grid for the spin axis ---
     ut = np.unique(all_times[row_ids_sorted])
@@ -271,9 +268,6 @@ def run_periodicity(args=None) -> str:
     ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(args.msname, field_name=None)
     ms_base, candidates_dir, chunk_prefix_root, all_prefix_root = ms_utils.derive_paths(args.msname)
 
-    partials_dir = os.path.join(candidates_dir, args.partials_dir)
-    os.makedirs(partials_dir, exist_ok=True)
-
     # block row ranges
     nrows = row_ids_sorted.size
     bounds = []
@@ -293,15 +287,16 @@ def run_periodicity(args=None) -> str:
                     None if args.chan_end is None else int(args.chan_end))
 
     spw_table_path = os.path.join(args.msname, "SPECTRAL_WINDOW")
-    Tspw = table(spw_table_path, readonly=True)
-    if Tspw.nrows() == 0 and args.msname.endswith(".uvsub.ms"):
-        alt_ms = args.msname[:-9] + ".ms"
-        if os.path.exists(alt_ms):
-            Tspw.close()
-            spw_table_path = os.path.join(alt_ms, "SPECTRAL_WINDOW")
-            Tspw = table(spw_table_path, readonly=True)
-    freqs_full = Tspw.getcol('CHAN_FREQ')[int(args.spw)]
-    Tspw.close()
+    if args.msname.endswith(".uvsub.ms"):
+        with table(spw_table_path, readonly=True, ack=False) as t_check:
+            is_empty = (t_check.nrows() == 0)
+        if is_empty:
+            alt_ms = args.msname[:-9] + ".ms"
+            if os.path.exists(alt_ms):
+                spw_table_path = os.path.join(alt_ms, "SPECTRAL_WINDOW")
+
+    with table(spw_table_path, readonly=True, ack=False) as Tspw:
+        freqs_full = Tspw.getcol('CHAN_FREQ')[int(args.spw)]
 
     if chan_sel is None:
         freqs_hz = freqs_full
@@ -309,7 +304,6 @@ def run_periodicity(args=None) -> str:
         s, e = chan_sel
         freqs_hz = freqs_full[s:e]
 
-    metas: List[Dict] = []
     num_blocks = len(bounds)
 
     do_wstacking = getattr(args, "do_wstacking", True)
@@ -587,6 +581,7 @@ def run_periodicity(args=None) -> str:
     else:
         raise ValueError(f"Unknown parallel-mode: {args.parallel_mode}")
 
+    shutil.rmtree(out_partials_dir, ignore_errors=True)
     logger.info(f"NUFFT block computations & accumulation completed in {time.time() - t_start:.2f}s.")
 
     t_stitch_0 = time.time()
@@ -697,5 +692,4 @@ def run_periodicity(args=None) -> str:
 
     total_time = time.time() - t_start
     logger.info(f"Finished fastducc periodicity search in {total_time:.2f}s.")
-    return out_cube_fits
     return out_cube_fits

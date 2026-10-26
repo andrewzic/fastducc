@@ -186,6 +186,44 @@ def filter_and_weight_w_plane(
 
 
 @njit(parallel=True, fastmath=True)
+def weight_w_plane_slice(
+    pts_slice: np.ndarray,      # (n_sub,) complex64
+    coords_slice: np.ndarray,   # (n_sub, 3) float64
+    w_slice: np.ndarray,        # (n_sub,) float64
+    w_curr: float,              # float64
+    dw: float,                  # float64
+    supp_w: float,              # float64
+    beta: float,                # float64
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Numba-accelerated parallel Kaiser-Bessel weighting over a pre-indexed W-slice.
+    Evaluates:
+        psi(x) = exp(beta * (sqrt(max(0, 1 - x^2)) - 1))
+    where x = ((w - w_curr) / dw) * (2 / supp_w).
+    Operates in O(N_slice) without re-scanning non-contributing visibilities.
+    """
+    n = len(w_slice)
+    plane_pts = np.empty(n, dtype=np.complex64)
+    plane_coords = np.empty((n, 3), dtype=np.float64)
+
+    inv_dw = 1.0 / dw
+    norm_fac = 2.0 / supp_w
+
+    for i in prange(n):
+        w_dist = (w_slice[i] - w_curr) * inv_dw
+        x_norm = w_dist * norm_fac
+        diff = 1.0 - x_norm * x_norm
+        val = math.exp(beta * (math.sqrt(diff if diff > 0.0 else 0.0) - 1.0))
+
+        plane_pts[i] = complex(pts_slice[i].real * val, pts_slice[i].imag * val)
+        plane_coords[i, 0] = coords_slice[i, 0]
+        plane_coords[i, 1] = coords_slice[i, 1]
+        plane_coords[i, 2] = coords_slice[i, 2]
+
+    return plane_pts, plane_coords
+
+
+@njit(parallel=True, fastmath=True)
 def accumulate_w_screen_inplace(
     accum_cube: np.ndarray,     # (npix, npix, nkeep) complex64
     plane_buf: np.ndarray,      # (npix, npix, Nf) complex64
@@ -319,9 +357,15 @@ def wstacked_3d_nufft_block(
     if len(all_pts) == 0:
         return np.zeros((npix, npix, nkeep), dtype=np.complex64)
 
-    # 2. W-plane geometry
-    w_min = float(np.min(all_w_lam))
-    w_max = float(np.max(all_w_lam))
+    # 2. Pre-sort visibilities and coordinates along w to enable O(log N + N_slice) windowing
+    sort_order = np.argsort(all_w_lam)
+    all_pts = all_pts[sort_order]
+    all_coords = all_coords[sort_order]
+    all_w_lam = all_w_lam[sort_order]
+
+    # 3. W-plane geometry
+    w_min = float(all_w_lam[0])
+    w_max = float(all_w_lam[-1])
     dw, nplanes, w0 = compute_w_plane_geometry(
         npix=npix,
         pixsize_rad=pixsize_rad,
@@ -331,29 +375,33 @@ def wstacked_3d_nufft_block(
         ofactor=ofactor,
     )
     beta = 2.3 * supp_w
+    half_supp_w = 0.5 * float(supp_w)
+    w_window = half_supp_w * dw
 
-    # 3. Precompute 2D w-screen coordinate table (nm1_screen)
+    # 4. Precompute 2D w-screen coordinate table (nm1_screen)
     nm1_screen = compute_nm1_screen(npix, pixsize_rad)
 
-    # 4. Allocate streaming buffers
+    # 5. Allocate streaming buffers
     accum_cube = np.zeros((npix, npix, nkeep), dtype=np.complex64)
     plane_buf = np.zeros((npix, npix, Nf), dtype=np.complex64)
 
-    # 5. Stream through W-planes
+    # 6. Stream through W-planes with binary search slicing
     for pl in range(nplanes):
         w_curr = w0 + pl * dw
-        plane_pts, plane_coords = filter_and_weight_w_plane(
-            all_pts=all_pts,
-            all_coords=all_coords,
-            all_w_lam=all_w_lam,
+        i_start = int(np.searchsorted(all_w_lam, w_curr - w_window, side="left"))
+        i_end = int(np.searchsorted(all_w_lam, w_curr + w_window, side="right"))
+        if i_end <= i_start:
+            continue
+
+        plane_pts, plane_coords = weight_w_plane_slice(
+            pts_slice=all_pts[i_start:i_end],
+            coords_slice=all_coords[i_start:i_end],
+            w_slice=all_w_lam[i_start:i_end],
             w_curr=w_curr,
             dw=dw,
             supp_w=float(supp_w),
             beta=beta,
         )
-
-        if len(plane_pts) == 0:
-            continue
 
         plane_buf.fill(0.0)
         ducc_nufft.nu2u(
@@ -400,18 +448,19 @@ def wstacked_3d_nufft(
     if not HAS_DUCC:
         raise ImportError("ducc0 is required for wstacked_3d_nufft")
 
+    if len(vis) == 0:
+        return np.zeros((npix, npix, Nf // 2), dtype=np.complex64)
+
     df = 1.0 / (Nf * dt)
     w_min = float(np.min(w_lam))
     w_max = float(np.max(w_lam))
     dw, nplanes, w0 = compute_w_plane_geometry(npix, pixsize_rad, w_min, w_max, supp_w=supp_w)
     beta = 2.3 * supp_w
 
-    def wrap_pi(x):
-        return (x + math.pi) % (2.0 * math.pi) - math.pi
-
-    omega_u = wrap_pi(2.0 * math.pi * u_lam * pixsize_rad)
-    omega_v = wrap_pi(2.0 * math.pi * v_lam * pixsize_rad)
-    omega_f = wrap_pi(-2.0 * math.pi * t_sec * df)
+    two_pi = 2.0 * math.pi
+    omega_u = (two_pi * u_lam * pixsize_rad + math.pi) % two_pi - math.pi
+    omega_v = (two_pi * v_lam * pixsize_rad + math.pi) % two_pi - math.pi
+    omega_f = (-two_pi * t_sec * df + math.pi) % two_pi - math.pi
     coords_3d = np.stack([omega_u, omega_v, omega_f], axis=1).astype(np.float64)
 
     nm1_screen = compute_nm1_screen(npix, pixsize_rad)
@@ -421,23 +470,34 @@ def wstacked_3d_nufft(
     else:
         weighted_vis = vis.astype(np.complex64)
 
+    # Pre-sort coordinates along w
+    sort_order = np.argsort(w_lam)
+    sorted_vis = weighted_vis[sort_order]
+    sorted_coords = coords_3d[sort_order]
+    sorted_w = w_lam[sort_order]
+
+    half_supp_w = 0.5 * float(supp_w)
+    w_window = half_supp_w * dw
+
     accum_cube = np.zeros((npix, npix, Nf // 2), dtype=np.complex64)
     plane_buf = np.zeros((npix, npix, Nf), dtype=np.complex64)
 
     for pl in range(nplanes):
         w_curr = w0 + pl * dw
-        plane_pts, plane_coords = filter_and_weight_w_plane(
-            all_pts=weighted_vis,
-            all_coords=coords_3d,
-            all_w_lam=w_lam,
+        i_start = int(np.searchsorted(sorted_w, w_curr - w_window, side="left"))
+        i_end = int(np.searchsorted(sorted_w, w_curr + w_window, side="right"))
+        if i_end <= i_start:
+            continue
+
+        plane_pts, plane_coords = weight_w_plane_slice(
+            pts_slice=sorted_vis[i_start:i_end],
+            coords_slice=sorted_coords[i_start:i_end],
+            w_slice=sorted_w[i_start:i_end],
             w_curr=w_curr,
             dw=dw,
             supp_w=float(supp_w),
             beta=beta,
         )
-
-        if len(plane_pts) == 0:
-            continue
 
         plane_buf.fill(0.0)
         ducc_nufft.nu2u(
@@ -474,7 +534,7 @@ def snapshot_wgridder_fft(
     nthreads: int = 0,
 ) -> np.ndarray:
     """
-    Concept B: Snapshot 2D W-Gridder + 1D Temporal FFT.
+    Snapshot 2D W-Gridder + 1D Temporal FFT.
     Transforms visibility tracks into a spin-frequency cube.
     """
     if not HAS_DUCC:
@@ -483,6 +543,7 @@ def snapshot_wgridder_fft(
     nbl, nt = vis_track.shape
     freq_arr = np.array([freq_hz], dtype=np.float64)
     img_cube = np.zeros((nt, npix, npix), dtype=np.float32)
+    dirty_buf = np.empty((npix, npix), dtype=np.float32)
 
     for it in range(nt):
         uvw_it = np.ascontiguousarray(uvw_track[:, :, it], dtype=np.float64)
@@ -492,8 +553,10 @@ def snapshot_wgridder_fft(
             if wgt_track is not None
             else None
         )
+        if wgt_it is not None and np.count_nonzero(wgt_it) == 0:
+            continue
 
-        dirty = ducc_wgridder.vis2dirty(
+        ducc_wgridder.vis2dirty(
             uvw=uvw_it,
             freq=freq_arr,
             vis=vis_it,
@@ -505,8 +568,9 @@ def snapshot_wgridder_fft(
             epsilon=epsilon,
             do_wgridding=True,
             nthreads=nthreads,
+            dirty=dirty_buf,
         )
-        img_cube[it] = dirty
+        img_cube[it] = dirty_buf
 
     fft_cube = np.fft.rfft(img_cube, axis=0)
     return fft_cube
