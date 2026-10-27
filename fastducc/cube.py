@@ -1142,22 +1142,25 @@ def grid_ms_to_zarr(
             _, _, n_done = fut.result()
             pbar.update(n_done)
     elif parallel_mode in ("dask-local", "dask-slurm"):
-        from dask.distributed import Client, as_completed as dask_as_completed
-        if parallel_mode == "dask-local":
-            from dask.distributed import LocalCluster
-            cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, processes=(dask_scheduler == "processes"))
-            dask_client = Client(cluster)
-        else:
-            from fastducc.dask_utils import setup_slurm_cluster, derive_dask_job_name, resolve_dask_log_directory
-            job_name = derive_dask_job_name(stage="zarr_cube", ms_path=msname)
-            log_dir = resolve_dask_log_directory()
-            cluster = setup_slurm_cluster(
-                queue=slurm_partition, account=slurm_account, cores_per_worker=slurm_cores_per_worker,
-                mem=slurm_mem, walltime=slurm_walltime, job_name=job_name, log_directory=log_dir,
-                job_extra_directives=slurm_job_extra or [], interface=slurm_interface,
-                min_workers=1, max_workers=n_workers, adaptive=False,
-            )
-            dask_client = Client(cluster)
+        from dask.distributed import as_completed as dask_as_completed
+        from fastducc.dask_utils import get_dask_client
+        dask_client, cluster = get_dask_client(
+            parallel_mode=parallel_mode,
+            stage_name="zarr_cube",
+            ms_path=msname,
+            slurm_partition=slurm_partition,
+            slurm_account=slurm_account,
+            slurm_cores_per_worker=slurm_cores_per_worker,
+            slurm_mem=slurm_mem,
+            slurm_walltime=slurm_walltime,
+            slurm_job_extra=slurm_job_extra,
+            slurm_interface=slurm_interface,
+            min_workers=1,
+            max_workers=n_workers,
+            local_workers=n_workers,
+            threads_per_worker=threads_per_worker,
+            dask_scheduler=dask_scheduler,
+        )
         try:
             future_to_task = [
                 dask_client.submit(
@@ -1669,35 +1672,31 @@ def make_dirty_cube(
                 _handle_worker_result(chunk_arr, c_g_idx, off_s)
                 pbar.update(n_done)
     elif parallel_mode in ("dask", "dask-local", "dask-slurm"):
-        from dask.distributed import Client, as_completed as dask_as_completed
+        from dask.distributed import as_completed as dask_as_completed
         close_client = False
+        cluster = None
         eff_client = client or getattr(cfg, "client", None)
         if eff_client is not None:
             dask_client = eff_client
-        elif parallel_mode == "dask-local":
-            from dask.distributed import LocalCluster
-            cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, processes=(dask_scheduler == "processes"))
-            dask_client = Client(cluster)
-            close_client = True
         else:
-            from fastducc.dask_utils import setup_slurm_cluster, derive_dask_job_name, resolve_dask_log_directory
-            job_name = derive_dask_job_name(stage="cube", ms_path=msname)
-            log_dir = resolve_dask_log_directory()
-            cluster = setup_slurm_cluster(
-                queue=slurm_partition,
-                account=slurm_account,
-                cores_per_worker=slurm_cores_per_worker,
-                mem=slurm_mem,
-                walltime=slurm_walltime,
-                job_name=job_name,
-                log_directory=log_dir,
-                job_extra_directives=slurm_job_extra or [],
-                interface=slurm_interface,
+            from fastducc.dask_utils import get_dask_client
+            dask_client, cluster = get_dask_client(
+                parallel_mode=parallel_mode if parallel_mode in ("dask-local", "dask-slurm") else "dask-slurm",
+                stage_name="cube",
+                ms_path=msname,
+                slurm_partition=slurm_partition,
+                slurm_account=slurm_account,
+                slurm_cores_per_worker=slurm_cores_per_worker,
+                slurm_mem=slurm_mem,
+                slurm_walltime=slurm_walltime,
+                slurm_job_extra=slurm_job_extra,
+                slurm_interface=slurm_interface,
                 min_workers=1,
                 max_workers=n_workers,
-                adaptive=False,
+                local_workers=n_workers,
+                threads_per_worker=threads_per_worker,
+                dask_scheduler=dask_scheduler,
             )
-            dask_client = Client(cluster)
             close_client = True
 
         try:
