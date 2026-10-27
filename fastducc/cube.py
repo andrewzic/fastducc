@@ -47,6 +47,11 @@ try:
 except ImportError:
     ducc0 = None
 
+try:
+    import zarr
+except ImportError:
+    zarr = None
+
 from fastducc.fd_types import CubeConfig
 from fastducc import ms_utils, imaging, dedisp, timeshift
 from fastducc import wcs as ducc_wcs
@@ -655,7 +660,94 @@ def process_chunk_task(
 
     ret_dirty = cube_chunk.astype(dtype_str) if (write_dirty and cube_chunk is not None) else None
     return (offset_start, offset_end, n_samples, (ret_dirty, real_chunk, imag_chunk))
-    return (offset_start, offset_end, n_samples, (ret_dirty, real_chunk, imag_chunk))
+
+
+def grid_chunk_to_zarr_task(
+    msname: str,
+    out_zarr: str,
+    chunk_times: np.ndarray,
+    offset_start: int,
+    offset_end: int,
+    npix_x: int = 384,
+    npix_y: int = 384,
+    pix_rad: float = 1e-4,
+    grid_indices: Optional[np.ndarray] = None,
+    data_column: str = "DATA",
+    corr_mode: str = "single",
+    basis: str = "linear",
+    single_pol: str = "XX",
+    epsilon: float = 1e-6,
+    do_wgridding: bool = True,
+    nthreads: int = 0,
+    verbosity: int = 0,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    flip_w: bool = False,
+    divide_by_n: bool = True,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+    min_valid_channels: int = 24,
+    dm: float = 0.0,
+    collapse_channels: bool = False,
+    nsubbands: int = 1,
+    exact_uvw: bool = True,
+    align_to: str = "fmax",
+    shift_samps: float = 0.0,
+    shift_method: str = "fft",
+    shift_domain: str = "native",
+    uv_hermitian_half: bool = True,
+    n_target_samples: Optional[int] = None,
+    **kwargs,
+) -> Tuple[int, int, int]:
+    """
+    Worker task: reads chunk rows from MS, applies sub-sample phase/time regularisation,
+    computes snapshot UV gridding via ducc0.wgridder.vis2grid (with uv_hermitian_half if enabled),
+    and writes directly to the on-disk chunked Zarr array slice.
+    """
+    if zarr is None:
+        raise ImportError("zarr library is required for grid_chunk_to_zarr_task.")
+
+    times_chunk, chunk_freq, dt, vis_3d, wgt_3d, uvw_3d = imaging.load_chunk_data(
+        msname=msname, chunk_times=chunk_times, data_column=data_column,
+        corr_mode=corr_mode, basis=basis, single_pol=single_pol,
+    )
+
+    if abs(shift_samps) > 1e-7 and shift_domain == "native":
+        vis_3d = timeshift.shift_time_series(vis_3d, shift_samps, method=shift_method, axis=-1)
+        wgt_3d = timeshift.shift_time_series(wgt_3d, shift_samps, method=shift_method, axis=-1)
+        wgt_3d = np.maximum(wgt_3d, 0.0)
+        uvw_3d = timeshift.shift_time_series(uvw_3d, shift_samps, method=shift_method, axis=-1)
+
+    uv_cube_chunk = imaging.grid_chunk_uv_cube(
+        vis_3d=vis_3d, wgt_3d=wgt_3d, uvw_3d=uvw_3d, chan_freq=chunk_freq, dt=dt,
+        dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands,
+        align_to=align_to, exact_uvw=exact_uvw, npix_x=npix_x, npix_y=npix_y,
+        pixsize_x=pix_rad, pixsize_y=pix_rad, epsilon=epsilon, do_wgridding=do_wgridding,
+        nthreads=nthreads, verbosity=verbosity, flip_u=flip_u, flip_v=flip_v, flip_w=flip_w,
+        divide_by_n=divide_by_n, sigma_min=sigma_min, sigma_max=sigma_max,
+        min_valid_channels=min_valid_channels,
+    )
+
+    if abs(shift_samps) > 1e-7 and shift_domain == "gridded":
+        uv_cube_chunk = timeshift.shift_time_series(uv_cube_chunk, shift_samps, method=shift_method, axis=0)
+
+    if n_target_samples is not None and len(uv_cube_chunk) > n_target_samples:
+        uv_cube_chunk = uv_cube_chunk[:n_target_samples]
+
+    if uv_hermitian_half and uv_cube_chunk is not None:
+        u_start = uv_cube_chunk.shape[-1] // 2
+        uv_cube_chunk = uv_cube_chunk[..., u_start:]
+
+    # Write slice directly to the pre-allocated on-disk chunked Zarr array
+    z_store = zarr.open_array(out_zarr, mode="r+")
+    if grid_indices is None or (len(grid_indices) > 0 and np.all(np.diff(grid_indices) == 1)):
+        s = int(grid_indices[0]) if grid_indices is not None else offset_start
+        z_store[s : s + len(uv_cube_chunk), :, :] = uv_cube_chunk
+    else:
+        for j, g_idx in enumerate(grid_indices):
+            z_store[int(g_idx), :, :] = uv_cube_chunk[j]
+
+    return (offset_start, offset_end, len(times_chunk))
 
 
 # =========================================================================
@@ -762,8 +854,367 @@ def resolve_time_bounds(
 
 
 # =========================================================================
-# Main Orchestration Engine
+# Main Orchestration Engine & Direct-to-Zarr Gridding
 # =========================================================================
+
+def grid_ms_to_zarr(
+    msname: str = "",
+    out_zarr: Optional[str] = None,
+    *,
+    cfg: Optional[CubeConfig] = None,
+    config: Optional[CubeConfig] = None,
+    client: Optional[Any] = None,
+    zarr_chunks: Optional[Tuple[int, int, int]] = None,
+    chunk_time: Optional[int] = None,
+    u_chunk_size: Optional[int] = None,
+    v_chunk_size: Optional[int] = None,
+    start_time_idx: Optional[int] = None,
+    end_time_idx: Optional[int] = None,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    chunk_size: int = 128,
+    time_step: Optional[float] = None,
+    time_tolerance: float = 1e-3,
+    max_blank_factor: float = 10.0,
+    npix_x: int = 384,
+    npix_y: int = 384,
+    pixsize_arcsec: float = 22.0,
+    corr_mode: str = "single",
+    single_pol: str = "XX",
+    basis: str = "linear",
+    data_column: str = "DATA",
+    field_name: Optional[str] = None,
+    epsilon: float = 1e-6,
+    do_wgridding: bool = True,
+    nthreads: int = 0,
+    verbosity: int = 0,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    flip_w: bool = False,
+    divide_by_n: bool = True,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+    min_valid_channels: int = 24,
+    dm: float = 0.0,
+    collapse_channels: bool = False,
+    nsubbands: int = 1,
+    exact_uvw: bool = True,
+    align_to: str = "fmax",
+    overwrite: bool = True,
+    parallel_mode: Optional[str] = None,
+    max_workers: Optional[int] = None,
+    threads_per_worker: int = 1,
+    dask_scheduler: str = "processes",
+    slurm_partition: Optional[str] = None,
+    slurm_account: Optional[str] = None,
+    slurm_cores_per_worker: int = 1,
+    slurm_mem: str = "32GB",
+    slurm_walltime: str = "02:30:00",
+    slurm_job_extra: Optional[List[str]] = None,
+    slurm_interface: Optional[str] = None,
+    regularize_time: bool = False,
+    sync_tolerance: float = 0.05,
+    shift_method: str = "fft",
+    shift_domain: str = "native",
+    uv_hermitian_half: bool = True,
+    **kwargs,
+) -> str:
+    """
+    Distribute MS time regularisation and snapshot UV gridding directly into an
+    on-disk chunked Zarr array using an existing Dask client or parallel pool.
+    """
+    if zarr is None:
+        raise ImportError("zarr library is required for direct-to-Zarr gridding.")
+
+    if cfg is None:
+        cfg = config
+    if cfg is not None:
+        msname = cfg.msname or msname
+        out_zarr = cfg.out_zarr or out_zarr
+        client = cfg.client or client
+        zarr_chunks = getattr(cfg, "zarr_chunks", None) or zarr_chunks
+        chunk_time = getattr(cfg, "chunk_time", None) or chunk_time
+        u_chunk_size = getattr(cfg, "u_chunk_size", None) or u_chunk_size
+        v_chunk_size = getattr(cfg, "v_chunk_size", None) or v_chunk_size
+        start_time_idx = cfg.start_time_idx if start_time_idx is None else start_time_idx
+        end_time_idx = cfg.end_time_idx if end_time_idx is None else end_time_idx
+        start_time = cfg.start_time if start_time is None else start_time
+        end_time = cfg.end_time if end_time is None else end_time
+        chunk_size = cfg.chunk_size or chunk_size
+        time_step = cfg.time_step or time_step
+        time_tolerance = cfg.time_tolerance or time_tolerance
+        max_blank_factor = cfg.max_blank_factor or max_blank_factor
+        npix_x = cfg.npix_x or npix_x
+        npix_y = cfg.npix_y or npix_y
+        pixsize_arcsec = cfg.pixsize_arcsec or pixsize_arcsec
+        corr_mode = cfg.corr_mode or corr_mode
+        single_pol = cfg.single_pol or single_pol
+        basis = cfg.basis or basis
+        data_column = cfg.data_column or data_column
+        field_name = cfg.field_name or field_name
+        epsilon = cfg.epsilon or epsilon
+        do_wgridding = cfg.do_wgridding if hasattr(cfg, "do_wgridding") else do_wgridding
+        nthreads = cfg.nthreads or nthreads
+        verbosity = cfg.verbosity or verbosity
+        flip_u = cfg.flip_u or flip_u
+        flip_v = cfg.flip_v or flip_v
+        flip_w = cfg.flip_w or flip_w
+        divide_by_n = cfg.divide_by_n if hasattr(cfg, "divide_by_n") else divide_by_n
+        sigma_min = cfg.sigma_min or sigma_min
+        sigma_max = cfg.sigma_max or sigma_max
+        min_valid_channels = cfg.min_valid_channels or min_valid_channels
+        dm = cfg.dm or dm
+        collapse_channels = cfg.collapse_channels or collapse_channels
+        nsubbands = cfg.nsubbands or nsubbands
+        exact_uvw = cfg.exact_uvw if hasattr(cfg, "exact_uvw") else exact_uvw
+        align_to = cfg.align_to or align_to
+        overwrite = cfg.overwrite if hasattr(cfg, "overwrite") else overwrite
+        parallel_mode = cfg.parallel_mode or parallel_mode
+        max_workers = cfg.max_workers or max_workers
+        threads_per_worker = cfg.threads_per_worker or threads_per_worker
+        dask_scheduler = cfg.dask_scheduler or dask_scheduler
+        slurm_partition = cfg.slurm_partition or slurm_partition
+        slurm_account = cfg.slurm_account or slurm_account
+        slurm_cores_per_worker = cfg.slurm_cores_per_worker or slurm_cores_per_worker
+        slurm_mem = cfg.slurm_mem or slurm_mem
+        slurm_walltime = cfg.slurm_walltime or slurm_walltime
+        slurm_job_extra = cfg.slurm_job_extra or slurm_job_extra
+        slurm_interface = cfg.slurm_interface or slurm_interface
+        regularize_time = cfg.regularize_time if hasattr(cfg, "regularize_time") else regularize_time
+        sync_tolerance = cfg.sync_tolerance or sync_tolerance
+        shift_method = cfg.shift_method or shift_method
+        shift_domain = cfg.shift_domain or shift_domain
+        uv_hermitian_half = cfg.uv_hermitian_half if hasattr(cfg, "uv_hermitian_half") else uv_hermitian_half
+
+    if not msname or not os.path.exists(msname):
+        raise FileNotFoundError(f"Measurement Set '{msname}' not found.")
+
+    ms_base = os.path.basename(msname.rstrip("/")).replace(".ms", "")
+    t_main = table(msname, readonly=True)
+    time_col = "TIME_CENTROID" if "TIME_CENTROID" in t_main.colnames() else "TIME"
+    has_scan = "SCAN_NUMBER" in t_main.colnames()
+    time_vals = t_main.getcol(time_col)
+    scan_vals = t_main.getcol("SCAN_NUMBER") if has_scan else None
+    t_main.close()
+
+    unique_times, u_idx = np.unique(time_vals, return_index=True)
+    scan_per_time = scan_vals[u_idx] if scan_vals is not None else np.zeros(len(unique_times), dtype=int)
+
+    start_idx, end_idx = resolve_time_bounds(unique_times, start_time_idx, end_time_idx, start_time, end_time)
+    sel_times = unique_times[start_idx : end_idx + 1]
+    sel_scans = scan_per_time[start_idx : end_idx + 1]
+    total_frames = len(sel_times)
+
+    if regularize_time:
+        time_info = timeshift.regularize_time_grid(
+            sel_times,
+            dt_nominal=time_step,
+            sync_tolerance=sync_tolerance,
+            scan_numbers=sel_scans,
+            max_blank_factor=max_blank_factor,
+        )
+    else:
+        time_info = analyze_time_axis(
+            sel_times,
+            create_blanks=True,
+            dt_nominal=time_step,
+            tolerance=time_tolerance,
+            max_blank_factor=max_blank_factor,
+        )
+    total_planes = time_info["total_planes"]
+
+    ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(msname, field_name)
+    pix_rad = pixsize_arcsec / 206265.0
+
+    nu_grid, nv_grid = imaging.get_uv_grid_dims(
+        npix_x=npix_x, npix_y=npix_y, pixsize_x=pix_rad, pixsize_y=pix_rad,
+        epsilon=epsilon, do_wgridding=do_wgridding, sigma_min=sigma_min, sigma_max=sigma_max,
+    )
+    nu_stored = (nu_grid - (nu_grid // 2)) if uv_hermitian_half else nu_grid
+
+    if out_zarr is None:
+        dm_tag = f"_dm{dm:06.1f}" if dm != 0.0 else ""
+        out_zarr = f"{ms_base}_t{start_idx:05d}_{end_idx:05d}{dm_tag}_uv.zarr"
+
+    if os.path.exists(out_zarr):
+        if not overwrite:
+            raise FileExistsError(f"Output Zarr '{out_zarr}' already exists and overwrite is False.")
+        shutil.rmtree(out_zarr, ignore_errors=True)
+
+    # Calculate target spatial chunking
+    c_time = chunk_time or (zarr_chunks[0] if zarr_chunks else chunk_size)
+    c_v = v_chunk_size or (zarr_chunks[1] if zarr_chunks else math.ceil(nv_grid / 4))
+    c_u = u_chunk_size or (zarr_chunks[2] if zarr_chunks else math.ceil(nu_stored / 4))
+    target_chunks = (min(total_planes, c_time), min(nv_grid, c_v), min(nu_stored, c_u))
+
+    z_arr = zarr.open_array(
+        out_zarr,
+        mode="w",
+        shape=(total_planes, nv_grid, nu_stored),
+        chunks=target_chunks,
+        dtype=np.complex64,
+    )
+    z_arr.attrs.update({
+        "tsamp": float(time_info["dt_nominal"]),
+        "t0": float(time_info["grid_times"][0]),
+        "du": float(1.0 / (npix_x * pix_rad)),
+        "dv": float(1.0 / (npix_y * pix_rad)),
+        "ra0_rad": float(ra0_rad),
+        "dec0_rad": float(dec0_rad),
+        "pixsize_arcsec": float(pixsize_arcsec),
+        "npix_x": int(npix_x),
+        "npix_y": int(npix_y),
+        "nu": int(nu_stored),
+        "nv": int(nv_grid),
+        "dm": float(dm),
+        "hermitian_half": bool(uv_hermitian_half),
+        "total_planes": int(total_planes),
+    })
+
+    chan_freq = None
+    try:
+        with table(f"{msname}/SPECTRAL_WINDOW", readonly=True, ack=False) as t_spw:
+            chan_freq = t_spw.getcell("CHAN_FREQ", 0)
+    except Exception:
+        pass
+
+    max_delay_samps = 0
+    if dm != 0.0 and chan_freq is not None and len(chan_freq) > 0 and time_info["dt_nominal"] > 0:
+        max_delay_samps = dedisp.get_dm_samps(chan_freq, abs(dm), time_info["dt_nominal"])
+
+    chunk_tasks = []
+    if regularize_time and "blocks" in time_info:
+        for b in time_info["blocks"]:
+            b_start = start_idx + b["start_sample"]
+            b_end = start_idx + b["end_sample"]
+            b_shift = float(b["shift_samps"])
+            for c_start in range(b_start, b_end + 1, chunk_size):
+                c_end = min(c_start + chunk_size - 1, b_end)
+                n_target = c_end - c_start + 1
+                c_end_pad = min(b_end, c_end + max_delay_samps) if dm != 0.0 and max_delay_samps > 0 else c_end
+                c_times = unique_times[c_start : c_end_pad + 1]
+                c_g_idx = time_info["grid_indices"][c_start - start_idx : c_end - start_idx + 1]
+                chunk_tasks.append((c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, b_shift))
+    else:
+        for c_start in range(start_idx, end_idx + 1, chunk_size):
+            c_end = min(c_start + chunk_size - 1, end_idx)
+            n_target = c_end - c_start + 1
+            c_end_pad = min(len(unique_times) - 1, c_end + max_delay_samps) if dm != 0.0 and max_delay_samps > 0 else c_end
+            c_times = unique_times[c_start : c_end_pad + 1]
+            c_g_idx = time_info["grid_indices"][c_start - start_idx : c_end - start_idx + 1]
+            chunk_tasks.append((c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, 0.0))
+
+    task_kwargs = dict(
+        msname=msname, out_zarr=out_zarr, npix_x=npix_x, npix_y=npix_y, pix_rad=pix_rad,
+        data_column=data_column, corr_mode=corr_mode, basis=basis, single_pol=single_pol,
+        epsilon=epsilon, do_wgridding=do_wgridding, nthreads=nthreads, verbosity=verbosity,
+        flip_u=flip_u, flip_v=flip_v, flip_w=flip_w, divide_by_n=divide_by_n,
+        sigma_min=sigma_min, sigma_max=sigma_max, min_valid_channels=min_valid_channels,
+        dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands, exact_uvw=exact_uvw,
+        align_to=align_to, shift_method=shift_method, shift_domain=shift_domain,
+        uv_hermitian_half=uv_hermitian_half,
+    )
+
+    eff_client = client or getattr(cfg, "client", None)
+    parallel_mode = parallel_mode or ("dask" if eff_client is not None else ("processes" if max_workers and max_workers > 1 else "serial"))
+    n_workers = max_workers if max_workers and max_workers > 0 else (os.cpu_count() or 4 if parallel_mode in ("processes", "threads", "dask-local") else 1)
+
+    logger.info(f"Direct-to-Zarr MS Gridding -> {out_zarr} | Planes: {total_planes} | Shape: {(total_planes, nv_grid, nu_stored)} | Chunks: {target_chunks} | Tasks: {len(chunk_tasks)} | Mode: {parallel_mode}")
+
+    pbar = tqdm(total=total_frames, desc=f"Gridding snapshots direct-to-Zarr ({parallel_mode})", unit="frame")
+
+    if eff_client is not None:
+        from dask.distributed import as_completed as dask_as_completed
+        future_to_task = [
+            eff_client.submit(
+                grid_chunk_to_zarr_task,
+                chunk_times=c_times,
+                grid_indices=c_g_idx,
+                offset_start=off_s,
+                offset_end=off_e,
+                n_target_samples=n_target,
+                shift_samps=b_shift,
+                **task_kwargs,
+            )
+            for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
+        ]
+        for fut in dask_as_completed(future_to_task):
+            _, _, n_done = fut.result()
+            pbar.update(n_done)
+    elif parallel_mode in ("dask-local", "dask-slurm"):
+        from dask.distributed import Client, as_completed as dask_as_completed
+        if parallel_mode == "dask-local":
+            from dask.distributed import LocalCluster
+            cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, processes=(dask_scheduler == "processes"))
+            dask_client = Client(cluster)
+        else:
+            from fastducc.dask_utils import setup_slurm_cluster, derive_dask_job_name, resolve_dask_log_directory
+            job_name = derive_dask_job_name(stage="zarr_cube", ms_path=msname)
+            log_dir = resolve_dask_log_directory()
+            cluster = setup_slurm_cluster(
+                queue=slurm_partition, account=slurm_account, cores_per_worker=slurm_cores_per_worker,
+                mem=slurm_mem, walltime=slurm_walltime, job_name=job_name, log_directory=log_dir,
+                job_extra_directives=slurm_job_extra or [], interface=slurm_interface,
+                min_workers=1, max_workers=n_workers, adaptive=False,
+            )
+            dask_client = Client(cluster)
+        try:
+            future_to_task = [
+                dask_client.submit(
+                    grid_chunk_to_zarr_task,
+                    chunk_times=c_times,
+                    grid_indices=c_g_idx,
+                    offset_start=off_s,
+                    offset_end=off_e,
+                    n_target_samples=n_target,
+                    shift_samps=b_shift,
+                    **task_kwargs,
+                )
+                for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
+            ]
+            for fut in dask_as_completed(future_to_task):
+                _, _, n_done = fut.result()
+                pbar.update(n_done)
+        finally:
+            dask_client.close()
+            if "cluster" in locals() and cluster is not None:
+                cluster.close()
+    elif parallel_mode in ("threads", "processes"):
+        ExecutorClass = ThreadPoolExecutor if parallel_mode == "threads" else ProcessPoolExecutor
+        with ExecutorClass(max_workers=n_workers) as executor:
+            future_to_task = [
+                executor.submit(
+                    grid_chunk_to_zarr_task,
+                    chunk_times=c_times,
+                    grid_indices=c_g_idx,
+                    offset_start=off_s,
+                    offset_end=off_e,
+                    n_target_samples=n_target,
+                    shift_samps=b_shift,
+                    **task_kwargs,
+                )
+                for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
+            ]
+            for fut in as_completed(future_to_task):
+                _, _, n_done = fut.result()
+                pbar.update(n_done)
+    else:  # serial
+        for _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift in chunk_tasks:
+            _, _, n_done = grid_chunk_to_zarr_task(
+                chunk_times=c_times,
+                grid_indices=c_g_idx,
+                offset_start=off_s,
+                offset_end=off_e,
+                n_target_samples=n_target,
+                shift_samps=b_shift,
+                **task_kwargs,
+            )
+            pbar.update(n_done)
+
+    pbar.close()
+    logger.info(f"Successfully gridded MS to Zarr -> {out_zarr}")
+    return out_zarr
+
 
 def make_dirty_cube(
     msname: str = "",
@@ -844,9 +1295,16 @@ def make_dirty_cube(
     sync_tolerance: float = 0.05,
     shift_method: str = "fft",
     shift_domain: str = "native",
+    out_zarr: Optional[str] = None,
+    zarr_chunks: Optional[Tuple[int, int, int]] = None,
+    chunk_time: Optional[int] = None,
+    u_chunk_size: Optional[int] = None,
+    v_chunk_size: Optional[int] = None,
+    client: Optional[Any] = None,
+    direct_to_zarr: bool = False,
     **kwargs,
 ) -> str:
-    """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes."""
+    """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes or Zarr."""
     if cfg is None:
         cfg = config
 
@@ -881,15 +1339,42 @@ def make_dirty_cube(
             create_blanks=create_blanks, floating=floating,
             regularize_time=regularize_time, sync_tolerance=sync_tolerance,
             shift_method=shift_method, shift_domain=shift_domain,
+            out_zarr=out_zarr, zarr_chunks=zarr_chunks, chunk_time=chunk_time,
+            u_chunk_size=u_chunk_size, v_chunk_size=v_chunk_size,
+            client=client, direct_to_zarr=direct_to_zarr,
         )
     else:
         if msname:
             cfg.msname = msname
         if out_cube is not None:
             cfg.out_cube = out_cube
+        if out_zarr is not None:
+            cfg.out_zarr = out_zarr
+        if client is not None:
+            cfg.client = client
         for k, v in kwargs.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
+
+    # Route direct-to-Zarr requests
+    if (
+        cfg.out_zarr is not None
+        or getattr(cfg, "direct_to_zarr", False)
+        or direct_to_zarr
+        or (out_zarr is not None)
+        or cfg.uv_format in ("dga_zarr", "zarr")
+    ):
+        target_zarr = cfg.out_zarr or out_zarr or cfg.uv_zarr_path
+        return grid_ms_to_zarr(
+            msname=cfg.msname,
+            out_zarr=target_zarr,
+            cfg=cfg,
+            client=client or cfg.client,
+            zarr_chunks=zarr_chunks or getattr(cfg, "zarr_chunks", None),
+            chunk_time=chunk_time or getattr(cfg, "chunk_time", None),
+            u_chunk_size=u_chunk_size or getattr(cfg, "u_chunk_size", None),
+            v_chunk_size=v_chunk_size or getattr(cfg, "v_chunk_size", None),
+        )
 
     msname = cfg.msname
     out_cube = cfg.out_cube
@@ -1125,11 +1610,11 @@ def make_dirty_cube(
                 epsilon=epsilon, do_wgridding=do_wgridding,
                 sigma_min=sigma_min, sigma_max=sigma_max
             )
-            nu_stored = (nu_grid // 2 + 1) if uv_hermitian_half else nu_grid
+            nu_stored = (nu_grid - (nu_grid // 2)) if uv_hermitian_half else nu_grid
             hdr_uv_r, hdr_uv_i = build_uv_headers(hdr3d, nu_stored, nv_grid, pix_rad, total_planes, time_info, as_4d=uv_4d, hermitian_half=uv_hermitian_half)
             uv_shape = (1, total_planes, nv_grid, nu_stored) if uv_4d else (total_planes, nv_grid, nu_stored)
         else:
-            nu_stored = (nx_out // 2 + 1) if uv_hermitian_half else nx_out
+            nu_stored = (nx_out - (nx_out // 2)) if uv_hermitian_half else nx_out
             hdr_uv_r, hdr_uv_i = build_uv_headers(hdr3d, nu_stored, ny_out, pix_rad, total_planes, time_info, as_4d=uv_4d, hermitian_half=uv_hermitian_half)
             uv_shape = (1, total_planes, ny_out, nu_stored) if uv_4d else (total_planes, ny_out, nu_stored)
         header_size_uv_r = init_empty_fits_cube(out_cube_real, hdr_uv_r, uv_shape, dtype=np_dtype, overwrite=overwrite, blank_indices=time_info["blank_indices"] if create_blanks else None)
@@ -1183,12 +1668,17 @@ def make_dirty_cube(
                 _, _, n_done, chunk_arr = fut.result()
                 _handle_worker_result(chunk_arr, c_g_idx, off_s)
                 pbar.update(n_done)
-    elif parallel_mode in ("dask-local", "dask-slurm"):
+    elif parallel_mode in ("dask", "dask-local", "dask-slurm"):
         from dask.distributed import Client, as_completed as dask_as_completed
-        if parallel_mode == "dask-local":
+        close_client = False
+        eff_client = client or getattr(cfg, "client", None)
+        if eff_client is not None:
+            dask_client = eff_client
+        elif parallel_mode == "dask-local":
             from dask.distributed import LocalCluster
             cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, processes=(dask_scheduler == "processes"))
-            client_ctx = Client(cluster)
+            dask_client = Client(cluster)
+            close_client = True
         else:
             from fastducc.dask_utils import setup_slurm_cluster, derive_dask_job_name, resolve_dask_log_directory
             job_name = derive_dask_job_name(stage="cube", ms_path=msname)
@@ -1207,17 +1697,57 @@ def make_dirty_cube(
                 max_workers=n_workers,
                 adaptive=False,
             )
-            client_ctx = Client(cluster)
-        with client_ctx as client:
-            future_to_task = {
-                client.submit(process_chunk_task, chunk_times=c_times, grid_indices=c_g_idx, offset_start=off_s, offset_end=off_e, n_target_samples=n_target, shift_samps=b_shift, **task_kwargs): (c_g_idx, off_s)
-                for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
-            }
-            for fut in dask_as_completed(list(future_to_task.keys())):
-                c_g_idx, off_s = future_to_task[fut]
-                _, _, n_done, chunk_arr = fut.result()
-                _handle_worker_result(chunk_arr, c_g_idx, off_s)
-                pbar.update(n_done)
+            dask_client = Client(cluster)
+            close_client = True
+
+        try:
+            n_sched_workers = len(dask_client.scheduler_info().get("workers", {})) if hasattr(dask_client, "scheduler_info") else n_workers
+        except Exception:
+            n_sched_workers = n_workers
+        max_in_flight = max(16, 2 * max(1, n_sched_workers))
+
+        future_to_task = {}
+        task_iter = iter(chunk_tasks)
+
+        def _submit_next():
+            try:
+                task_item = next(task_iter)
+            except StopIteration:
+                return False
+            _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift = task_item
+            fut = dask_client.submit(
+                process_chunk_task,
+                chunk_times=c_times,
+                grid_indices=c_g_idx,
+                offset_start=off_s,
+                offset_end=off_e,
+                n_target_samples=n_target,
+                shift_samps=b_shift,
+                **task_kwargs,
+            )
+            future_to_task[fut] = (c_g_idx, off_s)
+            return True
+
+        for _ in range(max_in_flight):
+            if not _submit_next():
+                break
+
+        seq = dask_as_completed(list(future_to_task.keys()))
+        while future_to_task:
+            fut = next(seq)
+            c_g_idx, off_s = future_to_task.pop(fut)
+            _, _, n_done, chunk_arr = fut.result()
+            _handle_worker_result(chunk_arr, c_g_idx, off_s)
+            del fut, chunk_arr
+            pbar.update(n_done)
+            if _submit_next():
+                new_fut = list(future_to_task.keys())[-1]
+                seq.add(new_fut)
+
+        if close_client:
+            dask_client.close()
+            if "cluster" in locals() and cluster is not None:
+                cluster.close()
     pbar.close()
 
     if write_timestamps_table:
@@ -1311,6 +1841,12 @@ def build_cli_cube(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--uv-format", choices=["fits", "fits-half", "dga_zarr", "zarr"], default="fits", help="Storage format for gridded UV data: 'fits', 'fits-half' (Hermitian half-plane), or 'dga_zarr'/'zarr'")
     parser.add_argument("--uv-hermitian-half", dest="uv_hermitian_half", action="store_true", default=False, help="Exploit Hermitian symmetry V(-u,-v)=V*(u,v) to store only the half-plane")
     parser.add_argument("--uv-zarr-path", default=None, help="Explicit path for output UV Zarr directory")
+    parser.add_argument("--out-zarr", default=None, help="Output Zarr store path for direct-to-Zarr gridding")
+    parser.add_argument("--zarr-chunks", type=int, nargs=3, default=None, help="Zarr chunk sizes (time, v, u)")
+    parser.add_argument("--chunk-time", type=int, default=None, help="Zarr time chunk size")
+    parser.add_argument("--u-chunk-size", type=int, default=None, help="Zarr U spatial chunk size")
+    parser.add_argument("--v-chunk-size", type=int, default=None, help="Zarr V spatial chunk size")
+    parser.add_argument("--direct-to-zarr", action="store_true", default=False, help="Enable direct-to-Zarr 1-pass gridding")
     parser.add_argument("--uv-threshold", type=float, default=1e-4, help="Amplitude threshold for sparse UV cell retention in DGA/Zarr mode")
     parser.add_argument("--out-uv-real", default=None)
     parser.add_argument("--out-uv-imag", default=None)

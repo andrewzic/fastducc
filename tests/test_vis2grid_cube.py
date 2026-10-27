@@ -221,6 +221,163 @@ class TestVis2GridCube(unittest.TestCase):
             self.assertEqual(ret_real.shape, (nt, nv, nu))
             self.assertEqual(ret_imag.shape, (nt, nv, nu))
 
+    def test_grid_chunk_to_zarr_task(self):
+        import tempfile
+        import shutil
+        import zarr
+        from fastducc.cube import grid_chunk_to_zarr_task
+
+        tmpdir = tempfile.mkdtemp()
+        zarr_path = f"{tmpdir}/test_uv.zarr"
+        try:
+            nbl, nchan, nt = 4, 8, 3
+            npix_x, npix_y = 32, 32
+            pix_rad = 1e-4
+            times = np.array([0.0, 0.1, 0.2])
+            chan_freq = np.linspace(1.3e9, 1.4e9, nchan)
+            dt = 0.1
+
+            vis_3d = (np.random.randn(nbl, nchan, nt) + 1j * np.random.randn(nbl, nchan, nt)).astype(np.complex64)
+            wgt_3d = np.ones((nbl, nchan, nt), dtype=np.float32)
+            uvw_3d = np.random.randn(nbl, 3, nt) * 200.0
+
+            nu, nv = imaging.get_uv_grid_dims(
+                npix_x=npix_x, npix_y=npix_y, pixsize_x=pix_rad, pixsize_y=pix_rad,
+                epsilon=1e-4, do_wgridding=True
+            )
+            nu_stored = nu // 2
+
+            z_arr = zarr.open_array(
+                zarr_path, mode="w", shape=(10, nv, nu_stored),
+                chunks=(5, nv, nu_stored), dtype=np.complex64
+            )
+
+            with patch("fastducc.imaging.load_chunk_data", return_value=(times, chan_freq, dt, vis_3d, wgt_3d, uvw_3d)):
+                res = grid_chunk_to_zarr_task(
+                    msname="dummy.ms",
+                    out_zarr=zarr_path,
+                    chunk_times=times,
+                    offset_start=2,
+                    offset_end=5,
+                    npix_x=npix_x,
+                    npix_y=npix_y,
+                    pix_rad=pix_rad,
+                    grid_indices=np.array([2, 3, 4]),
+                    uv_hermitian_half=True,
+                    epsilon=1e-4,
+                    do_wgridding=True,
+                )
+                off_s, off_e, n_done = res
+                self.assertEqual(off_s, 2)
+                self.assertEqual(off_e, 5)
+                self.assertEqual(n_done, nt)
+
+            z_read = zarr.open_array(zarr_path, mode="r")
+            self.assertTrue(np.any(np.abs(z_read[2:5]) > 0.0))
+            self.assertTrue(np.all(np.abs(z_read[0:2]) == 0.0))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_make_dirty_cube_out_zarr_routing_and_client_reuse(self):
+        import tempfile
+        import shutil
+        import zarr
+        from unittest.mock import MagicMock
+        from fastducc.cube import make_dirty_cube
+
+        tmpdir = tempfile.mkdtemp()
+        zarr_path = f"{tmpdir}/test_direct.zarr"
+        try:
+            mock_client = MagicMock()
+            mock_fut = MagicMock()
+            mock_fut.result.return_value = (0, 2, 2)
+            mock_client.submit.return_value = mock_fut
+
+            with patch("fastducc.cube.table") as mock_tab, \
+                 patch("os.path.exists", return_value=True), \
+                 patch("fastducc.imaging.get_uv_grid_dims", return_value=(48, 48)), \
+                 patch("fastducc.ms_utils.get_phase_center", return_value=(0.0, 0.0, "field0")), \
+                 patch("dask.distributed.as_completed", return_value=[mock_fut]):
+
+                mock_tab_inst = mock_tab.return_value
+                mock_tab_inst.colnames.return_value = ["TIME", "SCAN_NUMBER"]
+                mock_tab_inst.getcol.side_effect = lambda col: np.array([0.0, 0.1]) if col == "TIME" else np.array([1, 1])
+
+                out = make_dirty_cube(
+                    msname="mock.ms",
+                    out_zarr=zarr_path,
+                    client=mock_client,
+                    uv_hermitian_half=True,
+                    chunk_size=2,
+                    npix_x=32,
+                    npix_y=32,
+                )
+                self.assertEqual(out, zarr_path)
+                self.assertTrue(mock_client.submit.called)
+                # Verify external client was NOT closed
+                self.assertFalse(mock_client.close.called)
+
+                # Verify Zarr metadata
+                z_check = zarr.open_array(zarr_path, mode="r")
+                self.assertEqual(z_check.shape, (2, 48, 24))
+                self.assertTrue(z_check.attrs["hermitian_half"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_make_dirty_cube_hermitian_half_fits_dimension_match(self):
+        import os
+        import tempfile
+        import shutil
+        from astropy.io import fits
+        from fastducc.cube import make_dirty_cube
+
+        tmpdir = tempfile.mkdtemp()
+        fits_real = f"{tmpdir}/test_real.fits"
+        fits_imag = f"{tmpdir}/test_imag.fits"
+        try:
+            times = np.array([0.0, 0.1])
+            chan_freq = np.linspace(1.2e9, 1.4e9, 8)
+            dt = 0.1
+            nbl = 4
+            nt = len(times)
+            vis_3d = (np.random.randn(nbl, 8, nt) + 1j * np.random.randn(nbl, 8, nt)).astype(np.complex64)
+            wgt_3d = np.ones((nbl, 8, nt), dtype=np.float32)
+            uvw_3d = np.random.randn(nbl, 3, nt) * 100.0
+
+            orig_exists = os.path.exists
+            with patch("fastducc.cube.table") as mock_tab, \
+                 patch("os.path.exists", side_effect=lambda p: True if str(p) == "mock.ms" else orig_exists(p)), \
+                 patch("fastducc.imaging.get_uv_grid_dims", return_value=(450, 450)), \
+                 patch("fastducc.ms_utils.get_phase_center", return_value=(0.0, 0.0, "field0")), \
+                 patch("fastducc.imaging.load_chunk_data", return_value=(times, chan_freq, dt, vis_3d, wgt_3d, uvw_3d)), \
+                 patch("fastducc.imaging.grid_chunk_uv_cube", return_value=np.zeros((nt, 450, 450), dtype=np.complex64)):
+
+                mock_tab_inst = mock_tab.return_value
+                mock_tab_inst.colnames.return_value = ["TIME", "SCAN_NUMBER"]
+                mock_tab_inst.getcol.side_effect = lambda col: times if col == "TIME" else np.array([1, 1])
+
+                make_dirty_cube(
+                    msname="mock.ms",
+                    out_uv_real=fits_real,
+                    out_uv_imag=fits_imag,
+                    save_uv=True,
+                    uv_only=True,
+                    uv_mode="vis2grid",
+                    uv_hermitian_half=True,
+                    parallel_mode="serial",
+                    chunk_size=2,
+                    npix_x=384,
+                    npix_y=384,
+                )
+
+                hdr_r = fits.getheader(fits_real)
+                self.assertEqual(hdr_r["NAXIS1"], 225)
+                self.assertEqual(hdr_r["NAXIS2"], 450)
+                data_r = fits.getdata(fits_real)
+                self.assertEqual(data_r.shape, (2, 450, 225))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -229,6 +229,7 @@ def setup_slurm_cluster(
     effective_log_dir = log_directory or resolve_dask_log_directory()
 
     extra_directives = list(job_extra_directives or [])
+    extra_directives.append(f"--job-name={effective_name}")
 
     # Check if SLURMCluster supports log_directory natively; otherwise append to directives
     cluster_kwargs: Dict[str, Any] = {

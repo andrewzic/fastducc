@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Tuple
 import numpy as np
 
 @dataclass
@@ -145,6 +145,13 @@ class CubeConfig:
     sync_tolerance: float = 0.05
     shift_method: str = "fft"
     shift_domain: str = "native"
+    out_zarr: Optional[str] = None
+    zarr_chunks: Optional[Tuple[int, int, int]] = None
+    chunk_time: Optional[int] = None
+    u_chunk_size: Optional[int] = None
+    v_chunk_size: Optional[int] = None
+    client: Optional[Any] = None
+    direct_to_zarr: bool = False
 
     @classmethod
     def from_namespace(cls, args: Any, **overrides) -> CubeConfig:
