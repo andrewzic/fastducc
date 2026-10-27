@@ -219,8 +219,9 @@ def setup_slurm_cluster(
             parts = walltime.split(":")
             if len(parts) >= 2:
                 wt_min = int(parts[0]) * 60 + int(parts[1])
-                lifetime_min = max(30, wt_min - 45)
-                worker_extra.extend(["--lifetime", f"{lifetime_min}m", "--lifetime-stagger", "5m"])
+                lifetime_min = max(15, wt_min - 15) if wt_min > 20 else max(5, wt_min - 5)
+                stagger_min = min(5, max(1, lifetime_min // 10))
+                worker_extra.extend(["--lifetime", f"{lifetime_min}m", "--lifetime-stagger", f"{stagger_min}m"])
         except Exception:
             pass
 
