@@ -44,7 +44,8 @@ class TestCubeConfig(unittest.TestCase):
             "radius", "radius_arcsec", "radius_pix", "box_size_pix",
             "box_size_arcsec", "radius_unit", "start_time_idx", "end_time_idx",
             "start_time", "end_time", "chunk_size", "time_step", "time_tolerance",
-            "max_blank_factor", "write_timestamps_table", "save_uv", "uv_only",
+            "max_blank_factor", "write_timestamps_table", "save_uv", "uv_only", "uv_mode",
+            "uv_format", "uv_hermitian_half", "uv_zarr_path", "uv_threshold",
             "out_uv_real", "out_uv_imag", "uv_4d", "npix_x", "npix_y",
             "pixsize_arcsec", "corr_mode", "single_pol", "basis", "data_column",
             "field_name", "ra_sign", "dec_sign", "epsilon", "do_wgridding",
@@ -74,6 +75,38 @@ class TestCubeConfig(unittest.TestCase):
         cfg = CubeConfig(msname="/nonexistent/path/dummy.ms", npix_x=256)
         with self.assertRaises(FileNotFoundError):
             make_dirty_cube(cfg=cfg)
+
+    def test_uv_hermitian_config_and_headers(self):
+        from astropy.io import fits
+        import numpy as np
+        from fastducc.cube import build_uv_headers
+
+        cfg = CubeConfig(
+            msname="test.ms",
+            uv_format="fits-half",
+            uv_hermitian_half=True,
+            uv_threshold=1e-3,
+        )
+        self.assertEqual(cfg.uv_format, "fits-half")
+        self.assertTrue(cfg.uv_hermitian_half)
+        self.assertEqual(cfg.uv_threshold, 1e-3)
+
+        base_hdr = fits.Header()
+        time_info = {"grid_times": np.array([0.0, 0.11]), "dt_nominal": 0.11}
+        h_r, h_i = build_uv_headers(
+            base_hdr,
+            npix_x=588 // 2 + 1,
+            npix_y=588,
+            pix_rad=1e-4,
+            total_planes=50,
+            time_info=time_info,
+            hermitian_half=True,
+        )
+        self.assertEqual(h_r["NAXIS1"], 295)
+        self.assertEqual(h_r["NAXIS2"], 588)
+        self.assertEqual(h_r["CRPIX1"], 1.0)
+        self.assertTrue(h_r["HERMHALF"])
+        self.assertEqual(h_i["WSCVTYPE"], "IMAG")
 
 if __name__ == "__main__":
     unittest.main()

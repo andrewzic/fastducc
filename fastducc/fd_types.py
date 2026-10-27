@@ -92,6 +92,11 @@ class CubeConfig:
     write_timestamps_table: bool = True
     save_uv: bool = False
     uv_only: bool = False
+    uv_mode: str = "auto"
+    uv_format: str = "fits"
+    uv_hermitian_half: bool = False
+    uv_zarr_path: Optional[str] = None
+    uv_threshold: float = 1e-4
     out_uv_real: Optional[str] = None
     out_uv_imag: Optional[str] = None
     uv_4d: bool = False

@@ -467,49 +467,34 @@ def run_periodicity(args=None) -> str:
             logger.info(f"[Periodicity] Connecting to existing Dask scheduler at {args.scheduler_address}...")
             client = Client(args.scheduler_address)
         elif args.parallel_mode == "dask-slurm":
-            try:
-                from dask_jobqueue import SLURMCluster
-            except ImportError:
-                raise RuntimeError("dask_jobqueue is required for --parallel-mode=dask-slurm. Install with `pip install dask-jobqueue`.")
-            
-            import sys
-            slurm_interface = args.slurm_interface
-            if slurm_interface is None:
-                try:
-                    import psutil
-                    if 'ib0' in psutil.net_if_addrs():
-                        slurm_interface = 'ib0'
-                except Exception:
-                    pass
-            logger.info(f"[Periodicity] Launching Dask SLURMCluster (mem={args.slurm_mem}, cores={args.slurm_cores_per_worker}, interface={slurm_interface})...")
-            scheduler_opts = {"dashboard_address": ":0"}
-            if slurm_interface:
-                scheduler_opts["interface"] = slurm_interface
-            prologue = [
-                "module load python-scientific/3.11.5-foss-2023b 2>/dev/null || true",
-                "unset PYTHONPATH",
-                f"source {os.path.dirname(sys.executable)}/activate 2>/dev/null || true",
-                "export OMP_NUM_THREADS=1",
-                "export OPENBLAS_NUM_THREADS=1"
-            ]
-            cluster = SLURMCluster(
+            from fastducc.dask_utils import setup_slurm_cluster, derive_dask_job_name, resolve_dask_log_directory
+
+            job_name = derive_dask_job_name(
+                stage="nufft",
+                ms_path=getattr(args, "ms", None),
+                explicit_name=getattr(args, "dask_job_name", None),
+            )
+            log_dir = resolve_dask_log_directory(
+                log_dir=getattr(args, "slurm_log_dir", None),
+                output_dir=getattr(args, "out_dir", None),
+                subdir="dask_workers",
+            )
+            max_w = args.dask_workers if args.dask_workers and args.dask_workers > 0 else max(1, num_blocks)
+            cluster = setup_slurm_cluster(
                 queue=args.slurm_partition,
                 account=args.slurm_account,
-                cores=args.slurm_cores_per_worker,
-                memory=args.slurm_mem,
+                cores_per_worker=args.slurm_cores_per_worker,
+                mem=args.slurm_mem,
                 walltime=args.slurm_walltime,
+                job_name=job_name,
+                log_directory=log_dir,
                 job_extra_directives=args.slurm_job_extra,
-                interface=slurm_interface,
-                python=sys.executable,
-                job_script_prologue=prologue,
-                scheduler_options=scheduler_opts,
-                processes=1,
-                worker_extra_args=["--nthreads", "1", "--memory-limit", "0"],
+                interface=args.slurm_interface,
+                python_path=sys.executable,
+                min_workers=1,
+                max_workers=max_w,
+                adaptive=(args.dask_workers is None or args.dask_workers <= 0),
             )
-            if args.dask_workers and args.dask_workers > 0:
-                cluster.scale(args.dask_workers)
-            else:
-                cluster.adapt(minimum=1, maximum=max(1, num_blocks))
             client = Client(cluster)
         else:
             n_workers = args.dask_workers if args.dask_workers > 0 else None

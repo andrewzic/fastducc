@@ -462,3 +462,186 @@ def grid_chunk_cube(
         del vis_dedisp, wgt_dedisp
 
     return cube
+
+
+def get_uv_grid_dims(
+    npix_x: int,
+    npix_y: int,
+    pixsize_x: float,
+    pixsize_y: float,
+    epsilon: float = 1e-6,
+    do_wgridding: bool = True,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+) -> Tuple[int, int]:
+    """
+    Determine the (nu, nv) dimensions of the ducc0.wgridder.vis2grid output.
+    """
+    if ducc0 is None:
+        raise ImportError("ducc0 is required to compute UV grid dimensions.")
+    dummy_uvw = np.zeros((1, 3), dtype=np.float64)
+    dummy_freq = np.array([1.4e9], dtype=np.float64)
+    dummy_vis = np.zeros((1, 1), dtype=np.complex64)
+    grid_dummy = ducc0.wgridder.vis2grid(
+        uvw=dummy_uvw,
+        freq=dummy_freq,
+        vis=dummy_vis,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_x=pixsize_x,
+        pixsize_y=pixsize_y,
+        epsilon=epsilon,
+        do_wgridding=do_wgridding,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    return int(grid_dummy.shape[0]), int(grid_dummy.shape[1])
+
+
+def grid_chunk_uv_cube(
+    vis_3d: np.ndarray,
+    wgt_3d: np.ndarray,
+    uvw_3d: np.ndarray,
+    chan_freq: np.ndarray,
+    dt: float,
+    *,
+    dm: float = 0.0,
+    collapse_channels: bool = False,
+    nsubbands: int = 1,
+    align_to: str = "fmax",
+    exact_uvw: bool = True,
+    npix_x: int = 384,
+    npix_y: int = 384,
+    pixsize_x: float = 22.0 / 206265.0,
+    pixsize_y: float = 22.0 / 206265.0,
+    epsilon: float = 1e-6,
+    do_wgridding: bool = True,
+    nthreads: int = 0,
+    verbosity: int = 0,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    flip_w: bool = False,
+    divide_by_n: bool = True,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    allow_nshift: bool = True,
+    double_precision_accumulation: bool = False,
+    min_valid_channels: int = 24,
+) -> np.ndarray:
+    """
+    Grid an in-memory visibility chunk directly into a complex UV grid time cube
+    using ducc0.wgridder.vis2grid with full w-gridding.
+
+    Returns an array of shape (nt, nv, nu) and complex dtype.
+    """
+    if ducc0 is None:
+        raise ImportError("ducc0 is required for vis2grid UV gridding.")
+    nbl, nchan, nt = vis_3d.shape
+    engine = None
+    if dm != 0.0 or collapse_channels:
+        from fastducc.dedisp import DedispersionPlan, BruteForceDedisperser
+        plan = DedispersionPlan(chan_freq, dt, dm_min=dm, dm_max=dm)
+        engine = BruteForceDedisperser(plan, dm, align_to=align_to)
+        vis_dedisp, wgt_dedisp, eff_freq = engine.dedisperse_chunk(
+            vis_3d, wgt_3d, iblock=0, collapse_channels=collapse_channels, nsubbands=nsubbands, use_history=False
+        )
+    else:
+        vis_dedisp = vis_3d
+        wgt_dedisp = wgt_3d
+        eff_freq = chan_freq
+
+    use_exact = bool(exact_uvw and (dm != 0.0) and (not collapse_channels) and (engine is not None))
+    freq_1chan = np.array([c_light], dtype=np.float64)
+    freq_scale = (eff_freq[None, :, None] / c_light) if use_exact else None
+
+    # Vectorized precomputation of valid channel count per time snapshot
+    has_valid_raw_wgts = np.any(wgt_3d > 0.0, axis=0)  # (nchan, nt)
+    raw_valid_chans_per_t = np.count_nonzero(has_valid_raw_wgts, axis=0)  # (nt,)
+    req_chans = min(min_valid_channels, nchan) if min_valid_channels > 0 else 1
+
+    has_valid_dedisp_wgts = np.any(wgt_dedisp > 0.0, axis=0)
+    dedisp_valid_chans_per_t = np.count_nonzero(has_valid_dedisp_wgts, axis=0)
+
+    nu, nv = get_uv_grid_dims(
+        npix_x=npix_x, npix_y=npix_y, pixsize_x=pixsize_x, pixsize_y=pixsize_y,
+        epsilon=epsilon, do_wgridding=do_wgridding, sigma_min=sigma_min, sigma_max=sigma_max
+    )
+
+    grid_dtype = np.complex64 if (vis_dedisp.dtype == np.complex64) else np.complex128
+    cube = np.empty((nt, nv, nu), dtype=grid_dtype)
+    grid_buf = np.empty((nu, nv), dtype=grid_dtype)
+
+    for t_idx in range(nt):
+        if collapse_channels:
+            if (raw_valid_chans_per_t[t_idx] < req_chans) or (dedisp_valid_chans_per_t[t_idx] < 1):
+                cube[t_idx, :, :] = 0.0
+                continue
+        else:
+            if dedisp_valid_chans_per_t[t_idx] < req_chans:
+                cube[t_idx, :, :] = 0.0
+                continue
+
+        vis_snap = vis_dedisp[:, :, t_idx]
+        wgt_snap = wgt_dedisp[:, :, t_idx]
+
+        if use_exact:
+            t_phys = np.clip(t_idx + engine.delays, 0, nt - 1)
+            uvw_snap_m = uvw_3d[:, :, t_phys].transpose(0, 2, 1)
+            uvw_lambda = uvw_snap_m * freq_scale
+            uvw_input = uvw_lambda.reshape(-1, 3)
+            vis_input = vis_snap.reshape(-1, 1)
+            wgt_input = wgt_snap.reshape(-1, 1)
+            freq_input = freq_1chan
+        else:
+            uvw_input = uvw_3d[:, :, t_idx]
+            freq_input = eff_freq
+            vis_input = vis_snap
+            wgt_input = wgt_snap
+
+        wgt_max = float(np.max(wgt_input)) if wgt_input.size > 0 else 0.0
+        if wgt_max <= 0.0:
+            cube[t_idx, :, :] = 0.0
+            continue
+
+        wgt_norm = (wgt_input / wgt_max).astype(np.float32, copy=False)
+        n_valid = int(np.count_nonzero(wgt_norm))
+        if n_valid == 0:
+            cube[t_idx, :, :] = 0.0
+            continue
+
+        ducc0.wgridder.vis2grid(
+            uvw=uvw_input,
+            freq=freq_input,
+            vis=vis_input,
+            wgt=wgt_norm,
+            npix_x=npix_x,
+            npix_y=npix_y,
+            pixsize_x=pixsize_x,
+            pixsize_y=pixsize_y,
+            epsilon=epsilon,
+            do_wgridding=do_wgridding,
+            nthreads=nthreads,
+            verbosity=verbosity,
+            flip_u=flip_u,
+            flip_v=flip_v,
+            flip_w=flip_w,
+            divide_by_n=divide_by_n,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            center_x=center_x,
+            center_y=center_y,
+            allow_nshift=allow_nshift,
+            double_precision_accumulation=double_precision_accumulation,
+            grid=grid_buf,
+        )
+        if divide_by_n and n_valid > 0:
+            cube[t_idx, :, :] = grid_buf.T / n_valid
+        else:
+            cube[t_idx, :, :] = grid_buf.T
+
+    if vis_dedisp is not vis_3d:
+        del vis_dedisp, wgt_dedisp
+
+    return cube

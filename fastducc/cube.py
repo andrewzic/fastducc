@@ -432,6 +432,7 @@ def build_uv_headers(
     total_planes: int,
     time_info: Dict[str, Any],
     as_4d: bool = False,
+    hermitian_half: bool = False,
 ) -> Tuple[fits.Header, fits.Header]:
     """Construct standard FITS headers for gridded UV real/imag cubes directly from image header."""
     hdr_real = header_base.copy()
@@ -449,10 +450,12 @@ def build_uv_headers(
     hdr_real["BUNIT"] = "JY"
     hdr_real["BTYPE"] = "Intensity"
     hdr_real["CTYPE1"] = "U---WAV"
-    hdr_real["CRPIX1"] = float(npix_x // 2 + 1)
+    hdr_real["CRPIX1"] = 1.0 if hermitian_half else float(npix_x // 2 + 1)
     hdr_real["CRVAL1"] = 0.0
     hdr_real["CDELT1"] = float(1.0 / (npix_x * pix_rad))
     hdr_real["CUNIT1"] = "lambda"
+    if hermitian_half:
+        hdr_real["HERMHALF"] = True
 
     hdr_real["CTYPE2"] = "V---WAV"
     hdr_real["CRPIX2"] = float(npix_y // 2 + 1)
@@ -510,6 +513,7 @@ def process_chunk_task(
     pix_rad: float = 1e-4,
     grid_indices: Optional[np.ndarray] = None,
     save_uv: bool = False,
+    uv_mode: str = "fft",
     out_cube_real: Optional[str] = None,
     out_cube_imag: Optional[str] = None,
     header_size_uv_real: int = 0,
@@ -542,6 +546,8 @@ def process_chunk_task(
     shift_samps: float = 0.0,
     shift_method: str = "fft",
     shift_domain: str = "native",
+    uv_hermitian_half: bool = False,
+    uv_zarr_path: Optional[str] = None,
     **kwargs,
 ) -> Tuple[int, int, int, Any]:
     """Worker task: load visibilities, apply dedispersion, grid snapshots, compute UV FFT, and stream to cubes."""
@@ -556,53 +562,99 @@ def process_chunk_task(
         wgt_3d = np.maximum(wgt_3d, 0.0)
         uvw_3d = timeshift.shift_time_series(uvw_3d, shift_samps, method=shift_method, axis=-1)
 
-    cube_chunk = imaging.grid_chunk_cube(
-        vis_3d=vis_3d, wgt_3d=wgt_3d, uvw_3d=uvw_3d, chan_freq=chunk_freq, dt=dt,
-        dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands,
-        align_to=align_to, exact_uvw=exact_uvw, npix_x=npix_x, npix_y=npix_y,
-        pixsize_x=pix_rad, pixsize_y=pix_rad, epsilon=epsilon, do_wgridding=do_wgridding,
-        nthreads=nthreads, verbosity=verbosity, flip_u=flip_u, flip_v=flip_v, flip_w=flip_w,
-        divide_by_n=divide_by_n, sigma_min=sigma_min, sigma_max=sigma_max,
-        min_valid_channels=min_valid_channels,
-    )
-
-    if abs(shift_samps) > 1e-7 and shift_domain == "gridded":
-        cube_chunk = timeshift.shift_time_series(cube_chunk, shift_samps, method=shift_method, axis=0)
-
-    if n_target_samples is not None and len(cube_chunk) > n_target_samples:
-        cube_chunk = cube_chunk[:n_target_samples]
-        times_chunk = times_chunk[:n_target_samples]
-
-    if cutout_bbox is not None:
-        ymin, ymax, xmin, xmax = cutout_bbox
-        cube_chunk = cube_chunk[:, ymin:ymax, xmin:xmax]
-
-    ny_out, nx_out = cube_chunk.shape[-2:]
-    n_samples = len(times_chunk)
-
     real_chunk, imag_chunk = None, None
-    if save_uv:
-        uv_chunk = np.fft.fftshift(
-            np.fft.fft2(np.fft.ifftshift(cube_chunk, axes=(-2, -1)), axes=(-2, -1)),
-            axes=(-2, -1),
+    cube_chunk = None
+
+    if save_uv and uv_mode == "vis2grid":
+        uv_cube_chunk = imaging.grid_chunk_uv_cube(
+            vis_3d=vis_3d, wgt_3d=wgt_3d, uvw_3d=uvw_3d, chan_freq=chunk_freq, dt=dt,
+            dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands,
+            align_to=align_to, exact_uvw=exact_uvw, npix_x=npix_x, npix_y=npix_y,
+            pixsize_x=pix_rad, pixsize_y=pix_rad, epsilon=epsilon, do_wgridding=do_wgridding,
+            nthreads=nthreads, verbosity=verbosity, flip_u=flip_u, flip_v=flip_v, flip_w=flip_w,
+            divide_by_n=divide_by_n, sigma_min=sigma_min, sigma_max=sigma_max,
+            min_valid_channels=min_valid_channels,
         )
-        real_chunk = uv_chunk.real.astype(dtype_str)
-        imag_chunk = uv_chunk.imag.astype(dtype_str)
+        if abs(shift_samps) > 1e-7 and shift_domain == "gridded":
+            uv_cube_chunk = timeshift.shift_time_series(uv_cube_chunk, shift_samps, method=shift_method, axis=0)
+
+        if n_target_samples is not None and len(uv_cube_chunk) > n_target_samples:
+            uv_cube_chunk = uv_cube_chunk[:n_target_samples]
+
+        if uv_hermitian_half and uv_cube_chunk is not None:
+            u_start = uv_cube_chunk.shape[-1] // 2
+            uv_cube_chunk = uv_cube_chunk[..., u_start:]
+
+        real_chunk = uv_cube_chunk.real.astype(dtype_str)
+        imag_chunk = uv_cube_chunk.imag.astype(dtype_str)
+
+        if write_dirty:
+            cube_chunk = imaging.grid_chunk_cube(
+                vis_3d=vis_3d, wgt_3d=wgt_3d, uvw_3d=uvw_3d, chan_freq=chunk_freq, dt=dt,
+                dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands,
+                align_to=align_to, exact_uvw=exact_uvw, npix_x=npix_x, npix_y=npix_y,
+                pixsize_x=pix_rad, pixsize_y=pix_rad, epsilon=epsilon, do_wgridding=do_wgridding,
+                nthreads=nthreads, verbosity=verbosity, flip_u=flip_u, flip_v=flip_v, flip_w=flip_w,
+                divide_by_n=divide_by_n, sigma_min=sigma_min, sigma_max=sigma_max,
+                min_valid_channels=min_valid_channels,
+            )
+            if abs(shift_samps) > 1e-7 and shift_domain == "gridded":
+                cube_chunk = timeshift.shift_time_series(cube_chunk, shift_samps, method=shift_method, axis=0)
+            if n_target_samples is not None and len(cube_chunk) > n_target_samples:
+                cube_chunk = cube_chunk[:n_target_samples]
+            if cutout_bbox is not None:
+                ymin, ymax, xmin, xmax = cutout_bbox
+                cube_chunk = cube_chunk[:, ymin:ymax, xmin:xmax]
+    else:
+        cube_chunk = imaging.grid_chunk_cube(
+            vis_3d=vis_3d, wgt_3d=wgt_3d, uvw_3d=uvw_3d, chan_freq=chunk_freq, dt=dt,
+            dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands,
+            align_to=align_to, exact_uvw=exact_uvw, npix_x=npix_x, npix_y=npix_y,
+            pixsize_x=pix_rad, pixsize_y=pix_rad, epsilon=epsilon, do_wgridding=do_wgridding,
+            nthreads=nthreads, verbosity=verbosity, flip_u=flip_u, flip_v=flip_v, flip_w=flip_w,
+            divide_by_n=divide_by_n, sigma_min=sigma_min, sigma_max=sigma_max,
+            min_valid_channels=min_valid_channels,
+        )
+
+        if abs(shift_samps) > 1e-7 and shift_domain == "gridded":
+            cube_chunk = timeshift.shift_time_series(cube_chunk, shift_samps, method=shift_method, axis=0)
+
+        if n_target_samples is not None and len(cube_chunk) > n_target_samples:
+            cube_chunk = cube_chunk[:n_target_samples]
+
+        if cutout_bbox is not None:
+            ymin, ymax, xmin, xmax = cutout_bbox
+            cube_chunk = cube_chunk[:, ymin:ymax, xmin:xmax]
+
+        if save_uv:
+            uv_chunk = np.fft.fftshift(
+                np.fft.fft2(np.fft.ifftshift(cube_chunk, axes=(-2, -1)), axes=(-2, -1)),
+                axes=(-2, -1),
+            )
+            if uv_hermitian_half and uv_chunk is not None:
+                u_start = uv_chunk.shape[-1] // 2
+                uv_chunk = uv_chunk[..., u_start:]
+            real_chunk = uv_chunk.real.astype(dtype_str)
+            imag_chunk = uv_chunk.imag.astype(dtype_str)
+
+    n_samples = len(times_chunk)
+    bytes_per_plane = (cube_chunk.shape[-2] * cube_chunk.shape[-1] * (4 if "4" in dtype_str else 8)) if cube_chunk is not None else 0
+    bytes_per_plane_uv = (real_chunk.shape[-2] * real_chunk.shape[-1] * (4 if "4" in dtype_str else 8)) if real_chunk is not None else 0
 
     if direct_write:
-        bytes_per_plane = ny_out * nx_out * (4 if "4" in dtype_str else 8)
         try:
-            if write_dirty and out_cube and os.path.exists(out_cube):
+            if write_dirty and out_cube and os.path.exists(out_cube) and cube_chunk is not None:
                 _write_slices(out_cube, header_size, cube_chunk.astype(dtype_str), grid_indices, offset_start, bytes_per_plane)
-            if save_uv and out_cube_real and os.path.exists(out_cube_real):
-                _write_slices(out_cube_real, header_size_uv_real, real_chunk, grid_indices, offset_start, bytes_per_plane)
-            if save_uv and out_cube_imag and os.path.exists(out_cube_imag):
-                _write_slices(out_cube_imag, header_size_uv_imag, imag_chunk, grid_indices, offset_start, bytes_per_plane)
+            if save_uv and out_cube_real and os.path.exists(out_cube_real) and real_chunk is not None:
+                _write_slices(out_cube_real, header_size_uv_real, real_chunk, grid_indices, offset_start, bytes_per_plane_uv)
+            if save_uv and out_cube_imag and os.path.exists(out_cube_imag) and imag_chunk is not None:
+                _write_slices(out_cube_imag, header_size_uv_imag, imag_chunk, grid_indices, offset_start, bytes_per_plane_uv)
             return (offset_start, offset_end, n_samples, None)
         except OSError:
             pass
 
-    ret_dirty = cube_chunk.astype(dtype_str) if write_dirty else None
+    ret_dirty = cube_chunk.astype(dtype_str) if (write_dirty and cube_chunk is not None) else None
+    return (offset_start, offset_end, n_samples, (ret_dirty, real_chunk, imag_chunk))
     return (offset_start, offset_end, n_samples, (ret_dirty, real_chunk, imag_chunk))
 
 
@@ -739,6 +791,11 @@ def make_dirty_cube(
     write_timestamps_table: bool = True,
     save_uv: bool = False,
     uv_only: bool = False,
+    uv_mode: str = "auto",
+    uv_format: str = "fits",
+    uv_hermitian_half: bool = False,
+    uv_zarr_path: Optional[str] = None,
+    uv_threshold: float = 1e-4,
     out_uv_real: Optional[str] = None,
     out_uv_imag: Optional[str] = None,
     uv_4d: bool = False,
@@ -804,7 +861,9 @@ def make_dirty_cube(
             end_time_idx=end_time_idx, start_time=start_time, end_time=end_time,
             chunk_size=chunk_size, time_step=time_step, time_tolerance=time_tolerance,
             max_blank_factor=max_blank_factor, write_timestamps_table=write_timestamps_table,
-            save_uv=save_uv, uv_only=uv_only, out_uv_real=out_uv_real, out_uv_imag=out_uv_imag,
+            save_uv=save_uv, uv_only=uv_only, uv_mode=uv_mode, out_uv_real=out_uv_real, out_uv_imag=out_uv_imag,
+            uv_format=uv_format, uv_hermitian_half=uv_hermitian_half,
+            uv_zarr_path=uv_zarr_path, uv_threshold=uv_threshold,
             uv_4d=uv_4d, npix_x=npix_x, npix_y=npix_y, pixsize_arcsec=pixsize_arcsec,
             corr_mode=corr_mode, single_pol=single_pol, basis=basis, data_column=data_column,
             field_name=field_name, ra_sign=ra_sign, dec_sign=dec_sign, epsilon=epsilon,
@@ -854,8 +913,13 @@ def make_dirty_cube(
     write_timestamps_table = cfg.write_timestamps_table
     save_uv = cfg.save_uv
     uv_only = cfg.uv_only
+    uv_mode = getattr(cfg, "uv_mode", uv_mode)
     out_uv_real = cfg.out_uv_real
     out_uv_imag = cfg.out_uv_imag
+    uv_format = getattr(cfg, "uv_format", "fits")
+    uv_hermitian_half = getattr(cfg, "uv_hermitian_half", False) or (uv_format == "fits-half")
+    uv_zarr_path = getattr(cfg, "uv_zarr_path", None)
+    uv_threshold = getattr(cfg, "uv_threshold", 1e-4)
     uv_4d = cfg.uv_4d
     npix_x = cfg.npix_x
     npix_y = cfg.npix_y
@@ -937,6 +1001,8 @@ def make_dirty_cube(
 
     save_uv = save_uv or uv_only
     write_dirty = not uv_only
+    if uv_mode is None or uv_mode == "auto":
+        uv_mode = "vis2grid" if uv_only else "fft"
     ra0_rad, dec0_rad, used_field = ms_utils.get_phase_center(msname, field_name)
     pix_rad = pixsize_arcsec / 206265.0
 
@@ -1053,8 +1119,19 @@ def make_dirty_cube(
     header_size = init_empty_fits_cube(out_cube, hdr3d, (total_planes, ny_out, nx_out), dtype=np_dtype, overwrite=overwrite, blank_indices=time_info["blank_indices"] if create_blanks else None) if write_dirty else 0
     header_size_uv_r, header_size_uv_i = 0, 0
     if save_uv:
-        hdr_uv_r, hdr_uv_i = build_uv_headers(hdr3d, nx_out, ny_out, pix_rad, total_planes, time_info, as_4d=uv_4d)
-        uv_shape = (1, total_planes, ny_out, nx_out) if uv_4d else (total_planes, ny_out, nx_out)
+        if uv_mode == "vis2grid":
+            nu_grid, nv_grid = imaging.get_uv_grid_dims(
+                npix_x=grid_npix_x, npix_y=grid_npix_y, pixsize_x=pix_rad, pixsize_y=pix_rad,
+                epsilon=epsilon, do_wgridding=do_wgridding,
+                sigma_min=sigma_min, sigma_max=sigma_max
+            )
+            nu_stored = (nu_grid // 2 + 1) if uv_hermitian_half else nu_grid
+            hdr_uv_r, hdr_uv_i = build_uv_headers(hdr3d, nu_stored, nv_grid, pix_rad, total_planes, time_info, as_4d=uv_4d, hermitian_half=uv_hermitian_half)
+            uv_shape = (1, total_planes, nv_grid, nu_stored) if uv_4d else (total_planes, nv_grid, nu_stored)
+        else:
+            nu_stored = (nx_out // 2 + 1) if uv_hermitian_half else nx_out
+            hdr_uv_r, hdr_uv_i = build_uv_headers(hdr3d, nu_stored, ny_out, pix_rad, total_planes, time_info, as_4d=uv_4d, hermitian_half=uv_hermitian_half)
+            uv_shape = (1, total_planes, ny_out, nu_stored) if uv_4d else (total_planes, ny_out, nu_stored)
         header_size_uv_r = init_empty_fits_cube(out_cube_real, hdr_uv_r, uv_shape, dtype=np_dtype, overwrite=overwrite, blank_indices=time_info["blank_indices"] if create_blanks else None)
         header_size_uv_i = init_empty_fits_cube(out_cube_imag, hdr_uv_i, uv_shape, dtype=np_dtype, overwrite=overwrite, blank_indices=time_info["blank_indices"] if create_blanks else None)
 
@@ -1065,10 +1142,11 @@ def make_dirty_cube(
         verbosity=verbosity, flip_u=flip_u, flip_v=flip_v, flip_w=flip_w, divide_by_n=divide_by_n,
         sigma_min=sigma_min, sigma_max=sigma_max, min_valid_channels=min_valid_channels, dm=dm,
         collapse_channels=collapse_channels, nsubbands=nsubbands, exact_uvw=exact_uvw, align_to=align_to,
-        dtype_str=dtype_str, save_uv=save_uv, out_cube_real=out_cube_real, out_cube_imag=out_cube_imag,
+        dtype_str=dtype_str, save_uv=save_uv, uv_mode=uv_mode, out_cube_real=out_cube_real, out_cube_imag=out_cube_imag,
         header_size_uv_real=header_size_uv_r, header_size_uv_imag=header_size_uv_i, write_dirty=write_dirty,
         cutout_bbox=cutout_bbox, direct_write=True,
         shift_method=shift_method, shift_domain=shift_domain,
+        uv_hermitian_half=uv_hermitian_half,
     )
 
     def _driver_write_chunk(path, arr, c_g_idx, off_s):
@@ -1112,9 +1190,23 @@ def make_dirty_cube(
             cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, processes=(dask_scheduler == "processes"))
             client_ctx = Client(cluster)
         else:
-            from dask_jobqueue import SLURMCluster
-            cluster = SLURMCluster(queue=slurm_partition, project=slurm_account, cores=slurm_cores_per_worker, memory=slurm_mem, walltime=slurm_walltime, job_extra_directives=slurm_job_extra or [], interface=slurm_interface)
-            cluster.scale(n_workers)
+            from fastducc.dask_utils import setup_slurm_cluster, derive_dask_job_name, resolve_dask_log_directory
+            job_name = derive_dask_job_name(stage="cube", ms_path=msname)
+            log_dir = resolve_dask_log_directory()
+            cluster = setup_slurm_cluster(
+                queue=slurm_partition,
+                account=slurm_account,
+                cores_per_worker=slurm_cores_per_worker,
+                mem=slurm_mem,
+                walltime=slurm_walltime,
+                job_name=job_name,
+                log_directory=log_dir,
+                job_extra_directives=slurm_job_extra or [],
+                interface=slurm_interface,
+                min_workers=1,
+                max_workers=n_workers,
+                adaptive=False,
+            )
             client_ctx = Client(cluster)
         with client_ctx as client:
             future_to_task = {
@@ -1215,6 +1307,11 @@ def build_cli_cube(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-timestamps-table", dest="write_timestamps_table", action="store_false")
     parser.add_argument("--save-uv", "-save-uv", dest="save_uv", action="store_true", default=False)
     parser.add_argument("--uv-only", dest="uv_only", action="store_true", default=False)
+    parser.add_argument("--uv-mode", dest="uv_mode", choices=["auto", "fft", "vis2grid"], default="auto", help="Gridded UV generation method: 'auto' ('vis2grid' for --uv-only, 'fft' for imaging+save-uv), 'fft' (2D FFT of dirty image), or 'vis2grid' (direct ducc0.wgridder.vis2grid with w-gridding)")
+    parser.add_argument("--uv-format", choices=["fits", "fits-half", "dga_zarr", "zarr"], default="fits", help="Storage format for gridded UV data: 'fits', 'fits-half' (Hermitian half-plane), or 'dga_zarr'/'zarr'")
+    parser.add_argument("--uv-hermitian-half", dest="uv_hermitian_half", action="store_true", default=False, help="Exploit Hermitian symmetry V(-u,-v)=V*(u,v) to store only the half-plane")
+    parser.add_argument("--uv-zarr-path", default=None, help="Explicit path for output UV Zarr directory")
+    parser.add_argument("--uv-threshold", type=float, default=1e-4, help="Amplitude threshold for sparse UV cell retention in DGA/Zarr mode")
     parser.add_argument("--out-uv-real", default=None)
     parser.add_argument("--out-uv-imag", default=None)
     parser.add_argument("--uv-4d", dest="uv_4d", action="store_true", default=False)

@@ -229,6 +229,10 @@ def build_cli(argv=None):
                         help='Extra SLURM directives, e.g. ["--exclusive"]')
     parser.add_argument('--slurm-interface', default=None,
                         help='Network interface name (if needed for TCP comms)')
+    parser.add_argument('--dask-job-name', default=None,
+                        help='Custom Slurm job name for Dask workers (defaults to descriptive fd_tr_<sbid>_<beam>)')
+    parser.add_argument('--slurm-log-dir', default=None,
+                        help='Target directory for Dask worker Slurm stdout/stderr logs (defaults to $LOG_DIR/dask_workers)')
 
     # --- Cube creation mode ---
     parser.add_argument(
@@ -261,9 +265,19 @@ def build_cli(argv=None):
     parser.add_argument('--no-timestamps-table', dest='write_timestamps_table', action='store_false', default=True,
                         help='Do not include TIMESTAMPS binary table extension HDU')
     parser.add_argument('--save-uv', '-save-uv', dest='save_uv', action='store_true', default=False,
-                        help='Save gridded UV visibilities (2D FFT of dirty images) into separate real and imaginary FITS cubes (following wsclean -save-uv)')
+                        help='Save gridded UV visibilities into separate real and imaginary FITS cubes (following wsclean -save-uv)')
     parser.add_argument('--uv-only', dest='uv_only', action='store_true', default=False,
                         help='Only output real and imaginary UV cubes, skipping the dirty image cube')
+    parser.add_argument('--uv-mode', dest='uv_mode', choices=['auto', 'fft', 'vis2grid'], default='auto',
+                        help='Gridded UV generation method: "auto" ("vis2grid" for --uv-only, "fft" for imaging+save-uv), "fft" (2D FFT of dirty image), or "vis2grid" (direct ducc0.wgridder.vis2grid with w-gridding)')
+    parser.add_argument('--uv-format', choices=['fits', 'fits-half', 'dga_zarr', 'zarr'], default='fits',
+                        help="Storage format for gridded UV data: 'fits' (standard full-plane), 'fits-half' (Hermitian half-plane FITS, 2x smaller), or 'dga_zarr'/'zarr' (compressed active-cell Zarr storage, 10x smaller)")
+    parser.add_argument('--uv-hermitian-half', dest='uv_hermitian_half', action='store_true', default=False,
+                        help='Exploit Hermitian symmetry V(-u,-v) = V*(u,v) and only store the non-negative u half-plane')
+    parser.add_argument('--uv-zarr-path', default=None,
+                        help='Explicit output directory path for UV Zarr store (default: <prefix>-uv.zarr)')
+    parser.add_argument('--uv-threshold', type=float, default=1e-4,
+                        help='Amplitude cutoff threshold for sparse UV cell retention in DGA/Zarr mode (default: 1e-4)')
     parser.add_argument('--out-uv-real', default=None,
                         help='Explicit path for output real UV cube (default: <prefix>-uv-real.cube.fits)')
     parser.add_argument('--out-uv-imag', default=None,
@@ -569,114 +583,64 @@ def run_pipeline(args):
                 _ = fd_core.finalise_welford_parallel(cfg, agg_list, dm=trial_dm)
                 log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
 
-    elif args.parallel_mode == 'dask-local':
-        n_workers = args.dask_workers if args.dask_workers > 0 else None
-        cluster = LocalCluster(
-            n_workers=n_workers,
-            threads_per_worker=args.threads_per_worker,
-            processes=(args.dask_scheduler == 'processes')
-        )
-        with Client(cluster) as client:
-            agg_list = _process_chunks(client=client)
-            if cfg.enable_var:
-                for trial_dm in dm_trials:
-                    log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
-                    _ = fd_core.finalise_welford_parallel(cfg, agg_list, dm=trial_dm)
-                    log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
-        cluster.close()
+    elif args.parallel_mode in ('dask-local', 'dask-slurm'):
+        from fastducc.dask_utils import get_dask_client
 
-    elif args.parallel_mode == 'dask-slurm':
-        # SLURMCluster (requires dask_jobqueue)
-        if SLURMCluster is None:
-            raise RuntimeError("dask_jobqueue is required for --parallel-mode=dask-slurm")
-        slurm_interface = args.slurm_interface
-        if slurm_interface is None:
-            try:
-                import psutil
-                if 'ib0' in psutil.net_if_addrs():
-                    slurm_interface = 'ib0'
-            except Exception:
-                pass
-        scheduler_opts = {"dashboard_address": ":0"}
-        if slurm_interface:
-            scheduler_opts["interface"] = slurm_interface
-        prologue = [
-            "module load python-scientific/3.11.5-foss-2023b 2>/dev/null || true",
-            "unset PYTHONPATH",
-            f"source {os.path.dirname(sys.executable)}/activate 2>/dev/null || true",
-            f"export OMP_NUM_THREADS={args.slurm_cores_per_worker}",
-            "export OPENBLAS_NUM_THREADS=1"
-        ]
-
-        # Allow tasks to be retried if workers retire or fail without aborting cluster
-        # Configure adaptive target-duration to match coarse-grained batch tasks (~1 hour)
-        dask.config.set({
-            "distributed.scheduler.allowed-failures": 25,
-            "distributed.adaptive.target-duration": "3600s",
-        })
-
-        worker_extra = ["--nthreads", "1", "--memory-limit", "0"]
-        if args.slurm_walltime:
-            try:
-                parts = args.slurm_walltime.split(":")
-                if len(parts) >= 2:
-                    wt_min = int(parts[0]) * 60 + int(parts[1])
-                    # Retire gracefully 45 minutes before SLURM hard walltime, but at least 30m lifetime
-                    lifetime_min = max(30, wt_min - 45)
-                    worker_extra.extend(["--lifetime", f"{lifetime_min}m", "--lifetime-stagger", "5m"])
-            except Exception:
-                pass
-
-        log_memory("Before creating SLURMCluster")
-        cluster = SLURMCluster(
-            queue=args.slurm_partition,
-            account=args.slurm_account,
-            cores=args.slurm_cores_per_worker,
-            memory=args.slurm_mem,
-            walltime=args.slurm_walltime,
-            job_extra_directives=args.slurm_job_extra,
-            interface=slurm_interface,
-            python=sys.executable,
-            job_script_prologue=prologue,
-            scheduler_options=scheduler_opts, #avoid dashboard port conflicts
-            processes=1,
-            worker_extra_args=worker_extra,
-        )
-        log_memory("After creating SLURMCluster")
-        # adapt to number of workers: scale dynamically to match expected number of time chunks if 0 or not specified
         if args.dask_workers and args.dask_workers > 0:
             n_workers = args.dask_workers
         else:
             n_workers = max(1, len(chunk_bounds))
 
-        cluster.adapt(minimum=0, maximum=n_workers)
-        logger.info(f"[Dask-SLURM] Dynamically adapted cluster (0..{n_workers} workers).")
-        log_memory(f"After cluster.adapt ({n_workers})")
+        log_memory(f"Before creating {args.parallel_mode}")
+        client, cluster = get_dask_client(
+            parallel_mode=args.parallel_mode,
+            scheduler_address=None,
+            stage_name="transient",
+            ms_path=cfg.msname,
+            dask_job_name=getattr(args, "dask_job_name", None),
+            slurm_log_dir=getattr(args, "slurm_log_dir", None),
+            output_dir=candidates_dir,
+            slurm_partition=args.slurm_partition,
+            slurm_account=args.slurm_account,
+            slurm_cores_per_worker=args.slurm_cores_per_worker,
+            slurm_mem=args.slurm_mem,
+            slurm_walltime=args.slurm_walltime,
+            slurm_job_extra=args.slurm_job_extra,
+            slurm_interface=args.slurm_interface,
+            min_workers=0,
+            max_workers=n_workers,
+            local_workers=n_workers,
+            threads_per_worker=args.threads_per_worker,
+            dask_scheduler=args.dask_scheduler,
+        )
+        log_memory(f"After creating {args.parallel_mode}")
 
-        # Connect the client and run
-        log_memory("Before Client(cluster) context creation")
-        with Client(cluster) as client:
-            log_memory("After Client(cluster) context creation")
-            n_init = len(client.scheduler_info()["workers"])
-            logger.info(f"[Dask-SLURM] Connected to cluster. {n_init} worker(s) initially ready.")
+        try:
+            n_init = len(client.scheduler_info().get("workers", {}))
+            logger.info(f"[{args.parallel_mode}] Connected to cluster. {n_init} worker(s) initially ready.")
             agg_list = _process_chunks(client=client)
             if cfg.enable_var:
                 for trial_dm in dm_trials:
                     log_memory(f"Before finalise_welford_parallel DM={trial_dm:.2f}")
                     _ = fd_core.finalise_welford_parallel(cfg, agg_list, dm=trial_dm)
                     log_memory(f"After finalise_welford_parallel DM={trial_dm:.2f}")
-
-        log_memory("After Client closed")
-        # Graceful stop after the client context exits
-        try:
-            cluster.scale(0)  # retire workers first
-        except BaseException as e:
-            logger.warning(f"Error scaling cluster down: {e}")
-        try:
-            cluster.close()
-        except BaseException as e:
-            logger.warning(f"Error closing cluster: {e}")
-        log_memory("After SLURMCluster closed")
+        finally:
+            log_memory("After Client closed")
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            if cluster is not None:
+                try:
+                    cluster.scale(0)  # retire workers first
+                except BaseException as e:
+                    logger.warning(f"Error scaling cluster down: {e}")
+                try:
+                    cluster.close()
+                except BaseException as e:
+                    logger.warning(f"Error closing cluster: {e}")
+            log_memory(f"After {args.parallel_mode} closed")
 
     else:
         raise ValueError(f"Unknown parallel_mode: {args.parallel_mode}")

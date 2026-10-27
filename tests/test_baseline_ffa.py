@@ -4,7 +4,11 @@ Tests for baseline-domain FFA search and ducc0.wgridder integration.
 """
 
 import os
-import pytest
+try:
+    import pytest
+except ImportError:
+    import unittest
+    raise unittest.SkipTest("pytest is not installed")
 import numpy as np
 
 from fastducc.constants import c as c_light

@@ -38,6 +38,7 @@ __all__ = [
     "timeshift",
     "baseline_ffa",
     "wgridded_nufft",
+    "dask_utils",
 ]
 
 __version__ = "0.1.0"

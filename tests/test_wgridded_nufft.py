@@ -1,7 +1,11 @@
 # tests/test_wgridded_nufft.py
 import math
 import numpy as np
-import pytest
+try:
+    import pytest
+except ImportError:
+    import unittest
+    raise unittest.SkipTest("pytest is not installed")
 
 try:
     import ducc0
