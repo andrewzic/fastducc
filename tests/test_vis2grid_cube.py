@@ -245,7 +245,7 @@ class TestVis2GridCube(unittest.TestCase):
                 npix_x=npix_x, npix_y=npix_y, pixsize_x=pix_rad, pixsize_y=pix_rad,
                 epsilon=1e-4, do_wgridding=True
             )
-            nu_stored = nu // 2
+            nu_stored = nu // 2 + 1
 
             z_arr = zarr.open_array(
                 zarr_path, mode="w", shape=(10, nv, nu_stored),
@@ -319,7 +319,7 @@ class TestVis2GridCube(unittest.TestCase):
 
                 # Verify Zarr metadata
                 z_check = zarr.open_array(zarr_path, mode="r")
-                self.assertEqual(z_check.shape, (2, 48, 24))
+                self.assertEqual(z_check.shape, (2, 48, 25))
                 self.assertTrue(z_check.attrs["hermitian_half"])
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -371,10 +371,10 @@ class TestVis2GridCube(unittest.TestCase):
                 )
 
                 hdr_r = fits.getheader(fits_real)
-                self.assertEqual(hdr_r["NAXIS1"], 225)
+                self.assertEqual(hdr_r["NAXIS1"], 226)
                 self.assertEqual(hdr_r["NAXIS2"], 450)
                 data_r = fits.getdata(fits_real)
-                self.assertEqual(data_r.shape, (2, 450, 225))
+                self.assertEqual(data_r.shape, (2, 450, 226))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

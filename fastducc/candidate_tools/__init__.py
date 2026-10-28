@@ -29,6 +29,7 @@ from fastducc.candidate_tools.snippets import (
 from fastducc.candidate_tools.plotting import (
     save_candidate_summary,
     save_candidate_snippet_products,
+    save_periodicity_candidate_summary,
 )
 from fastducc.candidate_tools.catalogues import (
     _load_psrcat_csv,

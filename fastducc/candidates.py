@@ -40,6 +40,7 @@ from fastducc.candidate_tools.snippets import (
 from fastducc.candidate_tools.plotting import (
     save_candidate_summary,
     save_candidate_snippet_products,
+    save_periodicity_candidate_summary,
 )
 from fastducc.candidate_tools.catalogs import (
     _load_psrcat_csv,
@@ -80,6 +81,7 @@ __all__ = [
     "save_candidate_lightcurves",
     # Summary plotting & visualization
     "save_candidate_summary",
+    "save_periodicity_candidate_summary",
     "save_candidate_snippet_products",
     # Catalog annotation & crossmatch
     "annotate_observation_with_catalogs",

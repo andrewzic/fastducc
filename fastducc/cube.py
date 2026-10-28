@@ -587,8 +587,8 @@ def process_chunk_task(
             uv_cube_chunk = uv_cube_chunk[:n_target_samples]
 
         if uv_hermitian_half and uv_cube_chunk is not None:
-            u_start = uv_cube_chunk.shape[-1] // 2
-            uv_cube_chunk = uv_cube_chunk[..., u_start:]
+            u_half = uv_cube_chunk.shape[-1] // 2 + 1
+            uv_cube_chunk = uv_cube_chunk[..., :u_half]
 
         real_chunk = uv_cube_chunk.real.astype(dtype_str)
         imag_chunk = uv_cube_chunk.imag.astype(dtype_str)
@@ -735,8 +735,8 @@ def grid_chunk_to_zarr_task(
         uv_cube_chunk = uv_cube_chunk[:n_target_samples]
 
     if uv_hermitian_half and uv_cube_chunk is not None:
-        u_start = uv_cube_chunk.shape[-1] // 2
-        uv_cube_chunk = uv_cube_chunk[..., u_start:]
+        u_half = uv_cube_chunk.shape[-1] // 2 + 1
+        uv_cube_chunk = uv_cube_chunk[..., :u_half]
 
     # Write slice directly to the pre-allocated on-disk chunked Zarr array
     z_store = zarr.open_array(out_zarr, mode="r+")
@@ -1030,7 +1030,7 @@ def grid_ms_to_zarr(
         npix_x=npix_x, npix_y=npix_y, pixsize_x=pix_rad, pixsize_y=pix_rad,
         epsilon=epsilon, do_wgridding=do_wgridding, sigma_min=sigma_min, sigma_max=sigma_max,
     )
-    nu_stored = (nu_grid - (nu_grid // 2)) if uv_hermitian_half else nu_grid
+    nu_stored = (nu_grid // 2 + 1) if uv_hermitian_half else nu_grid
 
     if out_zarr is None:
         dm_tag = f"_dm{dm:06.1f}" if dm != 0.0 else ""
@@ -1613,11 +1613,11 @@ def make_dirty_cube(
                 epsilon=epsilon, do_wgridding=do_wgridding,
                 sigma_min=sigma_min, sigma_max=sigma_max
             )
-            nu_stored = (nu_grid - (nu_grid // 2)) if uv_hermitian_half else nu_grid
+            nu_stored = (nu_grid // 2 + 1) if uv_hermitian_half else nu_grid
             hdr_uv_r, hdr_uv_i = build_uv_headers(hdr3d, nu_stored, nv_grid, pix_rad, total_planes, time_info, as_4d=uv_4d, hermitian_half=uv_hermitian_half)
             uv_shape = (1, total_planes, nv_grid, nu_stored) if uv_4d else (total_planes, nv_grid, nu_stored)
         else:
-            nu_stored = (nx_out - (nx_out // 2)) if uv_hermitian_half else nx_out
+            nu_stored = (nx_out // 2 + 1) if uv_hermitian_half else nx_out
             hdr_uv_r, hdr_uv_i = build_uv_headers(hdr3d, nu_stored, ny_out, pix_rad, total_planes, time_info, as_4d=uv_4d, hermitian_half=uv_hermitian_half)
             uv_shape = (1, total_planes, ny_out, nu_stored) if uv_4d else (total_planes, ny_out, nu_stored)
         header_size_uv_r = init_empty_fits_cube(out_cube_real, hdr_uv_r, uv_shape, dtype=np_dtype, overwrite=overwrite, blank_indices=time_info["blank_indices"] if create_blanks else None)

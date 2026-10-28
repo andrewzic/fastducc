@@ -158,6 +158,17 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
     t["nharm_used"] = nharm_used
     t["algo"] = algo
     t["phase_center_field"] = field_name
+
+    optional_cols = [
+        "width_bins", "duty_cycle", "sbid", "beam", "scan",
+        "cutout_fits", "fullframe_fits", "summary_plot", "profile_npz", "lightcurve_npz",
+        "psrcat_match_name", "psrcat_sep_arcsec", "psrcat_period_s", "psrcat_dm",
+        "racs_match_name", "racs_sep_arcsec", "racs_flux_mjy",
+    ]
+    for opt in optional_cols:
+        vals = col(opt, None)
+        if any(v is not None for v in vals):
+            t[opt] = vals
     return t
 
 
