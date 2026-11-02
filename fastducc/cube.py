@@ -697,6 +697,7 @@ def grid_chunk_to_zarr_task(
     shift_domain: str = "native",
     uv_hermitian_half: bool = True,
     n_target_samples: Optional[int] = None,
+    min_uv_distance_m: Optional[float] = None,
     **kwargs,
 ) -> Tuple[int, int, int]:
     """
@@ -710,6 +711,7 @@ def grid_chunk_to_zarr_task(
     times_chunk, chunk_freq, dt, vis_3d, wgt_3d, uvw_3d = imaging.load_chunk_data(
         msname=msname, chunk_times=chunk_times, data_column=data_column,
         corr_mode=corr_mode, basis=basis, single_pol=single_pol,
+        min_uv_distance_m=min_uv_distance_m,
     )
 
     if abs(shift_samps) > 1e-7 and shift_domain == "native":
@@ -726,6 +728,7 @@ def grid_chunk_to_zarr_task(
         nthreads=nthreads, verbosity=verbosity, flip_u=flip_u, flip_v=flip_v, flip_w=flip_w,
         divide_by_n=divide_by_n, sigma_min=sigma_min, sigma_max=sigma_max,
         min_valid_channels=min_valid_channels,
+        min_uv_distance_m=min_uv_distance_m,
     )
 
     if abs(shift_samps) > 1e-7 and shift_domain == "gridded":
@@ -917,6 +920,7 @@ def grid_ms_to_zarr(
     shift_method: str = "fft",
     shift_domain: str = "native",
     uv_hermitian_half: bool = True,
+    min_uv_distance_m: Optional[float] = None,
     **kwargs,
 ) -> str:
     """
@@ -985,6 +989,7 @@ def grid_ms_to_zarr(
         shift_method = cfg.shift_method or shift_method
         shift_domain = cfg.shift_domain or shift_domain
         uv_hermitian_half = cfg.uv_hermitian_half if hasattr(cfg, "uv_hermitian_half") else uv_hermitian_half
+        min_uv_distance_m = getattr(cfg, "min_uv_distance_m", None) if min_uv_distance_m is None else min_uv_distance_m
 
     if not msname or not os.path.exists(msname):
         raise FileNotFoundError(f"Measurement Set '{msname}' not found.")
@@ -1113,6 +1118,7 @@ def grid_ms_to_zarr(
         dm=dm, collapse_channels=collapse_channels, nsubbands=nsubbands, exact_uvw=exact_uvw,
         align_to=align_to, shift_method=shift_method, shift_domain=shift_domain,
         uv_hermitian_half=uv_hermitian_half,
+        min_uv_distance_m=min_uv_distance_m,
     )
 
     eff_client = client or getattr(cfg, "client", None)
@@ -1305,6 +1311,7 @@ def make_dirty_cube(
     v_chunk_size: Optional[int] = None,
     client: Optional[Any] = None,
     direct_to_zarr: bool = False,
+    min_uv_distance_m: Optional[float] = None,
     **kwargs,
 ) -> str:
     """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes or Zarr."""
@@ -1345,6 +1352,7 @@ def make_dirty_cube(
             out_zarr=out_zarr, zarr_chunks=zarr_chunks, chunk_time=chunk_time,
             u_chunk_size=u_chunk_size, v_chunk_size=v_chunk_size,
             client=client, direct_to_zarr=direct_to_zarr,
+            min_uv_distance_m=min_uv_distance_m,
         )
     else:
         if msname:
@@ -1355,6 +1363,8 @@ def make_dirty_cube(
             cfg.out_zarr = out_zarr
         if client is not None:
             cfg.client = client
+        if min_uv_distance_m is not None:
+            cfg.min_uv_distance_m = min_uv_distance_m
         for k, v in kwargs.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
@@ -1853,7 +1863,20 @@ def build_cli_cube(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-blank-zero-beams", dest="no_blank_zero_beams", action="store_true", default=True)
     parser.add_argument("--floating", type=int, choices=[16, 32, 64], default=32)
     parser.add_argument("--fallback-astropy", action="store_true", default=False)
-    return parser.parse_args(argv)
+
+    if argv is None:
+        argv = sys.argv[1:]
+    fixed_argv = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--dec", "--cubelet-dec", "--ra", "--cubelet-ra", "--coord", "--target", "--dm") and i + 1 < len(argv) and not arg.startswith(f"{arg}="):
+            fixed_argv.append(f"{arg}={argv[i+1]}")
+            i += 2
+        else:
+            fixed_argv.append(arg)
+            i += 1
+    return parser.parse_args(fixed_argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

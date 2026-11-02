@@ -321,7 +321,19 @@ def build_cli(argv=None):
         help='Default unit when radius is passed as a bare number (default: arcsec)'
     )
 
-    return parser.parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
+    fixed_argv = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--dec", "--cubelet-dec", "--ra", "--cubelet-ra", "--dm", "-d") and i + 1 < len(argv) and not arg.startswith(f"{arg}="):
+            fixed_argv.append(f"{arg}={argv[i+1]}")
+            i += 2
+        else:
+            fixed_argv.append(arg)
+            i += 1
+    return parser.parse_args(fixed_argv)
 
 from fastducc.cli import (
     build_cli_aggregate,

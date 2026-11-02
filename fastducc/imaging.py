@@ -221,6 +221,7 @@ def load_chunk_data(
     average_correlations: bool = True,
     corr_index: int | None = None,
     use_weight_spectrum: bool = True,
+    min_uv_distance_m: float | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Read visibilities, weights, and UVW coordinates from Measurement Set for a single
@@ -285,6 +286,9 @@ def load_chunk_data(
         good = ~flags_all
         if flag_row is not None:
             good &= (~flag_row[:, None, None])
+        if min_uv_distance_m is not None and min_uv_distance_m > 0:
+            uvdist_m = np.hypot(uvw_all[:, 0], uvw_all[:, 1])
+            good &= (uvdist_m[:, None, None] >= min_uv_distance_m)
         wgt_all = np.where(good, wgt_all, 0.0)
 
         vis_flat, wgt_flat = _collapse_correlations(
@@ -346,11 +350,15 @@ def grid_chunk_cube(
     allow_nshift: bool = True,
     double_precision_accumulation: bool = False,
     min_valid_channels: int = 24,
+    min_uv_distance_m: float | None = None,
 ) -> np.ndarray:
     """
     Grid an in-memory visibility chunk into a dirty image time cube for a specified trial DM.
     Supports in-memory dedispersion and exact per-channel UVW baseline migration gridding.
     """
+    if min_uv_distance_m is not None and min_uv_distance_m > 0:
+        uv_dist_m = np.hypot(uvw_3d[:, 0, :], uvw_3d[:, 1, :])
+        wgt_3d = np.where(uv_dist_m[:, None, :] >= min_uv_distance_m, wgt_3d, np.float32(0.0))
     nbl, nchan, nt = vis_3d.shape
     engine = None
     if dm != 0.0 or collapse_channels:
@@ -529,6 +537,7 @@ def grid_chunk_uv_cube(
     allow_nshift: bool = True,
     double_precision_accumulation: bool = False,
     min_valid_channels: int = 24,
+    min_uv_distance_m: float | None = None,
 ) -> np.ndarray:
     """
     Grid an in-memory visibility chunk directly into a complex UV grid time cube
@@ -538,6 +547,9 @@ def grid_chunk_uv_cube(
     """
     if ducc0 is None:
         raise ImportError("ducc0 is required for vis2grid UV gridding.")
+    if min_uv_distance_m is not None and min_uv_distance_m > 0:
+        uv_dist_m = np.hypot(uvw_3d[:, 0, :], uvw_3d[:, 1, :])
+        wgt_3d = np.where(uv_dist_m[:, None, :] >= min_uv_distance_m, wgt_3d, np.float32(0.0))
     nbl, nchan, nt = vis_3d.shape
     engine = None
     if dm != 0.0 or collapse_channels:

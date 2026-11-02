@@ -152,6 +152,7 @@ class CubeConfig:
     v_chunk_size: Optional[int] = None
     client: Optional[Any] = None
     direct_to_zarr: bool = False
+    min_uv_distance_m: Optional[float] = None
 
     @classmethod
     def from_namespace(cls, args: Any, **overrides) -> CubeConfig:

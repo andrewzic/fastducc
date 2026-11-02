@@ -619,7 +619,11 @@ def save_periodicity_candidate_summary(
     y = int(candidate.get("y", 0))
     snr_val = float(candidate.get("snr", 0.0))
     period_s = float(candidate.get("period_s", candidate.get("period", 0.0)))
-    f_hz = float(candidate.get("f_hz", 1.0 / period_s if period_s > 0 else 0.0))
+    f_cand = candidate.get("f_hz")
+    if f_cand is not None and np.isfinite(float(f_cand)) and float(f_cand) > 0:
+        f_hz = float(f_cand)
+    else:
+        f_hz = 1.0 / period_s if period_s > 0 else 0.0
     dm_val = float(candidate.get("dm", 0.0)) if candidate.get("dm") is not None else 0.0
     width_bins = max(1, int(candidate.get("width_bins", candidate.get("width", 1))))
     duty_cycle = float(candidate.get("duty_cycle", 0.0))
@@ -682,10 +686,25 @@ def save_periodicity_candidate_summary(
         )
 
     # Prepare on-pulse and off-pulse cutout arrays
+    has_cutout = False
+    cutout_det = None
     if cutout is not None and isinstance(cutout, np.ndarray) and cutout.size > 0:
         cutout_det = _crop_or_pad_cutout(cutout, spatial_size)
+        has_cutout = True
     elif "cutout" in candidate and candidate["cutout"] is not None:
-        cutout_det = _crop_or_pad_cutout(np.asarray(candidate["cutout"]), spatial_size)
+        cand_cut = np.asarray(candidate["cutout"])
+        if cand_cut.size > 0:
+            cutout_det = _crop_or_pad_cutout(cand_cut, spatial_size)
+            has_cutout = True
+    elif candidate.get("cutout_fits") and os.path.exists(str(candidate["cutout_fits"])):
+        try:
+            with fits.open(str(candidate["cutout_fits"]), memmap=False) as hdul:
+                loaded_cut = np.squeeze(hdul[0].data)
+            if loaded_cut.size > 0:
+                cutout_det = _crop_or_pad_cutout(loaded_cut, spatial_size)
+                has_cutout = True
+        except Exception as e:
+            logger.debug(f"Could not load cutout_fits '{candidate.get('cutout_fits')}': {e}")
     elif fullframe is not None:
         half_sp = spatial_size // 2
         y0_des = y - half_sp
@@ -702,39 +721,76 @@ def save_periodicity_candidate_summary(
             ((y0_clip - y0_des, y1_des - y1_clip), (x0_clip - x0_des, x1_des - x1_clip)),
             mode="edge",
         ).astype(np.float32)
-    else:
-        cutout_det = np.zeros((spatial_size, spatial_size), dtype=np.float32)
-        cutout_det[spatial_size // 2, spatial_size // 2] = snr_val
+        has_cutout = True
 
     cutout_off_det = None
     if cutout_off is not None and isinstance(cutout_off, np.ndarray) and cutout_off.size > 0:
         cutout_off_det = _crop_or_pad_cutout(cutout_off, spatial_size)
     elif "cutout_off" in candidate and candidate["cutout_off"] is not None:
-        cutout_off_det = _crop_or_pad_cutout(np.asarray(candidate["cutout_off"]), spatial_size)
+        cand_off = np.asarray(candidate["cutout_off"])
+        if cand_off.size > 0:
+            cutout_off_det = _crop_or_pad_cutout(cand_off, spatial_size)
+    elif candidate.get("cutout_off_fits") and os.path.exists(str(candidate["cutout_off_fits"])):
+        try:
+            with fits.open(str(candidate["cutout_off_fits"]), memmap=False) as hdul:
+                loaded_off = np.squeeze(hdul[0].data)
+            if loaded_off.size > 0:
+                cutout_off_det = _crop_or_pad_cutout(loaded_off, spatial_size)
+        except Exception as e:
+            logger.debug(f"Could not load cutout_off_fits: {e}")
 
     # Prepare 1D rotational pulse profile
+    has_profile = False
+    p_raw = None
     if profile is not None and len(profile) > 0:
         p_raw = np.asarray(profile, dtype=np.float64)
+        has_profile = True
     elif "profile" in candidate and candidate["profile"] is not None and len(candidate["profile"]) > 0:
         p_raw = np.asarray(candidate["profile"], dtype=np.float64)
+        has_profile = True
+    elif candidate.get("profile_npz") and os.path.exists(str(candidate["profile_npz"])):
+        try:
+            with np.load(str(candidate["profile_npz"])) as nz:
+                for k in ("profile", "p_raw", "folded_profile", "flux", "arr_0"):
+                    if k in nz:
+                        p_raw = np.asarray(nz[k], dtype=np.float64)
+                        has_profile = True
+                        break
+        except Exception as e:
+            logger.debug(f"Could not load profile_npz: {e}")
+    elif candidate.get("lightcurve_npz") and os.path.exists(str(candidate["lightcurve_npz"])):
+        try:
+            with np.load(str(candidate["lightcurve_npz"])) as nz:
+                for k in ("profile", "p_raw", "folded_profile", "flux", "arr_0"):
+                    if k in nz:
+                        p_raw = np.asarray(nz[k], dtype=np.float64)
+                        has_profile = True
+                        break
+        except Exception as e:
+            logger.debug(f"Could not load lightcurve_npz: {e}")
+
+    if has_profile and p_raw is not None and len(p_raw) > 0:
+        p_std = float(np.std(p_raw))
+        p_med = float(np.median(p_raw))
+        p_norm = (p_raw - p_med) / (p_std if p_std > 1e-12 else 1.0)
+        nbins = len(p_norm)
+
+        # Boxcar matched-filter response along phase
+        box_filt = np.zeros(nbins, dtype=np.float64)
+        for b in range(nbins):
+            for k in range(width_bins):
+                box_filt[b] += p_norm[(b + k) % nbins]
+        box_filt /= np.sqrt(max(1, width_bins))
+
+        p2_raw = np.concatenate([p_norm, p_norm])
+        p2_box = np.concatenate([box_filt, box_filt])
+        phase2 = np.linspace(0.0, 2.0, len(p2_raw), endpoint=False)
     else:
-        p_raw = np.mean(cutout_det, axis=1).astype(np.float64)
-
-    p_std = float(np.std(p_raw))
-    p_med = float(np.median(p_raw))
-    p_norm = (p_raw - p_med) / (p_std if p_std > 1e-12 else 1.0)
-    nbins = len(p_norm)
-
-    # Boxcar matched-filter response along phase
-    box_filt = np.zeros(nbins, dtype=np.float64)
-    for b in range(nbins):
-        for k in range(width_bins):
-            box_filt[b] += p_norm[(b + k) % nbins]
-    box_filt /= np.sqrt(max(1, width_bins))
-
-    p2_raw = np.concatenate([p_norm, p_norm])
-    p2_box = np.concatenate([box_filt, box_filt])
-    phase2 = np.linspace(0.0, 2.0, len(p2_raw), endpoint=False)
+        p_norm = None
+        p2_raw = None
+        p2_box = None
+        phase2 = None
+        nbins = 0
 
     # Continuum Cutout
     cont_im, cont_wcs, cont_vmin, cont_vmax = None, None, None, None
@@ -768,248 +824,268 @@ def save_periodicity_candidate_summary(
 
     # Build GridSpec figure: 4 columns if off-pulse cutout is available, else 3
     base_stem = os.path.basename(out_prefix)
+    has_off = cutout_off_det is not None
+    out_fig = ""
     if out_dir_plots:
         os.makedirs(out_dir_plots, exist_ok=True)
         out_fig = os.path.join(out_dir_plots, f"{base_stem}_summary.pdf")
-    else:
-        out_dir = os.path.dirname(os.path.abspath(out_prefix))
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        out_fig = f"{out_prefix}_summary.pdf"
+        ncols = 4 if has_off else 3
+        figsize = (22, 11) if has_off else (18, 12)
+    
+        fig = plt.figure(figsize=figsize, dpi=dpi)
+        gs = GridSpec(
+            nrows=2, ncols=ncols, figure=fig,
+            height_ratios=[1.8, 1.0], width_ratios=[1.0] * ncols,
+        )
+    
+        # Panel (0, 0): Continuum or Reference Field Image
+        if cont_wcs is not None:
+            ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
+            im_cont = ax_cont.imshow(cont_im, origin="lower", cmap=cmap, vmin=cont_vmin, vmax=cont_vmax)
+            ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
+            ax_cont.set_xlabel("RA (J2000)")
+            ax_cont.set_ylabel("Dec (J2000)")
+            ax_cont.set_aspect("equal", adjustable="box")
+            ax_cont.plot([np.degrees(ra_c)], [np.degrees(dec_c)],
+                         marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none",
+                         transform=ax_cont.get_transform("world"))
+            ax_cont.plot([np.degrees(ra_c)], [np.degrees(dec_c)],
+                         marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none",
+                         transform=ax_cont.get_transform("world"))
+            cb0 = fig.colorbar(im_cont, ax=ax_cont, orientation="horizontal", fraction=0.046, pad=0.10)
+            cb0.set_label("Flux density (mJy/beam)")
+            ax_cont.set_title("Continuum")
+        elif fullframe is not None and wcs_full is not None:
+            ax_cont = fig.add_subplot(gs[0, 0], projection=wcs_full)
+            vmin_ff = float(np.nanpercentile(fullframe, 1.0))
+            vmax_ff = float(np.nanpercentile(fullframe, 99.8))
+            im_cont = ax_cont.imshow(fullframe, origin="lower", cmap=cmap, vmin=vmin_ff, vmax=vmax_ff)
+            ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
+            ax_cont.set_xlabel("RA (J2000)")
+            ax_cont.set_ylabel("Dec (J2000)")
+            ax_cont.set_aspect("equal", adjustable="box")
+            ax_cont.plot([x], [y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+            ax_cont.plot([x], [y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+            cb0 = fig.colorbar(im_cont, ax=ax_cont, orientation="horizontal", fraction=0.046, pad=0.10)
+            cb0.set_label("Folded Dirty Intensity")
+            ax_cont.set_title("Full Field (no cont.)")
+        else:
+            ax_cont = fig.add_subplot(gs[0, 0])
+            ax_cont.set_facecolor("#222222")
+            ax_cont.text(
+                0.5, 0.5, "NO CONTINUUM REFERENCE\nAVAILABLE",
+                ha="center", va="center", color="silver", weight="bold", fontsize=11,
+                transform=ax_cont.transAxes,
+            )
+            ax_cont.set_title("Continuum (Unavailable)")
+            ax_cont.set_xticks([])
+            ax_cont.set_yticks([])
+    
+        # Panel (0, 1): Full Field of View Detection Frame @ Trial Period
+        if fullframe is not None and wcs_full is not None:
+            ax_full = fig.add_subplot(gs[0, 1], projection=wcs_full)
+            vmin_ff = float(np.nanpercentile(fullframe, 1.0))
+            vmax_ff = float(np.nanpercentile(fullframe, 99.8))
+            im_full = ax_full.imshow(fullframe, origin="lower", cmap=cmap, vmin=vmin_ff, vmax=vmax_ff)
+            ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
+            ax_full.set_xlabel("RA (J2000)")
+            ax_full.set_ylabel("Dec (J2000)")
+            ax_full.set_aspect("equal", adjustable="box")
+            ax_full.plot([x], [y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+            ax_full.plot([x], [y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+            cb1 = fig.colorbar(im_full, ax=ax_full, orientation="horizontal", fraction=0.046, pad=0.10)
+            cb1.set_label("Folded Dirty Intensity")
+            ax_full.set_title(f"Field @ P={period_s*1e3:.2f} ms ({f_hz:.4f} Hz, DM={dm_val:.2f})")
+        else:
+            ax_full = fig.add_subplot(gs[0, 1])
+            ax_full.set_facecolor("#222222")
+            ax_full.text(
+                0.5, 0.5, "NO FULL-FRAME IMAGE ARCHIVED\n(save_fullframes=False or omitted)",
+                ha="center", va="center", color="silver", weight="bold", fontsize=11,
+                transform=ax_full.transAxes,
+            )
+            ax_full.set_title(f"Detection Map @ P={period_s*1e3:.2f} ms")
+            ax_full.set_xticks([])
+            ax_full.set_yticks([])
+    
+        # Panel (0, 2): Zoomed On-Pulse Cutout
+        if has_cutout and cutout_det is not None:
+            ax_cut = fig.add_subplot(gs[0, 2], projection=wcs_cut)
+            vmin_c = float(np.nanpercentile(cutout_det, 1.0))
+            vmax_c = float(np.nanpercentile(cutout_det, 99.8))
+            im_cut = ax_cut.imshow(cutout_det, origin="lower", cmap=cmap, vmin=vmin_c, vmax=vmax_c)
+            ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
+            ax_cut.set_xlabel("RA (J2000)")
+            ax_cut.set_ylabel("Dec (J2000)")
+            ax_cut.set_aspect("equal", adjustable="box")
+            c_x = cutout_det.shape[1] // 2
+            c_y = cutout_det.shape[0] // 2
+            ax_cut.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+            ax_cut.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+            cb2 = fig.colorbar(im_cut, ax=ax_cut, orientation="horizontal", fraction=0.046, pad=0.10)
+            cb2.set_label("Folded Dirty Intensity")
+            ax_cut.set_title(f"On-Pulse Cutout (S/N={snr_val:.2f})")
+        else:
+            ax_cut = fig.add_subplot(gs[0, 2])
+            ax_cut.set_facecolor("#222222")
+            ax_cut.text(
+                0.5, 0.5, "NO CUTOUT DATA AVAILABLE",
+                ha="center", va="center", color="silver", weight="bold", fontsize=12,
+                transform=ax_cut.transAxes,
+            )
+            ax_cut.set_title(f"On-Pulse Cutout (S/N={snr_val:.2f})")
+            ax_cut.set_xticks([])
+            ax_cut.set_yticks([])
+    
+        # Panel (0, 3): Zoomed Off-Pulse Cutout (if available)
+        if has_off and cutout_off_det is not None:
+            ax_cut_off = fig.add_subplot(gs[0, 3], projection=wcs_cut)
+            vmin_off = float(np.nanpercentile(cutout_off_det, 1.0)) if not has_cutout else vmin_c
+            vmax_off = float(np.nanpercentile(cutout_off_det, 99.8)) if not has_cutout else vmax_c
+            im_cut_off = ax_cut_off.imshow(cutout_off_det, origin="lower", cmap=cmap, vmin=vmin_off, vmax=vmax_off)
+            ax_cut_off.coords.grid(True, color="white", alpha=0.35, ls=":")
+            ax_cut_off.set_xlabel("RA (J2000)")
+            ax_cut_off.set_ylabel("Dec (J2000)")
+            ax_cut_off.set_aspect("equal", adjustable="box")
+            c_x = cutout_off_det.shape[1] // 2
+            c_y = cutout_off_det.shape[0] // 2
+            ax_cut_off.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+            ax_cut_off.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+            cb3 = fig.colorbar(im_cut_off, ax=ax_cut_off, orientation="horizontal", fraction=0.046, pad=0.10)
+            cb3.set_label("Folded Dirty Intensity")
+            ax_cut_off.set_title("Off-Pulse Cutout")
+    
+        # Bottom Row Left: Folded Pulse Profile (2 Full Cycles)
+        ax_lc = fig.add_subplot(gs[1, 0:ncols - 1])
+        if has_profile and p2_raw is not None and p2_box is not None and phase2 is not None:
+            ax_lc.step(phase2, p2_raw, where="mid", color="tab:blue", lw=1.5, label="Raw Folded Profile", zorder=2)
+            ax_lc.plot(phase2, p2_box, color="tab:green", lw=1.8, label=f"Boxcar Matched Filter (w={width_bins} bins, duty={duty_cycle*100.0:.1f}%)", zorder=3)
+            peak_b = int(candidate.get("best_b", np.argmax(p_norm) if p_norm is not None else 0))
+            peak_phase1 = peak_b / float(max(1, nbins))
+            peak_phase2 = peak_phase1 + 1.0
+            ax_lc.axvline(peak_phase1, color="crimson", ls="--", lw=1.2, label=f"Peak Phase ({peak_phase1:.3f})", zorder=4)
+            ax_lc.axvline(peak_phase2, color="crimson", ls="--", lw=1.2, zorder=4)
+            # Highlight on-pulse phase intervals
+            w_frac = width_bins / float(max(1, nbins))
+            ax_lc.axvspan(peak_phase1, peak_phase1 + w_frac, color="tab:green", alpha=0.15, label="On-Pulse Window")
+            ax_lc.axvspan(peak_phase2, peak_phase2 + w_frac, color="tab:green", alpha=0.15)
+            ax_lc.axvline(1.0, color="gray", ls=":", lw=1.2, alpha=0.7)
+            ax_lc.set_xlabel("Rotational Phase [0..2]")
+            ax_lc.set_ylabel("Normalized Flux / S/N")
+            ax_lc.set_title(f"Folded Pulse Profile | P = {period_s*1000.0:.3f} ms (f = {f_hz:.4f} Hz) | S/N = {snr_val:.2f}")
+            ax_lc.grid(True, alpha=0.3)
+            ax_lc.legend(loc="upper right", framealpha=0.9)
+        else:
+            ax_lc.set_facecolor("#222222")
+            ax_lc.text(
+                0.5, 0.5, "NO PROFILE DATA AVAILABLE",
+                ha="center", va="center", color="silver", weight="bold", fontsize=14,
+                transform=ax_lc.transAxes,
+            )
+            ax_lc.set_title(f"Folded Pulse Profile | P = {period_s*1000.0:.3f} ms (f = {f_hz:.4f} Hz) | S/N = {snr_val:.2f}")
+            ax_lc.set_xticks([])
+            ax_lc.set_yticks([])
+        ax_lc.axvline(1.0, color="gray", ls=":", lw=1.2, alpha=0.7)
+        ax_lc.set_xlabel("Rotational Phase [0..2]")
+        ax_lc.set_ylabel("Normalized Flux / S/N")
+        ax_lc.set_title(f"Folded Pulse Profile | P = {period_s*1000.0:.3f} ms (f = {f_hz:.4f} Hz) | S/N = {snr_val:.2f}")
+        ax_lc.grid(True, alpha=0.3)
+        ax_lc.legend(loc="upper right", framealpha=0.9)
+    
+        # Bottom Row Right: FastDUCC-style AnchoredText Summary Box
+        ax_txt = fig.add_subplot(gs[1, ncols - 1])
+        ax_txt.set_axis_off()
+    
+        meta = parse_candidate_filename(out_prefix)
+        field = candidate.get("phase_center_field", meta.get("field", "") if isinstance(meta, dict) else "")
+        sbid = candidate.get("sbid", meta.get("sbid", "") if isinstance(meta, dict) else "")
+        beam = candidate.get("beam", meta.get("beam", "") if isinstance(meta, dict) else "")
+        scan = candidate.get("scan", candidate.get("scan_id", meta.get("scan_id", "") if isinstance(meta, dict) else ""))
+    
+        psrcat_match = candidate.get("psrcat_match_name", candidate.get("psrcat_name", ""))
+        psrcat_sep = candidate.get("psrcat_sep_arcsec")
+        psrcat_str = f"{psrcat_match} ({float(psrcat_sep):.1f}\")" if psrcat_match and psrcat_sep is not None else (psrcat_match or "None")
+    
+        racs_match = candidate.get("racs_match_name", candidate.get("racs_name", ""))
+        racs_sep = candidate.get("racs_sep_arcsec")
+        racs_str = f"{racs_match} ({float(racs_sep):.1f}\")" if racs_match and racs_sep is not None else (racs_match or "None")
+    
+        txt = (
+            f"Name: {srcname}\n"
+            f"Field: {field}\n"
+            f"S/N: {snr_val:.2f}\n"
+            f"DM: {dm_val:.2f} pc/cm³\n"
+            f"Period: {period_s:.6f} s ({period_s * 1000.0:.3f} ms)\n"
+            f"Spin Freq: {f_hz:.6f} Hz\n"
+            f"FFA Width: {width_bins} bins\n"
+            f"Duty Cycle: {duty_cycle * 100.0:.1f}%\n"
+            f"SBID: {sbid}\n"
+            f"Beam: {beam}\n"
+            f"Scan: {scan}\n"
+            f"Coord (J2000): {ra_hms} {dec_dms}\n"
+            f"Coord (x,y): ({x:d}, {y:d})\n"
+            f"Method: {method}\n"
+            f"PSRCAT: {psrcat_str}\n"
+            f"RACS: {racs_str}"
+        )
+    
+        box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
+        ax_txt.add_artist(box)
+        ax_txt.set_title("Summary", pad=12)
+    
+        # Footer
+        gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        host = socket.gethostname()
+        username = getpass.getuser()
+        git_hash = "—"
+        try:
+            git_hash = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stderr=subprocess.DEVNULL,
+            ).decode("utf-8").strip()
+        except Exception:
+            pass
+        meta_footer = f"Generated: {gen_time} | Host: {host} | User: {username} | Git: {git_hash}"
+        fig.text(0.5, 0.01, meta_footer, ha="center", va="bottom", fontsize=8, color="gray", alpha=0.7)
+    
+        fig.savefig(out_fig, bbox_inches="tight")
+        plt.close(fig)
 
-    has_off = cutout_off_det is not None
-    ncols = 4 if has_off else 3
-    figsize = (22, 11) if has_off else (18, 12)
-
-    fig = plt.figure(figsize=figsize, dpi=dpi)
-    gs = GridSpec(
-        nrows=2, ncols=ncols, figure=fig,
-        height_ratios=[1.8, 1.0], width_ratios=[1.0] * ncols,
-    )
-
-    # Panel (0, 0): Continuum or Reference Field Image
-    if cont_wcs is not None:
-        ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
-        im_cont = ax_cont.imshow(cont_im, origin="lower", cmap=cmap, vmin=cont_vmin, vmax=cont_vmax)
-        ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
-        ax_cont.set_xlabel("RA (J2000)")
-        ax_cont.set_ylabel("Dec (J2000)")
-        ax_cont.set_aspect("equal", adjustable="box")
-        ax_cont.plot([np.degrees(ra_c)], [np.degrees(dec_c)],
-                     marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none",
-                     transform=ax_cont.get_transform("world"))
-        ax_cont.plot([np.degrees(ra_c)], [np.degrees(dec_c)],
-                     marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none",
-                     transform=ax_cont.get_transform("world"))
-        cb0 = fig.colorbar(im_cont, ax=ax_cont, orientation="horizontal", fraction=0.046, pad=0.10)
-        cb0.set_label("Flux density (mJy/beam)")
-        ax_cont.set_title("Continuum")
-    elif fullframe is not None and wcs_full is not None:
-        ax_cont = fig.add_subplot(gs[0, 0], projection=wcs_full)
-        vmin_ff = float(np.nanpercentile(fullframe, 1.0))
-        vmax_ff = float(np.nanpercentile(fullframe, 99.8))
-        im_cont = ax_cont.imshow(fullframe, origin="lower", cmap=cmap, vmin=vmin_ff, vmax=vmax_ff)
-        ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
-        ax_cont.set_xlabel("RA (J2000)")
-        ax_cont.set_ylabel("Dec (J2000)")
-        ax_cont.set_aspect("equal", adjustable="box")
-        ax_cont.plot([x], [y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
-        ax_cont.plot([x], [y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
-        cb0 = fig.colorbar(im_cont, ax=ax_cont, orientation="horizontal", fraction=0.046, pad=0.10)
-        cb0.set_label("Folded Dirty Intensity")
-        ax_cont.set_title("Full Field (no cont.)")
-    else:
-        ax_cont = fig.add_subplot(gs[0, 0], projection=wcs_cut)
-        vmin_c = float(np.nanpercentile(cutout_det, 5.0))
-        vmax_c = float(np.nanpercentile(cutout_det, 99.5))
-        im_cont = ax_cont.imshow(cutout_det, origin="lower", cmap=cmap, vmin=vmin_c, vmax=vmax_c)
-        ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
-        ax_cont.set_xlabel("RA (J2000)")
-        ax_cont.set_ylabel("Dec (J2000)")
-        ax_cont.set_aspect("equal", adjustable="box")
-        c_x = cutout_det.shape[1] // 2
-        c_y = cutout_det.shape[0] // 2
-        ax_cont.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
-        ax_cont.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
-        cb0 = fig.colorbar(im_cont, ax=ax_cont, orientation="horizontal", fraction=0.046, pad=0.10)
-        cb0.set_label("Folded Dirty Intensity")
-        ax_cont.set_title("Field (Reference)")
-
-    # Panel (0, 1): Full Field of View Detection Frame @ Trial Period
-    if fullframe is not None and wcs_full is not None:
-        ax_full = fig.add_subplot(gs[0, 1], projection=wcs_full)
-        vmin_ff = float(np.nanpercentile(fullframe, 1.0))
-        vmax_ff = float(np.nanpercentile(fullframe, 99.8))
-        im_full = ax_full.imshow(fullframe, origin="lower", cmap=cmap, vmin=vmin_ff, vmax=vmax_ff)
-        ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
-        ax_full.set_xlabel("RA (J2000)")
-        ax_full.set_ylabel("Dec (J2000)")
-        ax_full.set_aspect("equal", adjustable="box")
-        ax_full.plot([x], [y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
-        ax_full.plot([x], [y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
-        cb1 = fig.colorbar(im_full, ax=ax_full, orientation="horizontal", fraction=0.046, pad=0.10)
-        cb1.set_label("Folded Dirty Intensity")
-        ax_full.set_title(f"Field @ P={period_s*1e3:.2f} ms ({f_hz:.4f} Hz, DM={dm_val:.2f})")
-    else:
-        ax_full = fig.add_subplot(gs[0, 1], projection=wcs_cut)
-        vmin_c = float(np.nanpercentile(cutout_det, 5.0))
-        vmax_c = float(np.nanpercentile(cutout_det, 99.5))
-        im_full = ax_full.imshow(cutout_det, origin="lower", cmap=cmap, vmin=vmin_c, vmax=vmax_c)
-        ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
-        ax_full.set_xlabel("RA (J2000)")
-        ax_full.set_ylabel("Dec (J2000)")
-        ax_full.set_aspect("equal", adjustable="box")
-        c_x = cutout_det.shape[1] // 2
-        c_y = cutout_det.shape[0] // 2
-        ax_full.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
-        ax_full.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
-        cb1 = fig.colorbar(im_full, ax=ax_full, orientation="horizontal", fraction=0.046, pad=0.10)
-        cb1.set_label("Folded Dirty Intensity")
-        ax_full.set_title(f"Detection Map @ P={period_s*1e3:.2f} ms ({f_hz:.4f} Hz)")
-
-    # Panel (0, 2): Zoomed On-Pulse Cutout
-    ax_cut = fig.add_subplot(gs[0, 2], projection=wcs_cut)
-    vmin_c = float(np.nanpercentile(cutout_det, 1.0))
-    vmax_c = float(np.nanpercentile(cutout_det, 99.8))
-    im_cut = ax_cut.imshow(cutout_det, origin="lower", cmap=cmap, vmin=vmin_c, vmax=vmax_c)
-    ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
-    ax_cut.set_xlabel("RA (J2000)")
-    ax_cut.set_ylabel("Dec (J2000)")
-    ax_cut.set_aspect("equal", adjustable="box")
-    c_x = cutout_det.shape[1] // 2
-    c_y = cutout_det.shape[0] // 2
-    ax_cut.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
-    ax_cut.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
-    cb2 = fig.colorbar(im_cut, ax=ax_cut, orientation="horizontal", fraction=0.046, pad=0.10)
-    cb2.set_label("Folded Dirty Intensity")
-    ax_cut.set_title(f"On-Pulse Cutout (S/N={snr_val:.2f})")
-
-    # Panel (0, 3): Zoomed Off-Pulse Cutout (if available)
-    if has_off:
-        ax_cut_off = fig.add_subplot(gs[0, 3], projection=wcs_cut)
-        # Use shared vmin/vmax with on-pulse cutout for direct contrast comparison
-        im_cut_off = ax_cut_off.imshow(cutout_off_det, origin="lower", cmap=cmap, vmin=vmin_c, vmax=vmax_c)
-        ax_cut_off.coords.grid(True, color="white", alpha=0.35, ls=":")
-        ax_cut_off.set_xlabel("RA (J2000)")
-        ax_cut_off.set_ylabel("Dec (J2000)")
-        ax_cut_off.set_aspect("equal", adjustable="box")
-        ax_cut_off.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
-        ax_cut_off.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
-        cb3 = fig.colorbar(im_cut_off, ax=ax_cut_off, orientation="horizontal", fraction=0.046, pad=0.10)
-        cb3.set_label("Folded Dirty Intensity")
-        ax_cut_off.set_title("Off-Pulse Cutout")
-
-    # Bottom Row Left: Folded Pulse Profile (2 Full Cycles)
-    ax_lc = fig.add_subplot(gs[1, 0:ncols - 1])
-    ax_lc.step(phase2, p2_raw, where="mid", color="tab:blue", lw=1.5, label="Raw Folded Profile", zorder=2)
-    ax_lc.plot(phase2, p2_box, color="tab:green", lw=1.8, label=f"Boxcar Matched Filter (w={width_bins} bins, duty={duty_cycle*100.0:.1f}%)", zorder=3)
-    peak_b = int(candidate.get("best_b", np.argmax(p_norm)))
-    peak_phase1 = peak_b / float(nbins)
-    peak_phase2 = peak_phase1 + 1.0
-    ax_lc.axvline(peak_phase1, color="crimson", ls="--", lw=1.2, label=f"Peak Phase ({peak_phase1:.3f})", zorder=4)
-    ax_lc.axvline(peak_phase2, color="crimson", ls="--", lw=1.2, zorder=4)
-    # Highlight on-pulse phase intervals
-    w_frac = width_bins / float(nbins)
-    ax_lc.axvspan(peak_phase1, peak_phase1 + w_frac, color="tab:green", alpha=0.15, label="On-Pulse Window")
-    ax_lc.axvspan(peak_phase2, peak_phase2 + w_frac, color="tab:green", alpha=0.15)
-    ax_lc.axvline(1.0, color="gray", ls=":", lw=1.2, alpha=0.7)
-    ax_lc.set_xlabel("Rotational Phase [0..2]")
-    ax_lc.set_ylabel("Normalized Flux / S/N")
-    ax_lc.set_title(f"Folded Pulse Profile | P = {period_s*1000.0:.3f} ms (f = {f_hz:.4f} Hz) | S/N = {snr_val:.2f}")
-    ax_lc.grid(True, alpha=0.3)
-    ax_lc.legend(loc="upper right", framealpha=0.9)
-
-    # Bottom Row Right: FastDUCC-style AnchoredText Summary Box
-    ax_txt = fig.add_subplot(gs[1, ncols - 1])
-    ax_txt.set_axis_off()
-
-    meta = parse_candidate_filename(out_prefix)
-    field = candidate.get("phase_center_field", meta.get("field", "") if isinstance(meta, dict) else "")
-    sbid = candidate.get("sbid", meta.get("sbid", "") if isinstance(meta, dict) else "")
-    beam = candidate.get("beam", meta.get("beam", "") if isinstance(meta, dict) else "")
-    scan = candidate.get("scan", candidate.get("scan_id", meta.get("scan_id", "") if isinstance(meta, dict) else ""))
-
-    psrcat_match = candidate.get("psrcat_match_name", candidate.get("psrcat_name", ""))
-    psrcat_sep = candidate.get("psrcat_sep_arcsec")
-    psrcat_str = f"{psrcat_match} ({float(psrcat_sep):.1f}\")" if psrcat_match and psrcat_sep is not None else (psrcat_match or "None")
-
-    racs_match = candidate.get("racs_match_name", candidate.get("racs_name", ""))
-    racs_sep = candidate.get("racs_sep_arcsec")
-    racs_str = f"{racs_match} ({float(racs_sep):.1f}\")" if racs_match and racs_sep is not None else (racs_match or "None")
-
-    txt = (
-        f"Name: {srcname}\n"
-        f"Field: {field}\n"
-        f"S/N: {snr_val:.2f}\n"
-        f"DM: {dm_val:.2f} pc/cm³\n"
-        f"Period: {period_s:.6f} s ({period_s * 1000.0:.3f} ms)\n"
-        f"Spin Freq: {f_hz:.6f} Hz\n"
-        f"FFA Width: {width_bins} bins\n"
-        f"Duty Cycle: {duty_cycle * 100.0:.1f}%\n"
-        f"SBID: {sbid}\n"
-        f"Beam: {beam}\n"
-        f"Scan: {scan}\n"
-        f"Coord (J2000): {ra_hms} {dec_dms}\n"
-        f"Coord (x,y): ({x:d}, {y:d})\n"
-        f"Method: {method}\n"
-        f"PSRCAT: {psrcat_str}\n"
-        f"RACS: {racs_str}"
-    )
-
-    box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
-    ax_txt.add_artist(box)
-    ax_txt.set_title("Summary", pad=12)
-
-    # Footer
-    gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    host = socket.gethostname()
-    username = getpass.getuser()
-    git_hash = "—"
-    try:
-        git_hash = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            stderr=subprocess.DEVNULL,
-        ).decode("utf-8").strip()
-    except Exception:
-        pass
-    meta_footer = f"Generated: {gen_time} | Host: {host} | User: {username} | Git: {git_hash}"
-    fig.text(0.5, 0.01, meta_footer, ha="center", va="bottom", fontsize=8, color="gray", alpha=0.7)
-
-    fig.savefig(out_fig, bbox_inches="tight")
-    plt.close(fig)
-
-    # Save Cutout FITS with WCS & metadata
-    if out_dir_cutouts:
-        os.makedirs(out_dir_cutouts, exist_ok=True)
-        out_fits = os.path.join(out_dir_cutouts, f"{base_stem}_cutout.fits")
-    else:
-        out_fits = f"{out_prefix}_cutout.fits"
-    hdr = wcs_cut.to_header()
-    hdr["BUNIT"] = "JY/BEAM"
-    hdr["COMMENT"] = "Detection cutout frame from periodicity search"
-    if ra_hms and dec_dms:
-        hdr["OBJRA"] = str(ra_hms)
-        hdr["OBJDEC"] = str(dec_dms)
-    hdr["SRCNAME"] = str(srcname)
-    hdr["SNR"] = float(snr_val)
-    hdr["PERIOD"] = float(period_s)
-    hdr["FREQ_HZ"] = float(f_hz)
-    hdr["DM"] = float(dm_val)
-    hdr["WIDTH"] = int(width_bins)
-    hdr["CDELT1"] = float(wcs_cut.wcs.cdelt[0])
-    hdr["CDELT2"] = float(wcs_cut.wcs.cdelt[1])
-    hdr["PC1_1"] = 1.0
-    hdr["PC1_2"] = 0.0
-    hdr["PC2_1"] = 0.0
-    hdr["PC2_2"] = 1.0
-    if getattr(wcs_cut.wcs, "radesys", None):
-        hdr["RADESYS"] = str(wcs_cut.wcs.radesys)
-    fits.writeto(out_fits, cutout_det.astype(np.float32), header=hdr, overwrite=True)
+    # Save Cutout FITS with WCS & metadata if available
+    out_fits = ""
+    if has_cutout and cutout_det is not None and wcs_cut is not None:
+        if out_dir_cutouts:
+            os.makedirs(out_dir_cutouts, exist_ok=True)
+            out_fits = os.path.join(out_dir_cutouts, f"{base_stem}_cutout.fits")
+        else:
+            out_fits = f"{out_prefix}_cutout.fits"
+        hdr = wcs_cut.to_header()
+        hdr["BUNIT"] = "JY/BEAM"
+        hdr["COMMENT"] = "Detection cutout frame from periodicity search"
+        if ra_hms and dec_dms:
+            hdr["OBJRA"] = str(ra_hms)
+            hdr["OBJDEC"] = str(dec_dms)
+        hdr["SRCNAME"] = str(srcname)
+        hdr["SNR"] = float(snr_val)
+        hdr["PERIOD"] = float(period_s)
+        hdr["FREQ_HZ"] = float(f_hz)
+        hdr["DM"] = float(dm_val)
+        hdr["WIDTH"] = int(width_bins)
+        hdr["CDELT1"] = float(wcs_cut.wcs.cdelt[0])
+        hdr["CDELT2"] = float(wcs_cut.wcs.cdelt[1])
+        hdr["PC1_1"] = 1.0
+        hdr["PC1_2"] = 0.0
+        hdr["PC2_1"] = 0.0
+        hdr["PC2_2"] = 1.0
+        if getattr(wcs_cut.wcs, "radesys", None):
+            hdr["RADESYS"] = str(wcs_cut.wcs.radesys)
+        fits.writeto(out_fits, cutout_det.astype(np.float32), header=hdr, overwrite=True)
 
     out_fits_off = ""
-    if cutout_off_det is not None:
+    if has_cutout and cutout_off_det is not None and wcs_cut is not None:
         if out_dir_cutouts:
+            os.makedirs(out_dir_cutouts, exist_ok=True)
             out_fits_off = os.path.join(out_dir_cutouts, f"{base_stem}_cutout_off.fits")
         else:
             out_fits_off = f"{out_prefix}_cutout_off.fits"
@@ -1036,23 +1112,25 @@ def save_periodicity_candidate_summary(
         hdr_full["DM"] = float(dm_val)
         fits.writeto(out_fits_full, fullframe.astype(np.float32), header=hdr_full, overwrite=True)
 
-    # Save 1D Folded Pulse Profile NPZ
-    if out_dir_profiles:
-        os.makedirs(out_dir_profiles, exist_ok=True)
-        out_npz = os.path.join(out_dir_profiles, f"{base_stem}_profile.npz")
-    else:
-        out_npz = f"{out_prefix}_profile.npz"
-    np.savez(
-        out_npz,
-        profile=p_norm.astype(np.float32),
-        period_s=float(period_s),
-        f_hz=float(f_hz),
-        dm=float(dm_val),
-        snr=float(snr_val),
-        srcname=str(srcname),
-        width_bins=int(width_bins),
-        duty_cycle=float(duty_cycle),
-    )
+    # Save 1D Folded Pulse Profile NPZ if available
+    out_npz = ""
+    if has_profile and p_norm is not None:
+        if out_dir_profiles:
+            os.makedirs(out_dir_profiles, exist_ok=True)
+            out_npz = os.path.join(out_dir_profiles, f"{base_stem}_profile.npz")
+        else:
+            out_npz = f"{out_prefix}_profile.npz"
+        np.savez(
+            out_npz,
+            profile=p_norm.astype(np.float32),
+            period_s=float(period_s),
+            f_hz=float(f_hz),
+            dm=float(dm_val),
+            snr=float(snr_val),
+            srcname=str(srcname),
+            width_bins=int(width_bins),
+            duty_cycle=float(duty_cycle),
+        )
 
     return {
         "figure": out_fig,
