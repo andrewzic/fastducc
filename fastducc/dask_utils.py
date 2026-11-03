@@ -196,6 +196,12 @@ def setup_slurm_cluster(
         scheduler_opts["interface"] = interface
 
     # Standard prologue across fastducc transient & periodicity searches
+    scratch_root = os.environ.get("GLOBAL_SCRATCH_DIR") or "/aphid/scratch-3month/azic/lotrun_periodicity"
+    dask_local_scratch = os.path.join(scratch_root, "dask_spill")
+    numba_cache_dir = os.path.join(scratch_root, "numba_cache")
+    astropy_cache_dir = os.path.join(scratch_root, "astropy_cache")
+    mpl_cache_dir = os.path.join(scratch_root, "matplotlib_cache")
+
     prologue = [
         "module load python-scientific/3.11.5-foss-2023b 2>/dev/null || true",
         "unset PYTHONPATH",
@@ -203,13 +209,21 @@ def setup_slurm_cluster(
         f"export OMP_NUM_THREADS={cores_per_worker}",
         "export OPENBLAS_NUM_THREADS=1",
         "export MKL_NUM_THREADS=1",
+        # Keep worker logs and tool caches completely out of home directory
+        f"export DASK_TEMPORARY_DIRECTORY=\"${{JOBFS:-{dask_local_scratch}}}\"",
+        f"export NUMBA_CACHE_DIR=\"${{JOBFS:-{numba_cache_dir}}}\"",
+        f"export ASTROPY_CACHE_DIR=\"${{JOBFS:-{astropy_cache_dir}}}\"",
+        f"export MPLCONFIGDIR=\"${{JOBFS:-{mpl_cache_dir}}}\"",
+        f"export IPYTHONDIR=\"${{JOBFS:-{dask_local_scratch}}}/ipython\"",
     ]
 
-    # Global Dask resilience settings
+    # Global Dask resilience settings and spill storage
     if dask is not None:
+        dask_spill_target = os.environ.get("JOBFS") or dask_local_scratch
         dask.config.set({
             "distributed.scheduler.allowed-failures": int(allowed_failures),
             "distributed.adaptive.target-duration": target_duration,
+            "temporary-directory": dask_spill_target,
         })
 
     # Worker extra arguments and walltime lifetime management
@@ -363,12 +377,16 @@ def get_dask_client(
         if LocalCluster is None:
             raise ImportError("dask.distributed LocalCluster is not available.")
         n_w = min(int(local_workers), max(1, os.cpu_count() or 4))
-        logger.info(f"Launching Dask LocalCluster ({n_w} workers, memory_limit={local_memory_limit})...")
+        scratch_root = os.environ.get("GLOBAL_SCRATCH_DIR") or "/aphid/scratch-3month/azic/lotrun_periodicity"
+        dask_spill_dir = os.environ.get("JOBFS") or os.path.join(scratch_root, "dask_spill")
+        os.makedirs(dask_spill_dir, exist_ok=True)
+        logger.info(f"Launching Dask LocalCluster ({n_w} workers, memory_limit={local_memory_limit}, local_dir={dask_spill_dir})...")
         cluster = LocalCluster(
             n_workers=n_w,
             threads_per_worker=int(threads_per_worker),
             processes=(dask_scheduler == "processes"),
             memory_limit=local_memory_limit,
+            local_directory=dask_spill_dir,
             dashboard_address=":0",
         )
         client = Client(cluster)
