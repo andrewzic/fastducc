@@ -122,10 +122,19 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
     ys = np.array(col("y", -1), dtype=np.int64)
     ls = np.array(col("l"), dtype=float)
     ms = np.array(col("m"), dtype=float)
-    ra_rad = np.array(col("ra_rad"), dtype=float)
-    dec_rad = np.array(col("dec_rad"), dtype=float)
-    ra_deg = np.degrees(ra_rad)
-    dec_deg = np.degrees(dec_rad)
+    if any(c.get("ra_rad") is not None for c in annotated):
+        ra_rad = np.array(col("ra_rad"), dtype=float)
+        ra_deg = np.degrees(ra_rad)
+    else:
+        ra_deg = np.array(col("ra_deg", 0.0), dtype=float)
+        ra_rad = np.radians(ra_deg)
+
+    if any(c.get("dec_rad") is not None for c in annotated):
+        dec_rad = np.array(col("dec_rad"), dtype=float)
+        dec_deg = np.degrees(dec_rad)
+    else:
+        dec_deg = np.array(col("dec_deg", 0.0), dtype=float)
+        dec_rad = np.radians(dec_deg)
     ra_hms = np.array(col("ra_hms", ""), dtype=str)
     dec_dms = np.array(col("dec_dms", ""), dtype=str)
     srcname = np.array(col("srcname", ""), dtype=str)
@@ -163,8 +172,12 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
         "width_bins", "duty_cycle", "sbid", "beam", "scan",
         "downsample_factor", "plan_bins", "effective_time_res", "best_b",
         "cutout_fits", "fullframe_fits", "summary_plot", "profile_npz", "lightcurve_npz",
-        "psrcat_match_name", "psrcat_sep_arcsec", "psrcat_period_s", "psrcat_dm",
-        "racs_match_name", "racs_sep_arcsec", "racs_flux_mjy",
+        "psrcat_match_name", "psrcat_name", "psrcat_sep_arcsec", "psrcat_period_s", "psrcat_p0", "psrcat_dm", "is_psrcat_match",
+        "racs_match_name", "racs_match", "racs_source_name", "racs_sep_arcsec", "racs_flux_mjy", "racs_flux_jy",
+        "n_periods", "n_non_harmonic", "frac_harmonic", "period_dispersion_ratio",
+        "cont_flux_jy", "cont_rms_jy", "cont_snr",
+        "continuum_association", "cand_classification", "candidate_flag",
+        "is_point_like", "is_valid_flux", "morphology_verdict",
     ]
     for opt in optional_cols:
         vals = col(opt, None)

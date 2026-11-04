@@ -1,7 +1,210 @@
-from typing import Tuple, List, Dict, Any, Optional
+from typing import Tuple, List, Dict, Any, Optional, Sequence
 import numpy as np
 
 from scipy.ndimage import maximum_filter
+
+
+def evaluate_candidate_morphology_and_flux(
+    cutout: np.ndarray,
+    cutout_off: Optional[np.ndarray] = None,
+    profile: Optional[np.ndarray] = None,
+    on_bins: Optional[Sequence[int]] = None,
+    off_bins: Optional[Sequence[int]] = None,
+    *,
+    box_size: int = 5,
+    max_hp_lag1: float = 0.25,
+    min_sharpness: float = 0.25,
+    min_on_flux_share: float = 0.40,
+    min_on_snr: float = 2.5,
+) -> Dict[str, Any]:
+    """
+    Evaluates candidate morphology and pulse flux integrity to reject non-point source
+    structures (diffuse blobs, sidelobe ridges, annular rings) and negative off-pulse
+    trough artifacts.
+
+    1. Morphology Filter (Lightweight Unsharp Mask + 2D ACF + Peak Sharpness):
+       - Subtracts local background via uniform_filter (box_size x box_size, O(N)).
+       - Evaluates normalized 2D Autocorrelation Function (ACF) of high-pass residual.
+       - Evaluates peak sharpness (relative drop to 4-connected neighbors).
+       - Passes point sources even if sitting on correlated diffuse background emission.
+
+    2. Flux Integrity Filter (On-to-Detection Flux Share & On-Pulse Significance):
+       - Detects false positives driven purely by deep negative off-pulse baseline troughs
+         where on-pulse flux is noise-like.
+       - Evaluates share of detection flux coming from actual positive on-pulse emission:
+         rho_on = I_on / (I_on - I_off) >= min_on_flux_share
+       - Evaluates empirical on-pulse significance: S_on = I_on / std(I_off) >= min_on_snr
+
+    Parameters
+    ----------
+    cutout : np.ndarray
+        2D candidate detection cutout (or on-pulse cutout), typically 32x32.
+    cutout_off : np.ndarray, optional
+        2D off-pulse cutout for direct off-pulse flux verification.
+    profile : np.ndarray, optional
+        1D folded rotational pulse profile.
+    on_bins : sequence of int, optional
+        Indices of phase bins defining the on-pulse window.
+    off_bins : sequence of int, optional
+        Indices of phase bins defining the off-pulse window.
+    box_size : int, optional
+        Size of smoothing kernel for unsharp mask (default: 5).
+    max_hp_lag1 : float, optional
+        Maximum allowed ACF Lag-1 correlation on high-pass residual (default: 0.25).
+    min_sharpness : float, optional
+        Minimum allowed peak sharpness relative drop (default: 0.25).
+    min_on_flux_share : float, optional
+        Minimum fraction of detection flux coming from on-pulse (default: 0.40).
+    min_on_snr : float, optional
+        Minimum on-pulse significance in units of off-pulse std (default: 2.5).
+
+    Returns
+    -------
+    dict:
+        {
+            "is_point_like": bool,
+            "is_valid_flux": bool,
+            "passed_all": bool,
+            "hp_lag1": float,
+            "hp_lag2": float,
+            "sharpness": float,
+            "on_flux_share": float,
+            "on_snr": float,
+            "rejection_reasons": List[str],
+        }
+    """
+    from scipy.ndimage import uniform_filter
+
+    reasons: List[str] = []
+    cut = np.asarray(cutout, dtype=np.float64)
+
+    # Defaults
+    hp_lag1 = 0.0
+    hp_lag2 = 0.0
+    sharpness = 1.0
+    is_point_like = True
+
+    if cut.ndim == 2 and cut.size >= 16:
+        ny, nx = cut.shape
+        cy, cx = ny // 2, nx // 2
+        
+        # 1. Peak sharpness at central candidate position
+        y_min, y_max = max(0, cy - 1), min(ny - 1, cy + 1)
+        x_min, x_max = max(0, cx - 1), min(nx - 1, cx + 1)
+        neighbors = [cut[y_min, cx], cut[y_max, cx], cut[cy, x_min], cut[cy, x_max]]
+        peak_val = cut[cy, cx]
+        if peak_val > 0:
+            sharpness = float((peak_val - np.mean(neighbors)) / peak_val)
+        else:
+            sharpness = 0.0
+
+        # 2. Unsharp Mask: subtract local background
+        bg = uniform_filter(cut, size=box_size, mode="nearest")
+        hp = cut - bg
+
+        # 3. 2D ACF of high-pass residual via FFT
+        hp_sub = hp - np.mean(hp)
+        var = np.sum(hp_sub**2)
+        if var > 0:
+            f = np.fft.fft2(hp_sub)
+            acf = np.fft.ifft2(np.abs(f)**2).real
+            acf = np.fft.fftshift(acf) / var
+            mid_y, mid_x = acf.shape[0] // 2, acf.shape[1] // 2
+
+            l1_vals = [acf[mid_y + 1, mid_x], acf[mid_y - 1, mid_x], acf[mid_y, mid_x + 1], acf[mid_y, mid_x - 1]]
+            hp_lag1 = float(np.mean(l1_vals))
+
+            if acf.shape[0] >= 5 and acf.shape[1] >= 5:
+                l2_vals = [acf[mid_y + 2, mid_x], acf[mid_y - 2, mid_x], acf[mid_y, mid_x + 2], acf[mid_y, mid_x - 2]]
+                hp_lag2 = float(np.mean(l2_vals))
+            else:
+                hp_lag2 = 0.0
+        else:
+            hp_lag1 = 0.0
+            hp_lag2 = 0.0
+
+        # Morphology decision
+        if hp_lag1 > max_hp_lag1:
+            is_point_like = False
+            reasons.append(f"Extended ACF (HP Lag-1 = {hp_lag1:.3f} > {max_hp_lag1:.2f})")
+        if sharpness < min_sharpness:
+            is_point_like = False
+            reasons.append(f"Flat peak morphology (Sharpness = {sharpness:.3f} < {min_sharpness:.2f})")
+
+    # 4. Flux Integrity Check (Pulse Profile or Cutouts)
+    is_valid_flux = True
+    on_flux_share = 1.0
+    on_snr = 10.0
+
+    if profile is not None and len(profile) >= 4:
+        prof = np.asarray(profile, dtype=np.float64)
+        nbins = len(prof)
+        if on_bins is None:
+            b_peak = int(np.argmax(prof))
+            on_bins = [b_peak]
+        if off_bins is None:
+            off_bins = [b for b in range(nbins) if b not in on_bins]
+
+        on_flux = float(np.mean(prof[on_bins]))
+        off_vals = prof[off_bins]
+        off_flux = float(np.mean(off_vals))
+        off_std = float(np.std(off_vals)) if len(off_vals) > 1 else 1.0
+        if off_std <= 0:
+            off_std = 1.0
+
+        det_flux = on_flux - off_flux
+        if det_flux > 0:
+            on_flux_share = float(on_flux / det_flux)
+        else:
+            on_flux_share = 0.0
+        on_snr = float(on_flux / off_std)
+
+        if on_flux_share < min_on_flux_share:
+            is_valid_flux = False
+            reasons.append(f"Negative off-pulse trough artifact (On-share = {on_flux_share:.2f} < {min_on_flux_share:.2f})")
+        if on_snr < min_on_snr:
+            is_valid_flux = False
+            reasons.append(f"Insignificant on-pulse flux (On-SNR = {on_snr:.2f} < {min_on_snr:.2f})")
+
+    elif cutout_off is not None and cutout_off.shape == cut.shape:
+        # Evaluate via on-pulse and off-pulse cutouts if profile is not provided
+        c_off = np.asarray(cutout_off, dtype=np.float64)
+        cy, cx = cut.shape[0] // 2, cut.shape[1] // 2
+        on_flux = float(cut[cy, cx])
+        off_flux = float(c_off[cy, cx])
+        # Off-pulse std from image annulus/outer pixels
+        off_std = float(np.std(c_off)) if c_off.size > 1 else 1.0
+        if off_std <= 0:
+            off_std = 1.0
+
+        det_flux = on_flux - off_flux
+        if det_flux > 0:
+            on_flux_share = float(on_flux / det_flux)
+        else:
+            on_flux_share = 0.0
+        on_snr = float(on_flux / off_std)
+
+        if on_flux_share < min_on_flux_share:
+            is_valid_flux = False
+            reasons.append(f"Negative off-pulse trough artifact (On-share = {on_flux_share:.2f} < {min_on_flux_share:.2f})")
+        if on_snr < min_on_snr:
+            is_valid_flux = False
+            reasons.append(f"Insignificant on-pulse flux (On-SNR = {on_snr:.2f} < {min_on_snr:.2f})")
+
+    passed_all = is_point_like and is_valid_flux
+
+    return {
+        "is_point_like": is_point_like,
+        "is_valid_flux": is_valid_flux,
+        "passed_all": passed_all,
+        "hp_lag1": hp_lag1,
+        "hp_lag2": hp_lag2,
+        "sharpness": sharpness,
+        "on_flux_share": on_flux_share,
+        "on_snr": on_snr,
+        "rejection_reasons": reasons,
+    }
+
 
 def is_zero_flux_candidate(
     det: Dict[str, Any],

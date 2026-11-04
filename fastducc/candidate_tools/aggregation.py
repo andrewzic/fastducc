@@ -43,7 +43,7 @@ from fastducc.candidate_tools.utils import (
     _split_list_int,
 )
 from fastducc.candidate_tools.clustering import _cluster_indices_by_sky
-from fastducc.candidate_tools.catalogs import annotate_observation_with_catalogs
+from fastducc.candidate_tools.catalogues import annotate_observation_with_catalogues, annotate_observation_with_catalogs
 from fastducc.candidate_tools.regions import write_obs_region_files
 from fastducc.candidate_tools.organization import organize_candidate_outputs
 

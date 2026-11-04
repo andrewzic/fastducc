@@ -1,19 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Compatibility alias for candidate_tools.catalogues.
+All functions and exports have been consolidated into `fastducc.candidate_tools.catalogues`.
 """
-from fastducc.candidate_tools.catalogues import (
-    _load_psrcat_csv,
-    _load_racs_votable,
-    _nearest_within_radius,
-    annotate_observation_with_catalogues,
-    annotate_observation_with_catalogs,
-)
-
-__all__ = [
-    "_load_psrcat_csv",
-    "_load_racs_votable",
-    "_nearest_within_radius",
-    "annotate_observation_with_catalogues",
-    "annotate_observation_with_catalogs",
-]
+from fastducc.candidate_tools.catalogues import *  # noqa: F401, F403
+from fastducc.candidate_tools.catalogues import __all__  # noqa: F401

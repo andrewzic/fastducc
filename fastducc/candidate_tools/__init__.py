@@ -43,6 +43,12 @@ from fastducc.candidate_tools.clustering import (
     _time_groups,
     _cluster_indices_by_sky,
 )
+from fastducc.candidate_tools.classifier import (
+    evaluate_cluster_harmonic_structure,
+    sample_local_continuum_flux,
+    find_beam_continuum_image,
+    classify_candidate,
+)
 from fastducc.candidate_tools.regions import (
     write_obs_region_files,
 )

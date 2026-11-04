@@ -378,6 +378,33 @@ def save_candidate_summary(
 
     srcname = candidate.get("srcname", "—")
 
+    # Evaluate transient candidate morphology and lightcurve flux integrity
+    morph_res = None
+    if cutout_det is not None and cutout_det.size > 0:
+        try:
+            from fastducc.filters import evaluate_candidate_morphology_and_flux
+            on_bins_t = None
+            if "t0_idx" in candidate:
+                on_bins_t = list(range(int(candidate["t0_idx"]), int(candidate.get("t1_idx_excl", int(candidate["t0_idx"]) + w))))
+            morph_res = evaluate_candidate_morphology_and_flux(
+                cutout=cutout_det,
+                profile=lc_full,
+                on_bins=on_bins_t,
+            )
+        except Exception as e:
+            logger.debug(f"Could not compute transient morphology metrics: {e}")
+
+    morph_str = ""
+    if morph_res is not None:
+        status_pt = "Pass" if morph_res["is_point_like"] else "FAIL (Extended)"
+        status_flx = "Pass" if morph_res["is_valid_flux"] else "FAIL (Neg Trough)"
+        morph_str = (
+            f"\nMorphology: {status_pt}\n"
+            f"  HP Lag-1: {morph_res['hp_lag1']:.3f} | Sharp: {morph_res['sharpness']:.2f}\n"
+            f"Flux Quality: {status_flx}\n"
+            f"  On-Share: {morph_res['on_flux_share']:.2f} | On-SNR: {morph_res['on_snr']:.1f}"
+        )
+
     txt = (
         f"Name: {srcname}\n"
         f"Field: {field}\n"
@@ -396,6 +423,7 @@ def save_candidate_summary(
         f"wsclean: {wsclean_interval}\n"
         f"CASA timerange:\n"
         f"{casa_timerange}"
+        f"{morph_str}"
     )
 
     box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
@@ -822,6 +850,24 @@ def save_periodicity_candidate_summary(
             except Exception as e:
                 logger.debug(f"Could not load continuum cutout: {e}")
 
+    # Evaluate candidate morphology and pulse flux integrity metrics
+    morph_res = None
+    if cutout_det is not None:
+        try:
+            from fastducc.filters import evaluate_candidate_morphology_and_flux
+            on_bins_list = None
+            if has_profile and p_raw is not None:
+                peak_b = int(candidate.get("best_b", np.argmax(p_raw)))
+                on_bins_list = [(peak_b + offset) % len(p_raw) for offset in range(width_bins)]
+            morph_res = evaluate_candidate_morphology_and_flux(
+                cutout=cutout_det,
+                cutout_off=cutout_off_det,
+                profile=p_raw if has_profile else None,
+                on_bins=on_bins_list,
+            )
+        except Exception as e:
+            logger.debug(f"Could not compute morphology and flux metrics: {e}")
+
     # Build GridSpec figure: 4 columns if off-pulse cutout is available, else 3
     base_stem = os.path.basename(out_prefix)
     has_off = cutout_off_det is not None
@@ -1009,7 +1055,20 @@ def save_periodicity_candidate_summary(
         racs_match = candidate.get("racs_match_name", candidate.get("racs_name", ""))
         racs_sep = candidate.get("racs_sep_arcsec")
         racs_str = f"{racs_match} ({float(racs_sep):.1f}\")" if racs_match and racs_sep is not None else (racs_match or "None")
-    
+
+        # Morphology & Flux Quality Status
+        if morph_res is not None:
+            status_pt = "Pass" if morph_res["is_point_like"] else "FAIL (Extended)"
+            status_flx = "Pass" if morph_res["is_valid_flux"] else "FAIL (Neg Trough)"
+            morph_str = (
+                f"\nMorphology: {status_pt}\n"
+                f"  HP Lag-1: {morph_res['hp_lag1']:.3f} | Sharp: {morph_res['sharpness']:.2f}\n"
+                f"Flux Quality: {status_flx}\n"
+                f"  On-Share: {morph_res['on_flux_share']:.2f} | On-SNR: {morph_res['on_snr']:.1f}"
+            )
+        else:
+            morph_str = ""
+
         txt = (
             f"Name: {srcname}\n"
             f"Field: {field}\n"
@@ -1027,6 +1086,7 @@ def save_periodicity_candidate_summary(
             f"Method: {method}\n"
             f"PSRCAT: {psrcat_str}\n"
             f"RACS: {racs_str}"
+            f"{morph_str}"
         )
     
         box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
