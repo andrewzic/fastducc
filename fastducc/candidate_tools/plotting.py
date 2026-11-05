@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import os
+import re
 import glob
 import logging
 import subprocess
 import socket
 import getpass
 import datetime
-from typing import Dict, Any, Optional
+import textwrap
+from pathlib import Path
+from typing import Dict, Any, Optional, Union, List
 
 import numpy as np
 
@@ -17,7 +20,7 @@ matplotlib.use('Agg')
 
 logger = logging.getLogger(__name__)
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 from matplotlib.offsetbox import AnchoredText
 from matplotlib.animation import FuncAnimation, PillowWriter
 
@@ -39,6 +42,53 @@ from fastducc.filters import is_zero_flux_candidate
 from fastducc import kernels
 from fastducc.candidate_tools.utils import parse_candidate_filename
 from fastducc.candidate_tools.snippets import compute_candidate_local_rms
+
+
+def wrap_candidate_metadata_text(text: str, max_width: int = 33) -> str:
+    """Wrap candidate summary metadata text cleanly so that no line exceeds max_width."""
+    lines = []
+    for raw_line in text.split("\n"):
+        raw_line_s = raw_line.rstrip()
+        if not raw_line_s:
+            lines.append("")
+            continue
+        if len(raw_line_s) <= max_width:
+            lines.append(raw_line_s)
+            continue
+        # Special handling for CASA timerange line (with ~)
+        if "~" in raw_line_s:
+            t0, t1 = raw_line_s.split("~", 1)
+            lines.append(f"  {t0.strip()} ~")
+            lines.append(f"  {t1.strip()}")
+            continue
+        # Check if line has a key: value structure
+        if ":" in raw_line_s and not raw_line_s.startswith(" "):
+            parts = raw_line_s.split(":", 1)
+            k = parts[0].strip() + ":"
+            v = parts[1].strip()
+            if len(k) + 1 + len(v) <= max_width:
+                lines.append(f"{k} {v}")
+                continue
+            lines.append(k)
+            # Special handling for coordinates
+            if " " in v and any(c in v for c in ("h", "d", "m", "s", ":")):
+                v_parts = v.split()
+                if len(v_parts) == 2:
+                    lines.append(f"  {v_parts[0]}")
+                    lines.append(f"  {v_parts[1]}")
+                    continue
+            v_spaced = v.replace(".", ". ").replace("_", "_ ")
+            wrapped = textwrap.wrap(v_spaced, width=max_width - 2, break_long_words=True)
+            for w in wrapped:
+                lines.append("  " + w.replace(". ", ".").replace("_ ", "_"))
+        else:
+            indent = "  " if raw_line_s.startswith(" ") else ""
+            content = raw_line_s.strip()
+            content_spaced = content.replace(".", ". ").replace("_", "_ ")
+            wrapped = textwrap.wrap(content_spaced, width=max_width - len(indent), break_long_words=True)
+            for w in wrapped:
+                lines.append(indent + w.replace(". ", ".").replace("_ ", "_"))
+    return "\n".join(lines)
 
 
 def save_candidate_summary(
@@ -243,11 +293,83 @@ def save_candidate_summary(
     else:
         mjd_tag = ""
     out_fig = f"{out_prefix}{mjd_tag}_summary.pdf"
-    fig = plt.figure(figsize=(18, 12), dpi=dpi)
-    gs = GridSpec(
-        nrows=2, ncols=3, figure=fig,
-        height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0],
-    )
+
+    # Dynamic spectrum integration: check candidate dict, kwargs, or disk
+    dynspec_obj = candidate.get("dynspec") or kwargs.get("dynspec")
+    ds_path_val = candidate.get("ds_path") or kwargs.get("ds_path")
+    if dynspec_obj is None and ds_path_val is None:
+        src_name = candidate.get("srcname", "")
+        patterns = [
+            f"{out_prefix}.ds",
+            f"{out_prefix}_cand_{src_name}.ds",
+            f"{out_prefix}_dynspec.ds",
+        ]
+        parent_dir = os.path.dirname(out_prefix)
+        if parent_dir and src_name:
+            patterns.extend([
+                os.path.join(parent_dir, f"*{src_name}*.ds"),
+                os.path.join(parent_dir, "dynamic_spectra", f"*{src_name}*.ds"),
+                os.path.join(parent_dir, "..", "dynamic_spectra", f"*{src_name}*.ds"),
+                os.path.join(parent_dir, "..", "candidates", f"*{src_name}*.ds"),
+            ])
+        for p in patterns:
+            matches = glob.glob(p)
+            if matches:
+                ds_path_val = matches[0]
+                break
+
+    has_dynspec = False
+    ds_slice = None
+    ds_t_slice = None
+    ds_freqs = None
+    if dynspec_obj is not None or ds_path_val is not None:
+        try:
+            from fastducc.dynspec import load_dynamic_spectrum_hdf5
+            if dynspec_obj is not None and isinstance(dynspec_obj, dict):
+                ds_dict = dynspec_obj
+            elif ds_path_val is not None and os.path.isfile(str(ds_path_val)):
+                ds_dict = load_dynamic_spectrum_hdf5(ds_path_val)
+            else:
+                ds_dict = None
+
+            if ds_dict is not None and "data" in ds_dict and "freq" in ds_dict:
+                ds_raw_data = np.asarray(ds_dict["data"], dtype=np.float32)
+                ds_freqs = np.asarray(ds_dict["freq"], dtype=np.float64)
+                ds_raw_times = ds_dict.get("time_raw")
+
+                if ds_raw_times is not None and len(ds_raw_times) == ds_raw_data.shape[0] and len(times) > 0:
+                    t_start = times[0]
+                    t_end = times[-1]
+                    idx0 = max(0, int(np.searchsorted(ds_raw_times, t_start)) - 1)
+                    idx1 = min(len(ds_raw_times), int(np.searchsorted(ds_raw_times, t_end)) + 2)
+                    if idx1 > idx0:
+                        ds_slice = ds_raw_data[idx0:idx1, :]
+                        ds_t_slice = ds_raw_times[idx0:idx1] - t_start
+                    else:
+                        ds_slice = ds_raw_data
+                        ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
+                else:
+                    ds_slice = ds_raw_data
+                    ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
+
+                if ds_slice is not None and ds_slice.size > 0:
+                    has_dynspec = True
+        except Exception as e:
+            logger.debug(f"Could not load dynamic spectrum for summary plot: {e}")
+
+    if has_dynspec:
+        fig = plt.figure(figsize=(18, 12.5), dpi=dpi)
+        gs = GridSpec(
+            nrows=3, ncols=3, figure=fig,
+            height_ratios=[1.0, 0.96, 0.80], width_ratios=[1.0, 1.0, 0.95],
+            hspace=0.28, wspace=0.20,
+        )
+    else:
+        fig = plt.figure(figsize=(18, 12), dpi=dpi)
+        gs = GridSpec(
+            nrows=2, ncols=3, figure=fig,
+            height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0],
+        )
 
     if cont_wcs is not None:
         ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
@@ -326,7 +448,10 @@ def save_candidate_summary(
     else:
         ax_cut.set_title(f"Cutout @ {det_time_str}")
 
-    ax_txt = fig.add_subplot(gs[1, 2])
+    if has_dynspec:
+        ax_txt = fig.add_subplot(gs[1:3, 2])
+    else:
+        ax_txt = fig.add_subplot(gs[1, 2])
     ax_txt.set_axis_off()
 
     ra_hms = candidate.get("ra_hms", None)
@@ -426,11 +551,139 @@ def save_candidate_summary(
         f"{morph_str}"
     )
 
-    box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
-    ax_txt.add_artist(box)
-    ax_txt.set_title("Summary", pad=12)
+    if has_dynspec:
+        f_min_ds = float(ds_freqs[0]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
+        f_max_ds = float(ds_freqs[-1]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
+        if ds_path_val:
+            ds_name = Path(ds_path_val).name
+            txt += f"\nDynamic Spectrum:\n  {ds_name}\n  ({len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz)"
+        wrapped_txt = wrap_candidate_metadata_text(txt, max_width=33)
+        ax_txt.text(
+            0.03, 0.98, wrapped_txt,
+            transform=ax_txt.transAxes,
+            va="top", ha="left",
+            fontsize=9.5,
+            linespacing=1.26,
+            bbox=dict(boxstyle="square,pad=0.8", facecolor="#fcfcfc", edgecolor="#bbbbbb", lw=1.2),
+        )
+        ax_txt.set_title("Candidate Summary", pad=8, fontsize=11)
+    else:
+        box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
+        ax_txt.add_artist(box)
+        ax_txt.set_title("Summary", pad=12)
 
-    ax_lc = fig.add_subplot(gs[1, 0:2])
+    if has_dynspec:
+        fig.canvas.draw()
+        fig_w, fig_h = fig.get_size_inches()
+        bbox_ds_area = gs[1, 0:2].get_position(fig)
+        total_w_px = bbox_ds_area.width * fig_w * dpi
+        total_h_px = bbox_ds_area.height * fig_h * dpi
+        h_beam_px = (0.20 / 1.20) * total_h_px
+        w_cbar_px = 24.0
+        pad_cbar_px = 14.0
+        w_ds_spec_total = max(100.0, total_w_px - w_cbar_px - pad_cbar_px)
+        w_spec_px = h_beam_px
+        w_ds_px = max(100.0, w_ds_spec_total - w_spec_px)
+
+        gs_outer = GridSpecFromSubplotSpec(
+            nrows=1, ncols=2,
+            subplot_spec=gs[1, 0:2],
+            width_ratios=[w_ds_spec_total, w_cbar_px],
+            wspace=pad_cbar_px / w_ds_spec_total,
+        )
+
+        gs_inner = GridSpecFromSubplotSpec(
+            nrows=2, ncols=2,
+            subplot_spec=gs_outer[0],
+            height_ratios=[1.0, 0.20],
+            width_ratios=[w_ds_px, w_spec_px],
+            hspace=0.0, wspace=0.0,
+        )
+
+        ax_ds = fig.add_subplot(gs_inner[0, 0])
+        ax_spec = fig.add_subplot(gs_inner[0, 1], sharey=ax_ds)
+        ax_beam_lc = fig.add_subplot(gs_inner[1, 0], sharex=ax_ds)
+        cax = fig.add_subplot(gs_outer[1])
+
+        # Row 2: Main Image-plane Lightcurve matching height and aligned with ax_ds
+        gs_lc_outer = GridSpecFromSubplotSpec(
+            nrows=1, ncols=2,
+            subplot_spec=gs[2, 0:2],
+            width_ratios=[w_ds_spec_total, w_cbar_px],
+            wspace=pad_cbar_px / w_ds_spec_total,
+        )
+        gs_lc_inner = GridSpecFromSubplotSpec(
+            nrows=1, ncols=2,
+            subplot_spec=gs_lc_outer[0],
+            width_ratios=[w_ds_px, w_spec_px],
+            wspace=0.0,
+        )
+        ax_lc = fig.add_subplot(gs_lc_inner[0, 0], sharex=ax_ds)
+
+        # Downsample dynamic spectrum for display according to candidate detection width W
+        ds_disp = ds_slice
+        t_bin = max(1, w // 4)
+        f_bin = t_bin
+        if (t_bin > 1 or f_bin > 1) and ds_slice.ndim == 2:
+            Nt, Nf = ds_slice.shape
+            Nt_trim = (Nt // t_bin) * t_bin
+            Nf_trim = (Nf // f_bin) * f_bin
+            if Nt_trim > 0 and Nf_trim > 0:
+                sub = ds_slice[:Nt_trim, :Nf_trim]
+                ds_disp = np.nanmean(
+                    sub.reshape(Nt_trim // t_bin, t_bin, Nf_trim // f_bin, f_bin),
+                    axis=(1, 3)
+                )
+
+        vmin_ds, vmax_ds = np.nanpercentile(ds_disp, [5.0, 99.5])
+        t_min_ds = float(ds_t_slice[0])
+        t_max_ds = float(ds_t_slice[-1])
+        f_min_ds = float(ds_freqs[0])
+        f_max_ds = float(ds_freqs[-1])
+        im_ds = ax_ds.imshow(
+            ds_disp.T,
+            origin="lower",
+            aspect="auto",
+            extent=[t_min_ds, t_max_ds, f_min_ds, f_max_ds],
+            cmap=cmap,
+            vmin=vmin_ds,
+            vmax=vmax_ds,
+        )
+        ax_ds.set_ylabel("Frequency (MHz)", fontsize=10)
+        ax_ds.set_title("Dynamic spectrum", fontsize=11, fontweight="normal")
+        if np.isfinite(det_time):
+            t_det_rel = det_time - times[0]
+            if t_min_ds <= t_det_rel <= t_max_ds:
+                ax_ds.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85, label="Det Time")
+                if cand_dm > 0:
+                    nu_top = max(f_min_ds, f_max_ds)
+                    f_eval = np.linspace(min(f_min_ds, f_max_ds), nu_top, 100)
+                    dt_sweep = 4.1488e3 * cand_dm * (f_eval**(-2) - nu_top**(-2))
+                    ax_ds.plot(t_det_rel + dt_sweep, f_eval, color="gold", ls=":", lw=1.5, alpha=0.9, label=f"DM={cand_dm:.1f} track")
+        ax_ds.tick_params(labelbottom=False, bottom=False)
+
+        cb_ds = fig.colorbar(im_ds, cax=cax, orientation="vertical")
+        cb_ds.set_label("Flux density (Jy)", fontsize=9)
+
+        # Time-averaged spectrum to the right of imshow (wspace=0)
+        beam_spec = np.nanmean(ds_slice, axis=0)
+        ax_spec.plot(beam_spec, ds_freqs, color="indigo", lw=1.2)
+        ax_spec.tick_params(labelleft=False, left=False)
+        ax_spec.set_xlabel("Mean (Jy)", fontsize=8)
+        ax_spec.grid(True, alpha=0.3)
+
+        # Frequency-averaged lightcurve below imshow (hspace=0)
+        beam_lc = np.nanmean(ds_slice, axis=1) * 1000.0  # mJy
+        ax_beam_lc.plot(ds_t_slice, beam_lc, color="teal", lw=1.2)
+        if np.isfinite(det_time):
+            t_det_rel = det_time - times[0]
+            if t_min_ds <= t_det_rel <= t_max_ds:
+                ax_beam_lc.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85)
+        ax_beam_lc.set_ylabel("Beamformed\n(mJy)", fontsize=8)
+        ax_beam_lc.tick_params(labelbottom=False)
+        ax_beam_lc.grid(True, alpha=0.3)
+    else:
+        ax_lc = fig.add_subplot(gs[1, 0:2])
     if method.lower() == "variance" and var_highpass_cutoff_sec > 0:
         lc_filtered = np.empty_like(lc_full)
         ema = np.nanmean(lc_full)
@@ -1203,3 +1456,661 @@ def save_periodicity_candidate_summary(
         "profile_npz": out_npz,
         "lightcurve_npz": out_npz,
     }
+
+
+def update_candidate_summary_with_dynspec(
+    summary_plot_path: Union[str, Path],
+    ds_path: Union[str, Path],
+    out_path: Optional[Union[str, Path]] = None,
+    candidate_info: Optional[Dict[str, Any]] = None,
+    dpi: int = 200,
+    cmap: str = "viridis",
+) -> Path:
+    """
+    Update an existing transient candidate summary plot to incorporate a dynamic spectrum waterfall.
+
+    Locates the candidate's existing cutout FITS, fullframe FITS, lightcurve NPZ, and uses
+    the provided .ds file to re-render the comprehensive 3-row diagnostic summary plot
+    (Continuum | Full Frame | Cutout // Dynamic Spectrum Waterfall // Lightcurve // Metadata).
+
+    Parameters
+    ----------
+    summary_plot_path : str or Path
+        Path to the existing summary PDF (e.g. *cand_*_summary.pdf).
+    ds_path : str or Path
+        Path to the .ds dynamic spectrum file.
+    out_path : str or Path, optional
+        Destination path for the updated plot. If omitted, overwrites summary_plot_path.
+    candidate_info : dict, optional
+        Dictionary of candidate metadata (e.g. snr, dm, sbid, beam, scan, field, srcname).
+    dpi : int, default 200
+        Figure DPI resolution.
+    cmap : str, default "viridis"
+        Colormap name.
+
+    Returns
+    -------
+    Path
+        Path to the updated summary PDF file.
+    """
+    from fastducc.dynspec import load_dynamic_spectrum_hdf5
+
+    summary_plot_path = Path(summary_plot_path).resolve()
+    ds_path = Path(ds_path).resolve()
+    if not ds_path.is_file():
+        raise FileNotFoundError(f"Dynamic spectrum file not found: {ds_path}")
+
+    if out_path is None:
+        out_path = summary_plot_path
+    else:
+        out_path = Path(out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Load dynamic spectrum
+    ds_dict = load_dynamic_spectrum_hdf5(ds_path)
+    ds_raw_data = np.asarray(ds_dict["data"], dtype=np.float32)
+    ds_freqs = np.asarray(ds_dict["freq"], dtype=np.float64)
+    ds_raw_times = ds_dict.get("time_raw")
+
+    # 2. Discover candidate artefacts (cutout, fullframe, lightcurve)
+    pdir = summary_plot_path.parent
+    base_stem = summary_plot_path.name.replace("_summary.pdf", "").replace("_summary.png", "")
+
+    # Parse metadata from filename using parse_candidate_filename and regex
+    meta = parse_candidate_filename(summary_plot_path.name)
+    field = meta.get("field", "") if isinstance(meta, dict) else ""
+    sbid = meta.get("sbid", "") if isinstance(meta, dict) else ""
+    beam = meta.get("beam", "") if isinstance(meta, dict) else ""
+    scan = meta.get("scan_id", "") if isinstance(meta, dict) else ""
+    meta_dm = float(meta.get("dm", 0.0)) if isinstance(meta, dict) and meta.get("dm") else 0.0
+
+    # Parse candidate identifiers from filename
+    cand_name_match = re.search(r'(cand_[^._]+)', base_stem)
+    cand_sub = cand_name_match.group(1) if cand_name_match else base_stem
+    cand_id_clean = cand_sub.replace("cand_", "")
+    chunk_match = re.search(r'(chunk_\d+)', base_stem)
+    chunk_tag = chunk_match.group(1) if chunk_match else ""
+    scan_match = re.search(r'(scan_[^._]+)', base_stem)
+    if scan_match and not scan:
+        scan = scan_match.group(1).replace("scan_", "")
+    width_match = re.search(r'_w(\d+)', base_stem)
+    width_str = width_match.group(1) if width_match else "—"
+
+    # Method
+    if "_var_" in base_stem:
+        method = "variance"
+    elif "_boxcar_" in base_stem:
+        method = "boxcar"
+    elif "_periodicity_" in base_stem:
+        method = "periodicity"
+    else:
+        method = meta.get("kind", "transient") if isinstance(meta, dict) else "transient"
+
+    # MJD / Detection time
+    mjd_match = re.search(r'MJD(\d+\.\d+)', base_stem)
+    if mjd_match:
+        mjd_val = float(mjd_match.group(1))
+        det_time = mjd_val * 86400.0
+        det_time_str = f"{mjd_val:.7f} MJD"
+        imjd = str(int(mjd_val))
+    else:
+        det_time = np.nan
+        det_time_str = "—"
+        imjd = "—"
+
+    # Targeted lookups for auxiliary files without slow broad directory scans
+    cutout_path = None
+    for cdir in [pdir / ".." / "cutouts", pdir / "cutouts", pdir]:
+        if cdir.is_dir():
+            cands = list(cdir.glob(f"*{base_stem}*cutout.fits")) or list(cdir.glob(f"*{cand_sub}*cutout.fits"))
+            if cands:
+                cutout_path = cands[0]
+                break
+
+    fullframe_path = None
+    for fdir in [pdir / ".." / "fullframes", pdir / "fullframes", pdir]:
+        if fdir.is_dir():
+            cands = list(fdir.glob(f"*{base_stem}*fullframe.fits")) or list(fdir.glob(f"*{cand_sub}*fullframe.fits"))
+            if cands:
+                fullframe_path = cands[0]
+                break
+
+    # Look for lightcurve files (both raw/full and boxcar smoothed)
+    lc_path = None
+    lc_sm_path = None
+    w_int = int(width_str) if (width_str and width_str.isdigit()) else 1
+
+    lc_patterns = []
+    if scan and chunk_tag and width_match:
+        lc_patterns.append(f"*{scan}*{chunk_tag}*{cand_sub}*{width_match.group(0)}*lc*.npz")
+    if chunk_tag:
+        lc_patterns.append(f"*{chunk_tag}*{cand_sub}*lc*.npz")
+    lc_patterns.extend([
+        f"*{base_stem}*lc_full.npz",
+        f"*{base_stem}*lc*.npz",
+        f"*{cand_sub}*lc_full.npz",
+    ])
+    for ldir in [pdir / ".." / "lightcurves", pdir / "lightcurves", pdir]:
+        if ldir.is_dir():
+            for pat in lc_patterns:
+                cands = list(ldir.glob(pat))
+                if cands:
+                    # Prefer lc_full for raw if present
+                    cands_full = [c for c in cands if "_lc_full.npz" in c.name]
+                    lc_path = cands_full[0] if cands_full else cands[0]
+                    break
+            if lc_path:
+                break
+
+    # Look for precomputed boxcar smoothed lightcurve matching width W
+    if w_int > 1:
+        sm_patterns = [
+            f"*{chunk_tag}*{cand_sub}*w{w_int}*boxcar*w{w_int}.npz",
+            f"*{cand_sub}*w{w_int}*boxcar*w{w_int}.npz",
+            f"*{chunk_tag}*{cand_sub}*boxcar*w{w_int}.npz",
+            f"*w{w_int}*boxcar*w{w_int}.npz",
+        ]
+        for ldir in [pdir / ".." / "lightcurves", pdir / "lightcurves", pdir]:
+            if ldir.is_dir():
+                for pat in sm_patterns:
+                    cands = list(ldir.glob(pat))
+                    if cands:
+                        lc_sm_path = cands[0]
+                        break
+                if lc_sm_path:
+                    break
+
+    # Look for continuum image in continuum_images directory (under SBID or parent tree)
+    cont_path = None
+    beam_tag = beam if (beam and "beam" in beam) else f"beam{beam}" if beam else ""
+    cont_search_dirs = [
+        pdir / ".." / ".." / ".." / "continuum_images",
+        pdir / ".." / ".." / ".." / "cont_combined",
+        pdir / ".." / ".." / "continuum_images",
+        pdir / ".." / "continuum_images",
+    ]
+    if sbid:
+        cont_search_dirs.extend([
+            Path("/fred/oz451/azic/data") / sbid / "continuum_images",
+            Path("/fred/oz451/azic/data") / sbid / "cont_combined",
+            Path("/fred/oz451/azic/data") / f"SB{sbid}" / "continuum_images",
+        ])
+    for cdir in cont_search_dirs:
+        try:
+            cdir_res = cdir.resolve()
+            if cdir_res.is_dir():
+                matches = []
+                if beam_tag:
+                    matches = sorted(list(cdir_res.glob(f"*{beam_tag}*img-MFS-image.fits"))) or sorted(list(cdir_res.glob(f"*{beam_tag}*.fits")))
+                if not matches:
+                    matches = sorted(list(cdir_res.glob("*img-MFS-image.fits")))
+                if matches:
+                    cont_path = matches[0]
+                    break
+        except Exception:
+            pass
+
+    # Look for candidate table to extract image pixel coordinates (x, y) if present
+    cand_px_x = None
+    cand_px_y = None
+    cand_table_dirs = [pdir / ".." / "catalogs", pdir / "..", pdir, pdir / "catalogs"]
+    for tdir in cand_table_dirs:
+        try:
+            if tdir.resolve().is_dir():
+                csvs = list(tdir.resolve().glob(f"*{cand_sub}*candidate_list.csv")) or list(tdir.resolve().glob("*candidate_list.csv"))
+                if csvs:
+                    import pandas as pd
+                    df_c = pd.read_csv(csvs[0])
+                    if "x" in df_c.columns and "y" in df_c.columns:
+                        for _, row_c in df_c.iterrows():
+                            val_x = row_c["x"]
+                            val_y = row_c["y"]
+                            if np.isfinite(val_x) and np.isfinite(val_y) and val_x < 900000 and val_y < 900000:
+                                cand_px_x = float(val_x)
+                                cand_px_y = float(val_y)
+                                break
+                    if cand_px_x is not None:
+                        break
+        except Exception:
+            pass
+
+    # Read cutout FITS header if available for metadata
+    cut_hdr = {}
+    if cutout_path and cutout_path.is_file():
+        try:
+            with fits.open(cutout_path) as hdul:
+                cut_hdr = dict(hdul[0].header)
+        except Exception:
+            pass
+
+    # Ingest candidate_info overrides if provided
+    cand_info = candidate_info or {}
+    srcname = cand_info.get("srcname") or cand_id_clean
+    if cand_info.get("field"):
+        field = cand_info["field"]
+    if cand_info.get("sbid"):
+        sbid = cand_info["sbid"]
+    if cand_info.get("beam"):
+        beam = cand_info["beam"]
+    if cand_info.get("scan"):
+        scan = cand_info["scan"]
+    if cand_info.get("method"):
+        method = cand_info["method"]
+    if cand_info.get("width"):
+        width_str = str(cand_info["width"])
+
+    cand_dm = float(cand_info.get("dm", 0.0) or ds_dict.get("attrs", {}).get("dm", 0.0) or meta_dm)
+    dm_str = f"{cand_dm:.2f} pc/cm³"
+
+    # SNR resolution: check candidate_info, then cutout header
+    snr_val = cand_info.get("snr", np.nan)
+    if not np.isfinite(snr_val):
+        for k in ("SNR", "MAX_SNR", "DET_SNR"):
+            if k in cut_hdr:
+                try:
+                    snr_val = float(cut_hdr[k])
+                    break
+                except Exception:
+                    pass
+    snr_str = f"{float(snr_val):.2f}" if np.isfinite(snr_val) else "—"
+
+    # Coordinates
+    ra_str = cand_info.get("ra_hms") or cut_hdr.get("OBJRA") or ds_dict.get("ra_str", "")
+    dec_str = cand_info.get("dec_dms") or cut_hdr.get("OBJDEC") or ds_dict.get("dec_str", "")
+    telescope = ds_dict.get("telescope", "ASKAP")
+
+    # Load lightcurve for the detection chunk if available
+    lc_time, lc_flux = None, None
+    if lc_path is not None and lc_path.is_file():
+        try:
+            with np.load(lc_path) as z:
+                lc_time = np.array(z["time"], dtype=np.float64)
+                lc_flux = np.array(z["flux"], dtype=np.float64)
+        except Exception as e:
+            logger.debug(f"Could not load lightcurve NPZ {lc_path}: {e}")
+
+    # Load precomputed smoothed lightcurve or compute boxcar smoothing
+    lc_sm_time, lc_sm_flux = None, None
+    if lc_sm_path is not None and lc_sm_path.is_file():
+        try:
+            with np.load(lc_sm_path) as z:
+                lc_sm_time = np.array(z["time"], dtype=np.float64)
+                lc_sm_flux = np.array(z["flux"], dtype=np.float64)
+        except Exception as e:
+            logger.debug(f"Could not load smoothed lightcurve NPZ {lc_sm_path}: {e}")
+
+    # Fallback: slice a detection chunk (~512 timestamps) from the full-obs dynamic spectrum
+    if lc_time is None or lc_flux is None:
+        if np.isfinite(det_time) and ds_raw_times is not None:
+            det_idx = int(np.searchsorted(ds_raw_times, det_time))
+            half_chunk = 256
+            idx0 = max(0, det_idx - half_chunk)
+            idx1 = min(len(ds_raw_times), det_idx + half_chunk)
+            lc_time = ds_raw_times[idx0:idx1]
+            lc_flux = np.nanmean(ds_raw_data[idx0:idx1, :], axis=1) * 1000.0  # Jy -> mJy
+        elif ds_raw_times is not None and len(ds_raw_times) > 512:
+            lc_time = ds_raw_times[:512]
+            lc_flux = np.nanmean(ds_raw_data[:512, :], axis=1) * 1000.0
+        else:
+            lc_time = np.array(ds_dict["time"], dtype=np.float64)
+            lc_flux = np.nanmean(ds_raw_data, axis=1) * 1000.0
+
+    # If smoothed lightcurve wasn't loaded from disk but w_int > 1, compute boxcar smoothing
+    if (lc_sm_flux is None or len(lc_sm_flux) == 0) and w_int > 1 and len(lc_flux) >= w_int:
+        try:
+            from fastducc import kernels
+            offset = w_int // 2
+            sm_arr, T_eff = kernels._compute_boxcar_1d(lc_flux, w_int)
+            if T_eff > 0:
+                lc_sm_flux = sm_arr
+                lc_sm_time = lc_time[offset:offset + T_eff]
+        except Exception as e:
+            logger.debug(f"Could not compute boxcar smoothing on-the-fly: {e}")
+
+    # 3. Pull detection chunk dynamic spectrum slice out of the full-obs dynamic spectrum
+    t_start = lc_time[0] if len(lc_time) > 0 else 0.0
+    t_end = lc_time[-1] if len(lc_time) > 0 else 1.0
+    rel_times_start = lc_time - t_start
+
+    # CASA timerange
+    if len(lc_time) > 0:
+        try:
+            t_start_obj = Time(t_start / 86400.0, format='mjd', scale='utc')
+            t_end_obj = Time(t_end / 86400.0, format='mjd', scale='utc')
+            casa_start = t_start_obj.iso.replace('-', '/').replace(' ', '/')
+            casa_end = t_end_obj.iso.replace('-', '/').replace(' ', '/')
+            casa_timerange = f"{casa_start}~{casa_end}"
+        except Exception:
+            casa_timerange = "—"
+    else:
+        casa_timerange = "—"
+
+    if ds_raw_times is not None and len(ds_raw_times) == ds_raw_data.shape[0] and len(lc_time) > 0:
+        idx0 = max(0, int(np.searchsorted(ds_raw_times, t_start)) - 1)
+        idx1 = min(len(ds_raw_times), int(np.searchsorted(ds_raw_times, t_end)) + 2)
+        if idx1 > idx0:
+            ds_slice = ds_raw_data[idx0:idx1, :]
+            ds_t_slice = ds_raw_times[idx0:idx1] - t_start
+        else:
+            ds_slice = ds_raw_data
+            ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
+    else:
+        ds_slice = ds_raw_data
+        ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
+
+    # Build 3-tier publication figure with dynamic spectrum & main lightcurve shorter by 20%
+    fig = plt.figure(figsize=(18, 12.5), dpi=dpi)
+    gs_main = GridSpec(
+        nrows=3, ncols=3, figure=fig,
+        height_ratios=[1.0, 0.96, 0.80], width_ratios=[1.0, 1.0, 0.95],
+        hspace=0.28, wspace=0.20,
+    )
+
+    # Resolve sky position SkyCoord for reticles
+    cand_pos = None
+    if ra_str and dec_str and ra_str != "—" and dec_str != "—":
+        try:
+            cand_pos = SkyCoord(ra_str, dec_str, unit=(u.hourangle, u.deg), frame="icrs")
+        except Exception:
+            try:
+                cand_pos = SkyCoord(float(ra_str) * u.deg, float(dec_str) * u.deg, frame="icrs")
+            except Exception:
+                pass
+
+    # Panel (0, 0): Continuum / Reference Field
+    cont_plotted = False
+    if cont_path and cont_path.is_file():
+        try:
+            with fits.open(cont_path) as hdul:
+                cont_raw = np.squeeze(hdul[0].data)
+                cont_w = WCS(hdul[0].header).celestial
+            if cand_pos is not None:
+                from astropy.nddata import Cutout2D
+                c2d = Cutout2D(
+                    data=cont_raw,
+                    position=cand_pos,
+                    size=(50, 50),
+                    wcs=cont_w,
+                    mode="partial",
+                )
+                ax_cont = fig.add_subplot(gs_main[0, 0], projection=c2d.wcs)
+                c_v0, c_v1 = np.nanpercentile(c2d.data, [1.0, 99.8])
+                im_cont = ax_cont.imshow(c2d.data, origin="lower", cmap=cmap, vmin=c_v0, vmax=c_v1)
+                ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
+                ax_cont.set_xlabel("RA (J2000)")
+                ax_cont.set_ylabel("Dec (J2000)")
+                ax_cont.set_aspect("equal", adjustable="box")
+                ax_cont.set_title("Continuum")
+
+                # Reticle on continuum
+                c_rx, c_ry = c2d.wcs.world_to_pixel(cand_pos)
+                ax_cont.plot([c_rx], [c_ry], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+                ax_cont.plot([c_rx], [c_ry], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+
+                cb_c = fig.colorbar(im_cont, ax=ax_cont, orientation="horizontal", fraction=0.046, pad=0.10)
+                cb_c.set_label("Flux density (Jy/beam)")
+                cont_plotted = True
+        except Exception as e:
+            logger.debug(f"Could not load continuum cutout: {e}")
+
+    if not cont_plotted:
+        ax_cont = fig.add_subplot(gs_main[0, 0])
+        ax_cont.set_facecolor("#1e1e1e")
+        ax_cont.text(
+            0.5, 0.5, "CONTINUUM\nN/A",
+            ha="center", va="center", color="silver", weight="bold", fontsize=11,
+            transform=ax_cont.transAxes,
+        )
+        ax_cont.set_title("Continuum / Reference")
+        ax_cont.set_xticks([])
+        ax_cont.set_yticks([])
+
+    # Panel (0, 1): Full-Frame Detection Frame
+    if fullframe_path and fullframe_path.is_file():
+        try:
+            with fits.open(fullframe_path) as hdul:
+                ff_data = np.squeeze(hdul[0].data)
+                ff_wcs = WCS(hdul[0].header).celestial
+            ax_full = fig.add_subplot(gs_main[0, 1], projection=ff_wcs)
+            v0, v1 = np.nanpercentile(ff_data, [1.0, 99.8])
+            im_ff = ax_full.imshow(ff_data, origin="lower", cmap=cmap, vmin=v0, vmax=v1)
+            ax_full.coords.grid(True, color="white", alpha=0.35, ls=":")
+            ax_full.set_xlabel("RA (J2000)")
+            ax_full.set_ylabel("Dec (J2000)")
+            ax_full.set_aspect("equal", adjustable="box")
+            ax_full.set_title("Detection Field of View")
+
+            # Reticle on fullframe: candidate pixel coordinate (x, y)
+            ff_rx, ff_ry = None, None
+            if cand_px_x is not None and cand_px_y is not None:
+                ff_rx, ff_ry = cand_px_x, cand_px_y
+            elif cand_pos is not None:
+                wx, wy = ff_wcs.world_to_pixel(cand_pos)
+                # Check if fullframe WCS Dec is inverted relative to standard imaging convention
+                ff_rx, ff_ry = wx, (ff_data.shape[0] - 1 - wy)
+
+            if ff_rx is not None and ff_ry is not None:
+                ax_full.plot([ff_rx], [ff_ry], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+                ax_full.plot([ff_rx], [ff_ry], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+
+            cb_ff = fig.colorbar(im_ff, ax=ax_full, orientation="horizontal", fraction=0.046, pad=0.10)
+            cb_ff.set_label("Flux density (Jy/beam)")
+        except Exception:
+            ax_full = fig.add_subplot(gs_main[0, 1])
+            ax_full.set_facecolor("#1e1e1e")
+            ax_full.text(0.5, 0.5, "FULL FIELD N/A", ha="center", va="center", color="silver", transform=ax_full.transAxes)
+            ax_full.set_xticks([]); ax_full.set_yticks([])
+    else:
+        ax_full = fig.add_subplot(gs_main[0, 1])
+        ax_full.set_facecolor("#1e1e1e")
+        ax_full.text(0.5, 0.5, "FULL FIELD N/A", ha="center", va="center", color="silver", transform=ax_full.transAxes)
+        ax_full.set_xticks([]); ax_full.set_yticks([])
+
+    # Panel (0, 2): Zoomed Cutout
+    if cutout_path and cutout_path.is_file():
+        try:
+            with fits.open(cutout_path) as hdul:
+                cut_data = np.squeeze(hdul[0].data)
+                cut_wcs = WCS(hdul[0].header).celestial
+            ax_cut = fig.add_subplot(gs_main[0, 2], projection=cut_wcs)
+            v0, v1 = np.nanpercentile(cut_data, [1.0, 99.8])
+            im_cut = ax_cut.imshow(cut_data, origin="lower", cmap=cmap, vmin=v0, vmax=v1)
+            ax_cut.coords.grid(True, color="white", alpha=0.35, ls=":")
+            ax_cut.set_xlabel("RA (J2000)")
+            ax_cut.set_ylabel("Dec (J2000)")
+            ax_cut.set_aspect("equal", adjustable="box")
+            ax_cut.set_title("Candidate Cutout")
+
+            # Reticle on cutout
+            if cand_pos is not None:
+                cut_rx, cut_ry = cut_wcs.world_to_pixel(cand_pos)
+            else:
+                cut_rx, cut_ry = cut_data.shape[1] // 2, cut_data.shape[0] // 2
+            ax_cut.plot([cut_rx], [cut_ry], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+            ax_cut.plot([cut_rx], [cut_ry], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+
+            cb_cut = fig.colorbar(im_cut, ax=ax_cut, orientation="horizontal", fraction=0.046, pad=0.10)
+            cb_cut.set_label("Flux density (Jy/beam)")
+        except Exception:
+            ax_cut = fig.add_subplot(gs_main[0, 2])
+            ax_cut.set_facecolor("#1e1e1e")
+            ax_cut.text(0.5, 0.5, "CUTOUT N/A", ha="center", va="center", color="silver", transform=ax_cut.transAxes)
+            ax_cut.set_xticks([]); ax_cut.set_yticks([])
+    else:
+        ax_cut = fig.add_subplot(gs_main[0, 2])
+        ax_cut.set_facecolor("#1e1e1e")
+        ax_cut.text(0.5, 0.5, "CUTOUT N/A", ha="center", va="center", color="silver", transform=ax_cut.transAxes)
+        ax_cut.set_xticks([]); ax_cut.set_yticks([])
+
+    # Panel (1:3, 2): Tall Full Summary Metadata Box matching top cutout column width
+    f_min_ds = float(ds_freqs[0]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
+    f_max_ds = float(ds_freqs[-1]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
+    ax_txt = fig.add_subplot(gs_main[1:3, 2])
+    ax_txt.set_axis_off()
+    raw_txt = (
+        f"Name: {srcname}\n"
+        f"Field: {field or '—'}\n"
+        f"S/N: {snr_str}\n"
+        f"DM: {dm_str}\n"
+        f"SBID: {sbid or '—'}\n"
+        f"Beam: {beam or '—'}\n"
+        f"Scan: {scan or '—'}\n"
+        f"Coord (J2000): {ra_str} {dec_str}\n"
+        f"iMJD: {imjd}\n"
+        f"Det. time: {det_time_str}\n"
+        f"Method: {method}\n"
+        f"Width: {width_str}\n"
+        f"CASA timerange:\n"
+        f"{casa_timerange}\n"
+        f"Dynamic Spectrum:\n"
+        f"  {ds_path.name}\n"
+        f"  ({len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz | {t_end - t_start:.1f} s)"
+    )
+    wrapped_txt = wrap_candidate_metadata_text(raw_txt, max_width=33)
+    ax_txt.text(
+        0.03, 0.98, wrapped_txt,
+        transform=ax_txt.transAxes,
+        va="top", ha="left",
+        fontsize=9.5,
+        linespacing=1.26,
+        bbox=dict(boxstyle="square,pad=0.8", facecolor="#fcfcfc", edgecolor="#bbbbbb", lw=1.2),
+    )
+    ax_txt.set_title("Candidate Summary", pad=8, fontsize=11)
+
+    # Dynamic spectrum block & lightcurves within gs_main
+    fig.canvas.draw()
+    fig_w, fig_h = fig.get_size_inches()
+    bbox_ds_area = gs_main[1, 0:2].get_position(fig)
+    total_w_px = bbox_ds_area.width * fig_w * dpi
+    total_h_px = bbox_ds_area.height * fig_h * dpi
+    h_beam_px = (0.20 / 1.20) * total_h_px
+    w_cbar_px = 24.0
+    pad_cbar_px = 14.0
+    w_ds_spec_total = max(100.0, total_w_px - w_cbar_px - pad_cbar_px)
+    w_spec_px = h_beam_px
+    w_ds_px = max(100.0, w_ds_spec_total - w_spec_px)
+
+    gs_outer = GridSpecFromSubplotSpec(
+        nrows=1, ncols=2,
+        subplot_spec=gs_main[1, 0:2],
+        width_ratios=[w_ds_spec_total, w_cbar_px],
+        wspace=pad_cbar_px / w_ds_spec_total,
+    )
+
+    gs_inner = GridSpecFromSubplotSpec(
+        nrows=2, ncols=2,
+        subplot_spec=gs_outer[0],
+        height_ratios=[1.0, 0.20],
+        width_ratios=[w_ds_px, w_spec_px],
+        hspace=0.0, wspace=0.0,
+    )
+
+    ax_ds = fig.add_subplot(gs_inner[0, 0])
+    ax_spec = fig.add_subplot(gs_inner[0, 1], sharey=ax_ds)
+    ax_beam_lc = fig.add_subplot(gs_inner[1, 0], sharex=ax_ds)
+    cax = fig.add_subplot(gs_outer[1])
+
+    # Row 2: Main Image-plane Lightcurve matching height and aligned with ax_ds
+    gs_lc_outer = GridSpecFromSubplotSpec(
+        nrows=1, ncols=2,
+        subplot_spec=gs_main[2, 0:2],
+        width_ratios=[w_ds_spec_total, w_cbar_px],
+        wspace=pad_cbar_px / w_ds_spec_total,
+    )
+    gs_lc_inner = GridSpecFromSubplotSpec(
+        nrows=1, ncols=2,
+        subplot_spec=gs_lc_outer[0],
+        width_ratios=[w_ds_px, w_spec_px],
+        wspace=0.0,
+    )
+    ax_lc = fig.add_subplot(gs_lc_inner[0, 0], sharex=ax_ds)
+
+    # Dynamic Spectrum Waterfall (averaged in time by W/4 and frequency by ~W/4)
+    ds_disp = ds_slice
+    t_bin = max(1, w_int // 4)
+    f_bin = t_bin
+    if (t_bin > 1 or f_bin > 1) and ds_slice.ndim == 2:
+        Nt, Nf = ds_slice.shape
+        Nt_trim = (Nt // t_bin) * t_bin
+        Nf_trim = (Nf // f_bin) * f_bin
+        if Nt_trim > 0 and Nf_trim > 0:
+            sub = ds_slice[:Nt_trim, :Nf_trim]
+            ds_disp = np.nanmean(
+                sub.reshape(Nt_trim // t_bin, t_bin, Nf_trim // f_bin, f_bin),
+                axis=(1, 3)
+            )
+
+    vmin_ds, vmax_ds = np.nanpercentile(ds_disp, [5.0, 99.5])
+    t_min_ds = float(ds_t_slice[0])
+    t_max_ds = float(ds_t_slice[-1])
+    f_min_ds = float(ds_freqs[0])
+    f_max_ds = float(ds_freqs[-1])
+    im_ds = ax_ds.imshow(
+        ds_disp.T,
+        origin="lower",
+        aspect="auto",
+        extent=[t_min_ds, t_max_ds, f_min_ds, f_max_ds],
+        cmap=cmap,
+        vmin=vmin_ds,
+        vmax=vmax_ds,
+    )
+    ax_ds.set_ylabel("Frequency (MHz)", fontsize=10)
+    ax_ds.set_title("Dynamic spectrum", fontsize=11, fontweight="normal")
+    if np.isfinite(det_time):
+        t_det_rel = det_time - t_start
+        if t_min_ds <= t_det_rel <= t_max_ds:
+            ax_ds.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85, label="Det Time")
+            if cand_dm > 0:
+                nu_top = max(f_min_ds, f_max_ds)
+                f_eval = np.linspace(min(f_min_ds, f_max_ds), nu_top, 100)
+                dt_sweep = 4.1488e3 * cand_dm * (f_eval**(-2) - nu_top**(-2))
+                ax_ds.plot(t_det_rel + dt_sweep, f_eval, color="gold", ls=":", lw=1.5, alpha=0.9, label=f"DM={cand_dm:.1f} track")
+    ax_ds.tick_params(labelbottom=False, bottom=False)
+
+    # Vertical Colorbar to the right of the dynamic spectrum block
+    cb_ds = fig.colorbar(im_ds, cax=cax, orientation="vertical")
+    cb_ds.set_label("Flux density (Jy)", fontsize=9)
+
+    # Time-averaged spectrum directly adjoining to the right along frequency axis (wspace=0)
+    beam_spec = np.nanmean(ds_slice, axis=0)
+    ax_spec.plot(beam_spec, ds_freqs, color="indigo", lw=1.2)
+    ax_spec.tick_params(labelleft=False, left=False)
+    ax_spec.set_xlabel("Mean (Jy)", fontsize=8)
+    ax_spec.grid(True, alpha=0.3)
+
+    # Frequency-averaged lightcurve directly adjoining below along time axis (hspace=0)
+    beam_lc = np.nanmean(ds_slice, axis=1) * 1000.0  # mJy
+    ax_beam_lc.plot(ds_t_slice, beam_lc, color="teal", lw=1.2)
+    if np.isfinite(det_time):
+        t_det_rel = det_time - t_start
+        if t_min_ds <= t_det_rel <= t_max_ds:
+            ax_beam_lc.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85)
+    ax_beam_lc.set_ylabel("Beamformed\n(mJy)", fontsize=8)
+    ax_beam_lc.tick_params(labelbottom=False)
+    ax_beam_lc.grid(True, alpha=0.3)
+
+    # Main Image-plane Lightcurve below (matching height of image cutouts)
+    ax_lc.plot(rel_times_start, lc_flux, color="tab:blue", lw=1.2, label="Raw", alpha=0.75, zorder=2)
+    if lc_sm_flux is not None and len(lc_sm_flux) > 0 and lc_sm_time is not None and len(lc_sm_time) > 0:
+        rel_sm_start = lc_sm_time - t_start
+        ax_lc.plot(rel_sm_start, lc_sm_flux, color="tab:green", lw=1.6, label=f"Boxcar (w={w_int})", zorder=3)
+    if np.isfinite(det_time):
+        t_det_rel = det_time - t_start
+        if t_min_ds <= t_det_rel <= t_max_ds:
+            ax_lc.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85, zorder=4)
+    ax_lc.set_xlabel("Time from Start (s)", fontsize=10)
+    ax_lc.set_ylabel("Image Flux\n(mJy/beam)", fontsize=9)
+    ax_lc.grid(True, alpha=0.3)
+    ax_lc.legend(loc="upper right", fontsize=8)
+
+    meta_footer = f"Generated with fastducc.dynspec | File: {ds_path.name}"
+    fig.text(0.5, 0.01, meta_footer, ha="center", va="bottom", fontsize=8, color="gray", alpha=0.7)
+
+    fig.savefig(out_path, bbox_inches="tight")
+    # Also save PNG alongside PDF
+    png_path = out_path.with_suffix(".png")
+    fig.savefig(png_path, bbox_inches="tight")
+    plt.close(fig)
+
+    logger.info(f"Updated candidate summary with dynamic spectrum: {out_path} and {png_path}")
+    return out_path

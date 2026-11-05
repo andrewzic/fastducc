@@ -151,6 +151,29 @@ def build_cli_periodicity(argv: Sequence[str] | None = None) -> argparse.Namespa
     return p.parse_args(argv)
 
 
+def build_cli_extract_ds(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """CLI parser for 'fastducc extract_ds'."""
+    p = argparse.ArgumentParser(
+        prog="fastducc extract_ds",
+        description="Extract in-memory phased visibility dynamic spectra from Measurement Set(s) to HDF5 (.ds)",
+    )
+    p.add_argument("--ms", "--msname", dest="ms", default=None, help="Path to Measurement Set")
+    p.add_argument("--out", "-o", dest="out", default=None, help="Output .ds file or directory")
+    p.add_argument("--ra", type=float, default=None, help="Right Ascension in degrees")
+    p.add_argument("--dec", type=float, default=None, help="Declination in degrees")
+    p.add_argument("--cand-id", default=None, help="Candidate identifier")
+    p.add_argument("--dm", type=float, default=0.0, help="Dispersion Measure (pc cm^-3)")
+    p.add_argument("--pol", default="I", help="Polarization to extract ('I', 'XX', 'YY', etc.)")
+    p.add_argument("--datacolumn", default="DATA", help="MS data column (DATA, CORRECTED_DATA)")
+    p.add_argument("--chunk-rows", type=int, default=100000, help="Chunk size for MS streaming (default: 100000)")
+    p.add_argument("--sbid", default=None, help="SBID for full observation batch orchestration (e.g. SB77974)")
+    p.add_argument("--data-root", default=None, help="Root directory holding SBIDs")
+    p.add_argument("--catalogue", default=None, help="Path to candidate catalogue (VOTable or CSV)")
+    p.add_argument("--update-summary-plots", action="store_true", default=True, help="Update candidate summary plots with dynamic spectrum")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
+    return p.parse_args(argv)
+
+
 def _setup_logging(argv: Sequence[str]) -> None:
     """Initialize structured logging once at CLI entry based on verbosity flags."""
     is_verbose = any(arg in argv for arg in ("-v", "--verbose"))
@@ -177,6 +200,7 @@ Available Subcommands:
   aggregate             Aggregate per-beam candidate catalogues across an observation/scan
   aggregate_obs         Aggregate cross-beam super summaries across an SBID observation
   periodicity           3D DUCC NUFFT periodicity search on MS visibilities
+  extract_ds (extract-ds) High-performance in-memory phased visibility dynamic spectrum extraction
 
 Quick Examples:
   fastducc --msname /path/to/MS --chunk-size 512
@@ -185,6 +209,7 @@ Quick Examples:
   fastducc aggregate --obs-root /path/to/SB12345/scan_00
   fastducc aggregate_obs --obs-root /path/to/SB12345
   fastducc periodicity --msname /path/to/MS --fmin 1.0
+  fastducc extract_ds --ms /path/to/MS --ra 260.5 --dec -24.2 --cand-id cand01
 
 Run 'fastducc <command> --help' for detailed options on any command.
 """,
@@ -255,6 +280,82 @@ def run_periodicity(argv: Sequence[str]) -> int:
     return 0
 
 
+def run_extract_ds(argv: Sequence[str]) -> int:
+    """Execute dynamic spectrum extraction via fastducc.dynspec or orchestrator."""
+    from pathlib import Path
+
+    # If full observation orchestration flags are passed, delegate to extract_ds_orchestrator
+    if any(arg.startswith(("--sbid", "--data-root", "--catalogue")) for arg in argv):
+        try:
+            from dstools import extract_ds_orchestrator
+            return extract_ds_orchestrator.main(list(argv))
+        except ImportError:
+            pass
+
+    args = build_cli_extract_ds(list(argv))
+    if args.sbid:
+        from dstools import extract_ds_orchestrator
+        return extract_ds_orchestrator.main(list(argv))
+
+    if not args.ms:
+        logger.error("Either --ms or --sbid is required for dynamic spectrum extraction.")
+        return 1
+
+    from fastducc.dynspec import extract_phased_dynamic_spectra_from_ms, write_dynamic_spectrum_hdf5
+    from fastducc.candidate_tools.plotting import update_candidate_summary_with_dynspec
+
+    ms_path = Path(args.ms)
+    targets = []
+    if args.ra is not None and args.dec is not None:
+        cand_id = args.cand_id or "cand_0"
+        targets.append({"id": cand_id, "ra_deg": args.ra, "dec_deg": args.dec, "dm": args.dm})
+
+    if not targets:
+        logger.error("No targets provided. Specify --ra and --dec, or --catalogue / --sbid.")
+        return 1
+
+    dynspecs = extract_phased_dynamic_spectra_from_ms(
+        ms_path=ms_path,
+        targets=targets,
+        chunk_rows=args.chunk_rows,
+        pol=args.pol,
+        datacolumn=args.datacolumn,
+        verbose=args.verbose,
+    )
+
+    for tgt in targets:
+        c_id = tgt["id"]
+        if c_id not in dynspecs:
+            continue
+        spec = dynspecs[c_id]
+        if args.out:
+            out_p = Path(args.out)
+            if out_p.is_dir() or str(args.out).endswith("/"):
+                out_p.mkdir(parents=True, exist_ok=True)
+                out_file = out_p / f"{c_id}.ds"
+            else:
+                out_file = out_p
+        else:
+            out_file = ms_path.parent / f"{c_id}.ds"
+
+        extra_attrs = {"dm": float(tgt.get("dm", 0.0))}
+        write_dynamic_spectrum_hdf5(spec, out_file, datacolumn=args.datacolumn, attrs=extra_attrs)
+        logger.info(f"Saved dynamic spectrum to {out_file}")
+
+        if args.update_summary_plots:
+            for cand_dir in [out_file.parent, out_file.parent / "plots", out_file.parent.parent / "plots"]:
+                if not cand_dir.is_dir():
+                    continue
+                for plot_file in cand_dir.glob(f"*{c_id}*_summary.pdf"):
+                    try:
+                        update_candidate_summary_with_dynspec(plot_file, out_file)
+                        logger.info(f"Updated candidate summary plot: {plot_file}")
+                    except Exception as e:
+                        logger.warning(f"Failed to update plot {plot_file}: {e}")
+
+    return 0
+
+
 # Subcommand dispatch table
 _SUBCOMMAND_DISPATCH = {
     "search": run_search,
@@ -266,6 +367,9 @@ _SUBCOMMAND_DISPATCH = {
     "aggregate_obs": run_aggregate_obs,
     "aggregate-obs": run_aggregate_obs,
     "periodicity": run_periodicity,
+    "extract_ds": run_extract_ds,
+    "extract-ds": run_extract_ds,
+    "dynspec": run_extract_ds,
 }
 
 

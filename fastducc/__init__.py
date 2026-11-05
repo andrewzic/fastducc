@@ -39,6 +39,7 @@ __all__ = [
     "baseline_ffa",
     "wgridded_nufft",
     "dask_utils",
+    "dynspec",
 ]
 
 __version__ = "0.1.0"
