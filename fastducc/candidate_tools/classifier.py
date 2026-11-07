@@ -56,29 +56,32 @@ def evaluate_cluster_harmonic_structure(
     p0 = float(v_periods[best_idx])
 
     # 2. Group into distinct period trials within tol_frac
-    sorted_p = np.sort(v_periods)
+    sorted_p = np.unique(v_periods)
     distinct_p: List[float] = [float(sorted_p[0])]
+    last_p = float(sorted_p[0])
     for p in sorted_p[1:]:
         p_val = float(p)
-        if abs(p_val - distinct_p[-1]) > tol_frac * max(1e-6, distinct_p[-1]):
+        if abs(p_val - last_p) > tol_frac * max(1e-6, last_p):
             distinct_p.append(p_val)
+            last_p = p_val
 
     n_periods = len(distinct_p)
 
-    def is_harmonic_with_p0(p_cand: float) -> bool:
-        if not (np.isfinite(p_cand) and p_cand > 0 and p0 > 0):
-            return False
-        for k in harmonic_factors:
-            target_h = float(k) * p0
-            if abs(p_cand - target_h) <= tol_frac * target_h:
-                return True
-            target_sh = p0 / float(k)
-            if abs(p_cand - target_sh) <= tol_frac * target_sh:
-                return True
-        return False
+    if p0 > 0 and np.isfinite(p0) and len(harmonic_factors) > 0:
+        factors = np.asarray(harmonic_factors, dtype=np.float64)
+        targets = np.concatenate([p0 * factors, p0 / factors])
+        tols = tol_frac * targets
 
-    n_non_harmonic = sum(1 for dp in distinct_p if not is_harmonic_with_p0(dp))
-    n_harm_detections = sum(1 for p in v_periods if is_harmonic_with_p0(float(p)))
+        dp_arr = np.asarray(distinct_p, dtype=np.float64)
+        dp_is_harm = np.any(np.abs(dp_arr[:, None] - targets[None, :]) <= tols[None, :], axis=1)
+        n_non_harmonic = int(np.sum(~dp_is_harm))
+
+        vp_is_harm = np.any(np.abs(v_periods[:, None] - targets[None, :]) <= tols[None, :], axis=1)
+        n_harm_detections = int(np.sum(vp_is_harm))
+    else:
+        n_non_harmonic = n_periods
+        n_harm_detections = 0
+
     frac_harmonic = float(n_harm_detections / len(v_periods)) if len(v_periods) > 0 else 1.0
     period_dispersion_ratio = float(n_non_harmonic / max(1, n_periods))
 

@@ -58,6 +58,7 @@ class Config:
     filter_ips_agn: bool = True
     ips_snr_ratio_threshold: float = 0.8
     ips_match_radius_arcsec: float = 30.0
+    defer_summary_plots: bool = False
 
 @dataclass
 class WelfordState:

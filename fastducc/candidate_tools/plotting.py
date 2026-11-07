@@ -114,6 +114,7 @@ def save_candidate_summary(
     local_window_size: int = 64,
     rms_full: Optional[np.ndarray] = None,
     mean_cube: Optional[np.ndarray] = None,
+    defer_summary_plots: bool = False,
     **kwargs: Any,
 ) -> Dict[str, str]:
     """
@@ -729,7 +730,8 @@ def save_candidate_summary(
     meta_footer = f"Generated: {gen_time} | Host: {host} | User: {username} | Git: {git_hash}"
     fig.text(0.5, 0.01, meta_footer, ha="center", va="bottom", fontsize=8, color="gray", alpha=0.7)
 
-    fig.savefig(out_fig, bbox_inches="tight")
+    if not defer_summary_plots:
+        fig.savefig(out_fig, bbox_inches="tight")
     plt.close(fig)
 
     out_fits = f"{out_prefix}{mjd_tag}_cutout.fits"
@@ -774,7 +776,8 @@ def save_candidate_summary(
     hdu_full = fits.PrimaryHDU(data=frame_for_display.astype(np.float32), header=hdr_full)
     hdu_full.writeto(out_fits_full, overwrite=True)
 
-    return {"figure": out_fig, "fits_cutout": out_fits, "fits_fullframe": out_fits_full}
+    fig_ret = None if defer_summary_plots else out_fig
+    return {"figure": fig_ret, "fits_cutout": out_fits, "fits_fullframe": out_fits_full}
 
 
 def save_candidate_snippet_products(

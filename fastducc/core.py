@@ -322,6 +322,7 @@ def finalise_welford_parallel(
                         method="variance",
                         var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
                         rms_full=rms_full,
+                        defer_summary_plots=getattr(cfg, "defer_summary_plots", False),
                     )
                 if cfg.save_var_snippets:
                     std_snip = candidates.make_stdmap_snippet(std_map_full, cand, spatial_size=50)
@@ -438,6 +439,7 @@ def _export_variance_chunk_products(
                     method="variance",
                     var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
                     rms_full=rms_full,
+                    defer_summary_plots=getattr(cfg, "defer_summary_plots", False),
                 )
             else:
                 logger.warning(f"Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
@@ -488,6 +490,7 @@ def _export_boxcar_chunk_products(
                     continuum_dir=cfg.continuum_dir,
                     method="boxcar",
                     rms_full=rms_full,
+                    defer_summary_plots=getattr(cfg, "defer_summary_plots", False),
                 )
             if cfg.save_box_snippets:
                 snippets = candidates.extract_candidate_snippets(

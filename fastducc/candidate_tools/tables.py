@@ -171,6 +171,10 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
     optional_cols = [
         "width_bins", "duty_cycle", "sbid", "beam", "scan",
         "downsample_factor", "plan_bins", "effective_time_res", "best_b",
+        "plan_idx", "base_period_s", "row_idx", "global_row_idx",
+        "range_name", "range_idx", "ranges_all",
+        "range_period_min", "range_period_max", "range_bins_min", "range_bins_max",
+        "cand_bins", "cand_subints",
         "cutout_fits", "fullframe_fits", "summary_plot", "profile_npz", "lightcurve_npz",
         "psrcat_match_name", "psrcat_name", "psrcat_sep_arcsec", "psrcat_period_s", "psrcat_p0", "psrcat_dm", "is_psrcat_match",
         "racs_match_name", "racs_match", "racs_source_name", "racs_sep_arcsec", "racs_flux_mjy", "racs_flux_jy",

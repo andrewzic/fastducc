@@ -153,6 +153,11 @@ def build_cli(argv=None):
     _add_bool_flag(parser, '--save-var-snippets', '--no-save-var-snippets', 'save_var_snippets', False, help_true='Save snippet products (PNG/GIF/FITS) for variance candidates')
     _add_bool_flag(parser, '--save-box-lightcurves', '--no-save-box-lightcurves', 'save_box_lightcurves', True, help_true='Save lightcurves for boxcar candidates')
     _add_bool_flag(parser, '--save-box-snippets', '--no-save-box-snippets', 'save_box_snippets', False, help_true='Save snippet products (PNG/GIF/FITS) for boxcar candidates')
+    _add_bool_flag(
+        parser, '--defer-summary-plots', '--no-summary-plots', 'defer_summary_plots', False,
+        help_true='Defer candidate diagnostic summary PDF rendering during search pass (saves lightweight artifacts only; default: False).',
+        help_false='Render candidate diagnostic summary PDF plots immediately during search (default: True).',
+    )
     parser.add_argument('--continuum-dir', default=None, help='Path to directory containing deep per-beam continuum fits images.')
 
     # --- Dedispersion & DM search parameters ---
@@ -390,6 +395,7 @@ def make_config(args, paths) -> Config:
         filter_ips_agn=getattr(args, "filter_ips_agn", True),
         ips_snr_ratio_threshold=getattr(args, "ips_snr_ratio_threshold", 0.8),
         ips_match_radius_arcsec=getattr(args, "ips_match_radius_arcsec", 30.0),
+        defer_summary_plots=getattr(args, "defer_summary_plots", False),
     )
 
 def main_serial(args):
