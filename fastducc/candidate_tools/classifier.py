@@ -229,7 +229,13 @@ def sample_local_continuum_flux(
             "cont_snr": cont_snr,
         }
     except Exception as exc:
-        logger.debug(f"Error sampling continuum flux at ({ra_deg:.4f}, {dec_deg:.4f}): {exc}")
+        logger.warning(
+            "Error sampling continuum flux from '%s' at (RA=%.4f, Dec=%.4f): %s",
+            continuum_fits_path,
+            ra_deg,
+            dec_deg,
+            exc,
+        )
         return default_res
 
 

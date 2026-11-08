@@ -41,7 +41,8 @@ def _load_psrcat_csv(psrcat_csv_path: str) -> Table:
             c = SkyCoord(ra_s, dec_s, unit=(u.hourangle, u.deg), frame="icrs")
             r_ra = float(c.ra.deg)
             r_dec = float(c.dec.deg)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to parse coordinates (RAJ='%s', DECJ='%s') in PSRCAT catalogue: %s", ra_s, dec_s, exc)
             continue
 
         p0_val = float("nan")
@@ -52,8 +53,8 @@ def _load_psrcat_csv(psrcat_csv_path: str) -> Table:
                     f0_val = float(f0_s)
                     if f0_val > 0:
                         p0_val = 1.0 / f0_val
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to parse F0 value '%s' for source '%s' in PSRCAT catalogue: %s", f0_s, r[col_name], exc)
 
         dm_val = float("nan")
         if has_dm:
@@ -61,8 +62,8 @@ def _load_psrcat_csv(psrcat_csv_path: str) -> Table:
             if dm_s and dm_s != "*" and dm_s != "nan":
                 try:
                     dm_val = float(dm_s)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to parse DM value '%s' for source '%s' in PSRCAT catalogue: %s", dm_s, r[col_name], exc)
 
         names.append(str(r[col_name]).strip())
         ra_deg.append(r_ra)
@@ -112,7 +113,8 @@ def _load_racs_votable(racs_vot_path: str) -> Table:
         for val in t[flux_col]:
             try:
                 flux_mjy.append(float(val))
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to parse flux value '%s' in RACS VOTable: %s", val, exc)
                 flux_mjy.append(float("nan"))
     else:
         flux_mjy = [float("nan")] * len(t)
@@ -250,7 +252,13 @@ def annotate_observation_with_catalogues(
                             sc = SkyCoord(str(r["RA"]), str(r["DEC"]),
                                           unit=(u.hourangle, u.deg), frame="icrs")
                             sc_list.append(sc)
-                        except Exception:
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to parse SIMBAD coordinate record (RA='%s', DEC='%s'): %s",
+                                r.get("RA"),
+                                r.get("DEC"),
+                                exc,
+                            )
                             continue
                     if sc_list:
                         cat = SkyCoord([c.ra.deg for c in sc_list],
