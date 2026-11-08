@@ -283,7 +283,8 @@ def save_candidate_summary(
                 position=pos,
                 size=(size_rad * u.rad, size_rad * u.rad),
                 wcs=cont_w_2d,
-                mode="partial"
+                mode="partial",
+                fill_value=np.nan,
             )
             cont_im = c2d.data
             cont_wcs = c2d.wcs
@@ -1097,7 +1098,7 @@ def save_periodicity_candidate_summary(
                 cw = WCS(chdr).celestial
                 size_rad = spatial_size * float(pix_rad)
                 pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
-                c2d = Cutout2D(data=cdata, position=pos, size=(size_rad * u.rad, size_rad * u.rad), wcs=cw, mode="partial")
+                c2d = Cutout2D(data=cdata, position=pos, size=(size_rad * u.rad, size_rad * u.rad), wcs=cw, mode="partial", fill_value=np.nan)
                 cont_im = c2d.data
                 bunit = str(chdr.get("BUNIT", "")).upper()
                 if "JY" in bunit and "MJY" not in bunit and "UJY" not in bunit:
@@ -1837,6 +1838,7 @@ def update_candidate_summary_with_dynspec(
                     size=(50, 50),
                     wcs=cont_w,
                     mode="partial",
+                    fill_value=np.nan,
                 )
                 ax_cont = fig.add_subplot(gs_main[0, 0], projection=c2d.wcs)
                 c_v0, c_v1 = np.nanpercentile(c2d.data, [1.0, 99.8])

@@ -36,9 +36,12 @@ def make_stdmap_snippet(
     pad_x_left = max(0, (x - half_sp) - x0)
     pad_x_right = max(0, (x0 + spatial_size) - x1)
 
-    snippet_2d = np.pad(cut,
-                        ((pad_y_top, pad_y_bot), (pad_x_left, pad_x_right)),
-                        mode="edge")
+    snippet_2d = np.pad(
+        cut,
+        ((pad_y_top, pad_y_bot), (pad_x_left, pad_x_right)),
+        mode="constant",
+        constant_values=np.nan,
+    )
     snippet_cube = snippet_2d[None, :, :]  # (1, spatial_size, spatial_size)
     snippet_times = np.array([np.nan], dtype=float)
 
@@ -67,7 +70,7 @@ def extract_candidate_snippets(
     spatial_size: int = 50,
     time_factor: int = 25,            # in units of *smoothed* frames
     pad_mode: str = "constant",
-    pad_value: float = 0.0,
+    pad_value: float = np.nan,
     return_indices: bool = True,
     center_policy: str = "right",    # 'right' uses w//2, 'left' uses (w-1)//2 for center time
 ) -> List[Dict[str, Any]]:
@@ -191,7 +194,7 @@ def extract_candidate_snippets(
             snippet_times = np.pad(sub_times, (pad_t_front, pad_t_back),
                                    mode="constant", constant_values=np.nan)
         elif pad_mode == "edge":
-            snippet_cube = np.pad(sub_cube, pad_widths, mode="edge")
+            snippet_cube = np.pad(sub_cube, pad_widths, mode="constant", constant_values=np.nan)
             if sub_times.size == 0:
                 snippet_times = np.full((t_len_sm,), np.nan, dtype=times.dtype)
             else:
