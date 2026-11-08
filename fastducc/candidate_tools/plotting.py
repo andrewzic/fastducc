@@ -249,7 +249,8 @@ def save_candidate_summary(
     cutout_det = np.pad(
         cut,
         ((pad_y_top, pad_y_bot), (pad_x_left, pad_x_right)),
-        mode="edge"
+        mode="constant",
+        constant_values=np.nan,
     )
 
     wcs_cut = ducc_wcs._build_tan_wcs_for_snippet(
@@ -855,7 +856,7 @@ def _crop_or_pad_cutout(img: np.ndarray, target_size: int) -> np.ndarray:
     ny, nx = img.shape
     if ny == target_size and nx == target_size:
         return img.astype(np.float32)
-    out = np.zeros((target_size, target_size), dtype=np.float32)
+    out = np.full((target_size, target_size), np.nan, dtype=np.float32)
     sy = min(ny, target_size)
     sx = min(nx, target_size)
     y0_src = (ny - sy) // 2
@@ -1003,7 +1004,8 @@ def save_periodicity_candidate_summary(
         cutout_det = np.pad(
             cut,
             ((y0_clip - y0_des, y1_des - y1_clip), (x0_clip - x0_des, x1_des - x1_clip)),
-            mode="edge",
+            mode="constant",
+            constant_values=np.nan,
         ).astype(np.float32)
         has_cutout = True
 
