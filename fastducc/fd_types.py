@@ -154,6 +154,9 @@ class CubeConfig:
     client: Optional[Any] = None
     direct_to_zarr: bool = False
     min_uv_distance_m: Optional[float] = None
+    sparse_grid_plan: Optional[Dict[str, Any]] = None
+    direct_dga: bool = False
+    pad_radius: int = 12
 
     @classmethod
     def from_namespace(cls, args: Any, **overrides) -> CubeConfig:

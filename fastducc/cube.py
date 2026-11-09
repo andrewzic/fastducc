@@ -698,6 +698,8 @@ def grid_chunk_to_zarr_task(
     uv_hermitian_half: bool = True,
     n_target_samples: Optional[int] = None,
     min_uv_distance_m: Optional[float] = None,
+    flat_indices: Optional[np.ndarray] = None,
+    is_direct_dga: bool = False,
     **kwargs,
 ) -> Tuple[int, int, int]:
     """
@@ -741,14 +743,31 @@ def grid_chunk_to_zarr_task(
         u_half = uv_cube_chunk.shape[-1] // 2 + 1
         uv_cube_chunk = uv_cube_chunk[..., :u_half]
 
-    # Write slice directly to the pre-allocated on-disk chunked Zarr array
-    z_store = zarr.open_array(out_zarr, mode="r+")
-    if grid_indices is None or (len(grid_indices) > 0 and np.all(np.diff(grid_indices) == 1)):
+    # Write slice directly to the pre-allocated on-disk chunked Zarr array / DGA group
+    if is_direct_dga and flat_indices is not None and len(flat_indices) > 0:
+        root_grp = zarr.open_group(out_zarr, mode="r+")
+        dga_arr = root_grp["dga"]
+        # Extract flat points from (nt, nv, nu) chunk
+        # Shape of uv_cube_chunk: (nt, nv, nu)
+        # Reshape to (nt, nv * nu)
+        nt_chunk = uv_cube_chunk.shape[0]
+        flat_cube = uv_cube_chunk.reshape(nt_chunk, -1)
+        # Extracted shape: (M, nt_chunk)
+        dga_sub = flat_cube[:, flat_indices].T
         s = int(grid_indices[0]) if grid_indices is not None else offset_start
-        z_store[s : s + len(uv_cube_chunk), :, :] = uv_cube_chunk
+        if grid_indices is None or (len(grid_indices) > 0 and np.all(np.diff(grid_indices) == 1)):
+            dga_arr[:, s : s + nt_chunk] = dga_sub
+        else:
+            for j, g_idx in enumerate(grid_indices):
+                dga_arr[:, int(g_idx)] = dga_sub[:, j]
     else:
-        for j, g_idx in enumerate(grid_indices):
-            z_store[int(g_idx), :, :] = uv_cube_chunk[j]
+        z_store = zarr.open_array(out_zarr, mode="r+")
+        if grid_indices is None or (len(grid_indices) > 0 and np.all(np.diff(grid_indices) == 1)):
+            s = int(grid_indices[0]) if grid_indices is not None else offset_start
+            z_store[s : s + len(uv_cube_chunk), :, :] = uv_cube_chunk
+        else:
+            for j, g_idx in enumerate(grid_indices):
+                z_store[int(g_idx), :, :] = uv_cube_chunk[j]
 
     return (offset_start, offset_end, len(times_chunk))
 
@@ -1046,39 +1065,99 @@ def grid_ms_to_zarr(
             raise FileExistsError(f"Output Zarr '{out_zarr}' already exists and overwrite is False.")
         shutil.rmtree(out_zarr, ignore_errors=True)
 
-    # Calculate target spatial chunking
-    c_time = chunk_time or (zarr_chunks[0] if zarr_chunks else chunk_size)
-    c_v = v_chunk_size or (zarr_chunks[1] if zarr_chunks else math.ceil(nv_grid / 4))
-    c_u = u_chunk_size or (zarr_chunks[2] if zarr_chunks else math.ceil(nu_stored / 4))
-    target_chunks = (min(total_planes, c_time), min(nv_grid, c_v), min(nu_stored, c_u))
+    is_direct_dga = bool(getattr(cfg, "direct_dga", False) or getattr(cfg, "uv_format", "") == "direct_dga")
+    sparse_grid_plan = getattr(cfg, "sparse_grid_plan", None)
 
-    z_arr = zarr.open_array(
-        out_zarr,
-        mode="w",
-        shape=(total_planes, nv_grid, nu_stored),
-        chunks=target_chunks,
-        dtype=np.complex64,
-    )
-    z_arr.attrs.update({
-        "tsamp": float(time_info["dt_nominal"]),
-        "t0": float(time_info["grid_times"][0]),
-        "du": float(1.0 / (npix_x * pix_rad)),
-        "dv": float(1.0 / (npix_y * pix_rad)),
-        "ra0_rad": float(ra0_rad),
-        "dec0_rad": float(dec0_rad),
-        "pixsize_arcsec": float(pixsize_arcsec),
-        "npix_x": int(npix_x),
-        "npix_y": int(npix_y),
-        "nu": int(nu_stored),
-        "nv": int(nv_grid),
-        "dm": float(dm),
-        "hermitian_half": bool(uv_hermitian_half),
-        "total_planes": int(total_planes),
-    })
+    if is_direct_dga and sparse_grid_plan is None:
+        from fastducc.grid_plan import compute_sparse_uv_grid_plan
+        pad_rad = int(getattr(cfg, "pad_radius", 12))
+        logger.info(f"Computing sparse UV grid plan for direct DGA gridding (pad_radius={pad_rad})...")
+        sparse_grid_plan = compute_sparse_uv_grid_plan(
+            msname=msname,
+            npix_x=npix_x,
+            npix_y=npix_y,
+            pixsize_arcsec=pixsize_arcsec,
+            epsilon=epsilon,
+            do_wgridding=do_wgridding,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            pad_radius=pad_rad,
+            uv_hermitian_half=uv_hermitian_half,
+            min_uv_distance_m=min_uv_distance_m,
+        )
+
+    if is_direct_dga and sparse_grid_plan is not None:
+        m_total = int(sparse_grid_plan["m_total"])
+        uv_indices = sparse_grid_plan["uv_indices"]
+        flat_indices = sparse_grid_plan["flat_indices"]
+        c_time = chunk_time or (zarr_chunks[0] if zarr_chunks else chunk_size)
+        dga_chunks = (min(512, m_total), min(total_planes, c_time))
+        uv_chunks = (m_total, 2)
+
+        root_grp = zarr.open_group(out_zarr, mode="w")
+        if hasattr(root_grp, "create_array"):
+            root_grp.create_array("dga", shape=(m_total, total_planes), chunks=dga_chunks, dtype=np.complex64)
+            root_grp.create_array("uv", shape=uv_indices.shape, chunks=uv_chunks, dtype=np.int64)
+        else:
+            root_grp.create_dataset("dga", shape=(m_total, total_planes), chunks=dga_chunks, dtype=np.complex64)
+            root_grp.create_dataset("uv", data=uv_indices, chunks=uv_chunks)
+        root_grp["uv"][:] = uv_indices
+
+        root_grp.attrs.update({
+            "format": "direct_dga",
+            "tsamp": float(time_info["dt_nominal"]),
+            "t0": float(time_info["grid_times"][0]),
+            "du": float(1.0 / (npix_x * pix_rad)),
+            "dv": float(1.0 / (npix_y * pix_rad)),
+            "ra0_rad": float(ra0_rad),
+            "dec0_rad": float(dec0_rad),
+            "pixsize_arcsec": float(pixsize_arcsec),
+            "npix_x": int(npix_x),
+            "npix_y": int(npix_y),
+            "nu": int(nu_stored),
+            "nv": int(nv_grid),
+            "dm": float(dm),
+            "hermitian_half": bool(uv_hermitian_half),
+            "total_planes": int(total_planes),
+            "m_total": int(m_total),
+        })
+        target_chunks = dga_chunks
+    else:
+        flat_indices = None
+        # Calculate target spatial chunking
+        c_time = chunk_time or (zarr_chunks[0] if zarr_chunks else chunk_size)
+        c_v = v_chunk_size or (zarr_chunks[1] if zarr_chunks else math.ceil(nv_grid / 4))
+        c_u = u_chunk_size or (zarr_chunks[2] if zarr_chunks else math.ceil(nu_stored / 4))
+        target_chunks = (min(total_planes, c_time), min(nv_grid, c_v), min(nu_stored, c_u))
+
+        z_arr = zarr.open_array(
+            out_zarr,
+            mode="w",
+            shape=(total_planes, nv_grid, nu_stored),
+            chunks=target_chunks,
+            dtype=np.complex64,
+        )
+        z_arr.attrs.update({
+            "tsamp": float(time_info["dt_nominal"]),
+            "t0": float(time_info["grid_times"][0]),
+            "du": float(1.0 / (npix_x * pix_rad)),
+            "dv": float(1.0 / (npix_y * pix_rad)),
+            "ra0_rad": float(ra0_rad),
+            "dec0_rad": float(dec0_rad),
+            "pixsize_arcsec": float(pixsize_arcsec),
+            "npix_x": int(npix_x),
+            "npix_y": int(npix_y),
+            "nu": int(nu_stored),
+            "nv": int(nv_grid),
+            "dm": float(dm),
+            "hermitian_half": bool(uv_hermitian_half),
+            "total_planes": int(total_planes),
+        })
 
     chan_freq = None
+    ms_ref = msname[0] if isinstance(msname, (list, tuple)) else msname
     try:
-        with table(f"{msname}/SPECTRAL_WINDOW", readonly=True, ack=False) as t_spw:
+        with table(f"{ms_ref}/SPECTRAL_WINDOW", readonly=True, ack=False) as t_spw:
             chan_freq = t_spw.getcell("CHAN_FREQ", 0)
     except Exception:
         pass
@@ -1119,13 +1198,18 @@ def grid_ms_to_zarr(
         align_to=align_to, shift_method=shift_method, shift_domain=shift_domain,
         uv_hermitian_half=uv_hermitian_half,
         min_uv_distance_m=min_uv_distance_m,
+        flat_indices=flat_indices,
+        is_direct_dga=is_direct_dga,
     )
 
     eff_client = client or getattr(cfg, "client", None)
     parallel_mode = parallel_mode or ("dask" if eff_client is not None else ("processes" if max_workers and max_workers > 1 else "serial"))
     n_workers = max_workers if max_workers and max_workers > 0 else (os.cpu_count() or 4 if parallel_mode in ("processes", "threads", "dask-local") else 1)
 
-    logger.info(f"Direct-to-Zarr MS Gridding -> {out_zarr} | Planes: {total_planes} | Shape: {(total_planes, nv_grid, nu_stored)} | Chunks: {target_chunks} | Tasks: {len(chunk_tasks)} | Mode: {parallel_mode}")
+    if is_direct_dga:
+        logger.info(f"Direct-to-DGA MS Gridding -> {out_zarr} | Active Cells: {m_total} | Planes: {total_planes} | Chunks: {target_chunks} | Tasks: {len(chunk_tasks)} | Mode: {parallel_mode}")
+    else:
+        logger.info(f"Direct-to-Zarr MS Gridding -> {out_zarr} | Planes: {total_planes} | Shape: {(total_planes, nv_grid, nu_stored)} | Chunks: {target_chunks} | Tasks: {len(chunk_tasks)} | Mode: {parallel_mode}")
 
     pbar = tqdm(total=total_frames, desc=f"Gridding snapshots direct-to-Zarr ({parallel_mode})", unit="frame")
 
@@ -1569,8 +1653,9 @@ def make_dirty_cube(
     if used_field: hdr3d["OBJECT"] = str(used_field)
 
     chan_freq = None
+    ms_ref = msname[0] if isinstance(msname, (list, tuple)) else msname
     try:
-        with table(f"{msname}/SPECTRAL_WINDOW", readonly=True, ack=False) as t_spw:
+        with table(f"{ms_ref}/SPECTRAL_WINDOW", readonly=True, ack=False) as t_spw:
             chan_freq = t_spw.getcell("CHAN_FREQ", 0)
             if chan_freq is not None and len(chan_freq) > 0:
                 hdr3d["RESTFRQ"] = float(np.mean(chan_freq))
