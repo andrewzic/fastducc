@@ -352,15 +352,7 @@ def _get_module() -> Any:
     with _MODULE_LOCK:
         mod = _MODULE_CACHE.get(dev_id)
         if mod is None:
-            mod = cp.RawModule(
-                code=_CUDA_KERNEL_SRC,
-                options=(
-                    "--std=c++17",
-                    "--generate-code=arch=compute_75,code=sm_75",
-                    "--generate-code=arch=compute_80,code=sm_80",
-                    "--generate-code=arch=compute_80,code=compute_80",
-                ),
-            )
+            mod = cp.RawModule(code=_CUDA_KERNEL_SRC, options=("--std=c++17",))
             _MODULE_CACHE[dev_id] = mod
         return mod
 

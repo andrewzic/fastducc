@@ -136,15 +136,7 @@ def _get_module() -> Any:
                 )
             with open(_CUDA_KERNEL_PATH, "r", encoding="utf-8") as fh:
                 src = fh.read()
-            mod = cp.RawModule(
-                code=src,
-                options=(
-                    "--std=c++17",
-                    "--generate-code=arch=compute_75,code=sm_75",
-                    "--generate-code=arch=compute_80,code=sm_80",
-                    "--generate-code=arch=compute_80,code=compute_80",
-                ),
-            )
+            mod = cp.RawModule(code=src, options=("--std=c++17",))
             _MODULE_CACHE[dev_id] = mod
         return mod
 
