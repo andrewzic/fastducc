@@ -83,6 +83,7 @@ def _process_block_and_save(
     do_wstacking: bool = True,
     supp_w: int = 4,
     w_oversampling: float = 1.5,
+    min_uv_distance_m: float = 0.0,
 ) -> Dict:
     """
     Per-block worker:
@@ -107,11 +108,16 @@ def _process_block_and_save(
 
     if chan_sel is None:
         vis = data[:, :, pol].astype(np.complex64)
-        flg = flags[:, :, pol]
+        flg = flags[:, :, pol].copy()
     else:
         s, e = chan_sel
         vis = data[:, s:e, pol].astype(np.complex64)
-        flg = flags[:, s:e, pol]
+        flg = flags[:, s:e, pol].copy()
+
+    if min_uv_distance_m > 0.0:
+        uv_dist_m = np.hypot(uvw_m[:, 0], uvw_m[:, 1])
+        short_mask = (uv_dist_m < min_uv_distance_m)
+        flg = flg | short_mask[:, None]
 
     nrow_blk, nchan = vis.shape
     if nrow_blk == 0:

@@ -55,6 +55,12 @@ except ImportError:
 from fastducc.fd_types import CubeConfig
 from fastducc import ms_utils, imaging, dedisp, timeshift
 from fastducc import wcs as ducc_wcs
+from fastducc.ragged import (
+    pack_chunk_to_ragged_csr,
+    write_ragged_fragment,
+    consolidate_ragged_fragments,
+    RaggedDGAStore,
+)
 
 
 # =========================================================================
@@ -662,6 +668,34 @@ def process_chunk_task(
     return (offset_start, offset_end, n_samples, (ret_dirty, real_chunk, imag_chunk))
 
 
+def _resolve_cube_device(device: str = "cpu") -> str:
+    """Resolve cube compute backend ('cpu', 'cuda', or 'auto') without importing CUDA on CPU runs."""
+    mode = str("cpu" if device is None else device).strip().lower()
+    if mode == "cpu":
+        return "cpu"
+    if mode not in ("cuda", "auto"):
+        raise ValueError(f"Unsupported device='{device}'; expected 'cpu', 'cuda', or 'auto'.")
+
+    available = False
+    try:
+        from fastducc.ragged_gpu import is_cuda_available
+
+        available = bool(is_cuda_available())
+    except ImportError as exc:
+        logger.debug("fastducc.ragged_gpu unavailable; CUDA backend disabled: %s", exc)
+        available = False
+
+    if mode == "cuda":
+        if not available:
+            raise RuntimeError("device='cuda' requested in fastducc.cube, but CUDA/CuPy is unavailable.")
+        return "cuda"
+
+    if not available:
+        logger.debug("fastducc.cube(device='auto') falling back to CPU: CUDA/CuPy unavailable.")
+        return "cpu"
+    return "cuda"
+
+
 def grid_chunk_to_zarr_task(
     msname: str,
     out_zarr: str,
@@ -700,14 +734,19 @@ def grid_chunk_to_zarr_task(
     min_uv_distance_m: Optional[float] = None,
     flat_indices: Optional[np.ndarray] = None,
     is_direct_dga: bool = False,
+    is_ragged_csr: bool = False,
+    chunk_idx: int = 0,
+    fragments_dir: Optional[str] = None,
+    uv_threshold: float = 1e-4,
+    device: str = "cpu",
     **kwargs,
 ) -> Tuple[int, int, int]:
     """
     Worker task: reads chunk rows from MS, applies sub-sample phase/time regularisation,
     computes snapshot UV gridding via ducc0.wgridder.vis2grid (with uv_hermitian_half if enabled),
-    and writes directly to the on-disk chunked Zarr array slice.
+    and writes directly to the on-disk chunked Zarr array slice or sharded CSR fragment.
     """
-    if zarr is None:
+    if not is_ragged_csr and zarr is None:
         raise ImportError("zarr library is required for grid_chunk_to_zarr_task.")
 
     times_chunk, chunk_freq, dt, vis_3d, wgt_3d, uvw_3d = imaging.load_chunk_data(
@@ -743,8 +782,49 @@ def grid_chunk_to_zarr_task(
         u_half = uv_cube_chunk.shape[-1] // 2 + 1
         uv_cube_chunk = uv_cube_chunk[..., :u_half]
 
-    # Write slice directly to the pre-allocated on-disk chunked Zarr array / DGA group
-    if is_direct_dga and flat_indices is not None and len(flat_indices) > 0:
+    # Write slice directly to sharded CSR fragment or pre-allocated on-disk chunked Zarr array / DGA group
+    if is_ragged_csr and flat_indices is not None and len(flat_indices) > 0:
+        if fragments_dir is None:
+            fragments_dir = os.path.join(out_zarr, "fragments")
+        os.makedirs(fragments_dir, exist_ok=True)
+        nt_chunk = uv_cube_chunk.shape[0]
+        if grid_indices is not None and len(grid_indices) > 0:
+            t_chunk = np.asarray(grid_indices, dtype=np.float64) * dt
+        else:
+            t_chunk = (np.arange(nt_chunk, dtype=np.float64) + offset_start) * dt
+
+        eff_device = _resolve_cube_device(device)
+        if eff_device == "cuda":
+            from fastducc.ragged_gpu import pack_uv_chunk_to_ragged_gpu
+
+            c_idx, c_cnt, v_data, v_times = pack_uv_chunk_to_ragged_gpu(
+                uv_cube_chunk,
+                flat_indices,
+                t_chunk,
+                threshold=float(uv_threshold),
+                return_host=True,
+            )
+        else:
+            flat_cube = uv_cube_chunk.reshape(nt_chunk, -1)
+            dga_sub = flat_cube[:, flat_indices].T
+            c_idx, c_cnt, v_data, v_times = pack_chunk_to_ragged_csr(
+                dga_sub, t_chunk, threshold=float(uv_threshold)
+            )
+        c_idx_int = int(chunk_idx)
+        frag_path = os.path.join(fragments_dir, f"chunk_{c_idx_int:05d}.csr.bin")
+        write_ragged_fragment(
+            filepath=frag_path,
+            chunk_idx=c_idx_int,
+            cell_indices=c_idx,
+            cell_counts=c_cnt,
+            vis_data=v_data,
+            vis_times=v_times,
+            t_start=float(t_chunk[0]) if len(t_chunk) > 0 else 0.0,
+            dt=float(dt),
+            threshold=float(uv_threshold),
+        )
+        return (offset_start, offset_end, len(times_chunk))
+    elif is_direct_dga and flat_indices is not None and len(flat_indices) > 0:
         root_grp = zarr.open_group(out_zarr, mode="r+")
         dga_arr = root_grp["dga"]
         # Extract flat points from (nt, nv, nu) chunk
@@ -770,6 +850,15 @@ def grid_chunk_to_zarr_task(
                 z_store[int(g_idx), :, :] = uv_cube_chunk[j]
 
     return (offset_start, offset_end, len(times_chunk))
+
+
+def grid_chunk_to_ragged_task(*args, **kwargs) -> Tuple[int, int, int]:
+    """
+    Dedicated worker task: reads chunk rows from MS, grids snapshot UVvisibilities,
+    identifies non-zero samples (|V| > threshold), and writes a sharded binary CSR fragment.
+    """
+    kwargs["is_ragged_csr"] = True
+    return grid_chunk_to_zarr_task(*args, **kwargs)
 
 
 # =========================================================================
@@ -940,15 +1029,19 @@ def grid_ms_to_zarr(
     shift_domain: str = "native",
     uv_hermitian_half: bool = True,
     min_uv_distance_m: Optional[float] = None,
+    device: Optional[str] = None,
+    engine: Optional[str] = None,
+    raster_mode: Optional[str] = None,
+    row_chunk_size: Optional[int] = None,
     **kwargs,
 ) -> str:
     """
     Distribute MS time regularisation and snapshot UV gridding directly into an
     on-disk chunked Zarr array using an existing Dask client or parallel pool.
     """
-    if zarr is None:
-        raise ImportError("zarr library is required for direct-to-Zarr gridding.")
-
+    if isinstance(msname, CubeConfig) and cfg is None:
+        cfg = msname
+        msname = cfg.msname
     if cfg is None:
         cfg = config
     if cfg is not None:
@@ -1010,8 +1103,78 @@ def grid_ms_to_zarr(
         uv_hermitian_half = cfg.uv_hermitian_half if hasattr(cfg, "uv_hermitian_half") else uv_hermitian_half
         min_uv_distance_m = getattr(cfg, "min_uv_distance_m", None) if min_uv_distance_m is None else min_uv_distance_m
 
-    if not msname or not os.path.exists(msname):
-        raise FileNotFoundError(f"Measurement Set '{msname}' not found.")
+    raw_engine = engine if engine is not None else (getattr(cfg, "engine", "wgridder") if cfg is not None else "wgridder")
+    eff_engine = str("wgridder" if raw_engine is None else raw_engine).strip().lower()
+    if eff_engine not in ("wgridder", "direct_raster"):
+        raise ValueError(f"Unsupported engine='{raw_engine}'; expected 'wgridder' or 'direct_raster'.")
+
+    eff_raster_mode = str(
+        raster_mode if raster_mode is not None else (getattr(cfg, "raster_mode", "nearest") if cfg is not None else "nearest")
+    ).strip().lower()
+    eff_row_chunk_size = int(
+        row_chunk_size if row_chunk_size is not None else (getattr(cfg, "row_chunk_size", 300000) if cfg is not None else 300000)
+    )
+
+    raw_device = device if device is not None else (getattr(cfg, "device", "cpu") if cfg is not None else "cpu")
+    eff_device = str("cpu" if raw_device is None else raw_device).strip().lower()
+    if eff_device not in ("cpu", "cuda", "auto"):
+        raise ValueError(f"Unsupported device='{raw_device}'; expected 'cpu', 'cuda', or 'auto'.")
+
+    ms_check = msname[0] if isinstance(msname, (list, tuple)) else msname
+    if not ms_check or not os.path.exists(ms_check):
+        raise FileNotFoundError(f"Measurement Set '{ms_check}' not found.")
+
+    if eff_engine == "direct_raster":
+        from fastducc.gpu_direct_cube import stream_ms_to_ragged_csr
+
+        ms_base = os.path.basename(str(ms_check).rstrip("/")).replace(".ms", "")
+        if out_zarr is None:
+            dm_tag = f"_dm{dm:06.1f}" if dm != 0.0 else ""
+            s_tag = 0 if start_time_idx is None else int(start_time_idx)
+            e_tag = 0 if end_time_idx is None else int(end_time_idx)
+            out_zarr = f"{ms_base}_t{s_tag:05d}_{e_tag:05d}{dm_tag}_uv.zarr"
+
+        stream_ms_to_ragged_csr(
+            msname=msname,
+            out_dir=out_zarr,
+            write_to_disk=True,
+            overwrite=bool(overwrite),
+            start_time_idx=start_time_idx,
+            end_time_idx=end_time_idx,
+            start_time=start_time,
+            end_time=end_time,
+            time_step=time_step,
+            time_tolerance=float(time_tolerance),
+            max_blank_factor=float(max_blank_factor),
+            regularize_time=bool(regularize_time),
+            sync_tolerance=float(sync_tolerance),
+            shift_method=str(shift_method),
+            shift_domain=str(shift_domain),
+            data_column=str(data_column),
+            corr_mode=str(corr_mode),
+            single_pol=str(single_pol),
+            basis=str(basis),
+            field_name=field_name,
+            npix_x=int(npix_x),
+            npix_y=int(npix_y),
+            pixsize_arcsec=float(pixsize_arcsec),
+            dm=float(dm),
+            align_to=str(align_to),
+            collapse_channels=bool(collapse_channels),
+            nsubbands=int(nsubbands),
+            exact_uvw=bool(exact_uvw),
+            mode=eff_raster_mode,
+            min_valid_channels=int(min_valid_channels),
+            min_uv_distance_m=min_uv_distance_m,
+            uv_threshold=float(getattr(cfg, "uv_threshold", kwargs.get("uv_threshold", 1e-4))),
+            row_chunk_size=eff_row_chunk_size,
+            sparse_grid_plan=getattr(cfg, "sparse_grid_plan", None),
+            device=eff_device,
+        )
+        return out_zarr
+
+    if zarr is None:
+        raise ImportError("zarr library is required for direct-to-Zarr gridding.")
 
     ms_base = os.path.basename(msname.rstrip("/")).replace(".ms", "")
     t_main = table(msname, readonly=True)
@@ -1066,12 +1229,13 @@ def grid_ms_to_zarr(
         shutil.rmtree(out_zarr, ignore_errors=True)
 
     is_direct_dga = bool(getattr(cfg, "direct_dga", False) or getattr(cfg, "uv_format", "") == "direct_dga")
+    is_ragged_csr = bool(getattr(cfg, "ragged_csr", False) or getattr(cfg, "uv_format", "") == "ragged_csr")
     sparse_grid_plan = getattr(cfg, "sparse_grid_plan", None)
 
-    if is_direct_dga and sparse_grid_plan is None:
+    if (is_direct_dga or is_ragged_csr) and sparse_grid_plan is None:
         from fastducc.grid_plan import compute_sparse_uv_grid_plan
         pad_rad = int(getattr(cfg, "pad_radius", 12))
-        logger.info(f"Computing sparse UV grid plan for direct DGA gridding (pad_radius={pad_rad})...")
+        logger.info(f"Computing sparse UV grid plan for direct sparse gridding (pad_radius={pad_rad})...")
         sparse_grid_plan = compute_sparse_uv_grid_plan(
             msname=msname,
             npix_x=npix_x,
@@ -1086,7 +1250,34 @@ def grid_ms_to_zarr(
             min_uv_distance_m=min_uv_distance_m,
         )
 
-    if is_direct_dga and sparse_grid_plan is not None:
+    fragments_dir = None
+    common_attrs = None
+    if is_ragged_csr and sparse_grid_plan is not None:
+        m_total = int(sparse_grid_plan["m_total"])
+        uv_indices = sparse_grid_plan["uv_indices"]
+        flat_indices = sparse_grid_plan["flat_indices"]
+        fragments_dir = os.path.join(out_zarr, "fragments")
+        os.makedirs(fragments_dir, exist_ok=True)
+        common_attrs = {
+            "format": "ragged_csr",
+            "tsamp": float(time_info["dt_nominal"]),
+            "t0": float(time_info["grid_times"][0]),
+            "du": float(1.0 / (npix_x * pix_rad)),
+            "dv": float(1.0 / (npix_y * pix_rad)),
+            "ra0_rad": float(ra0_rad),
+            "dec0_rad": float(dec0_rad),
+            "pixsize_arcsec": float(pixsize_arcsec),
+            "npix_x": int(npix_x),
+            "npix_y": int(npix_y),
+            "nu": int(nu_stored),
+            "nv": int(nv_grid),
+            "dm": float(dm),
+            "hermitian_half": bool(uv_hermitian_half),
+            "total_planes": int(total_planes),
+            "m_total": int(m_total),
+        }
+        target_chunks = (min(512, m_total), chunk_size)
+    elif is_direct_dga and sparse_grid_plan is not None:
         m_total = int(sparse_grid_plan["m_total"])
         uv_indices = sparse_grid_plan["uv_indices"]
         flat_indices = sparse_grid_plan["flat_indices"]
@@ -1167,6 +1358,7 @@ def grid_ms_to_zarr(
         max_delay_samps = dedisp.get_dm_samps(chan_freq, abs(dm), time_info["dt_nominal"])
 
     chunk_tasks = []
+    chk_idx = 0
     if regularize_time and "blocks" in time_info:
         for b in time_info["blocks"]:
             b_start = start_idx + b["start_sample"]
@@ -1178,7 +1370,8 @@ def grid_ms_to_zarr(
                 c_end_pad = min(b_end, c_end + max_delay_samps) if dm != 0.0 and max_delay_samps > 0 else c_end
                 c_times = unique_times[c_start : c_end_pad + 1]
                 c_g_idx = time_info["grid_indices"][c_start - start_idx : c_end - start_idx + 1]
-                chunk_tasks.append((c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, b_shift))
+                chunk_tasks.append((chk_idx, c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, b_shift))
+                chk_idx += 1
     else:
         for c_start in range(start_idx, end_idx + 1, chunk_size):
             c_end = min(c_start + chunk_size - 1, end_idx)
@@ -1186,7 +1379,8 @@ def grid_ms_to_zarr(
             c_end_pad = min(len(unique_times) - 1, c_end + max_delay_samps) if dm != 0.0 and max_delay_samps > 0 else c_end
             c_times = unique_times[c_start : c_end_pad + 1]
             c_g_idx = time_info["grid_indices"][c_start - start_idx : c_end - start_idx + 1]
-            chunk_tasks.append((c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, 0.0))
+            chunk_tasks.append((chk_idx, c_start, c_end, c_times, c_g_idx, int(c_g_idx[0]), int(c_g_idx[-1]) + 1, n_target, 0.0))
+            chk_idx += 1
 
     task_kwargs = dict(
         msname=msname, out_zarr=out_zarr, npix_x=npix_x, npix_y=npix_y, pix_rad=pix_rad,
@@ -1200,13 +1394,19 @@ def grid_ms_to_zarr(
         min_uv_distance_m=min_uv_distance_m,
         flat_indices=flat_indices,
         is_direct_dga=is_direct_dga,
+        is_ragged_csr=is_ragged_csr,
+        fragments_dir=fragments_dir,
+        uv_threshold=float(getattr(cfg, "uv_threshold", 1e-4)),
+        device=eff_device,
     )
 
     eff_client = client or getattr(cfg, "client", None)
     parallel_mode = parallel_mode or ("dask" if eff_client is not None else ("processes" if max_workers and max_workers > 1 else "serial"))
     n_workers = max_workers if max_workers and max_workers > 0 else (os.cpu_count() or 4 if parallel_mode in ("processes", "threads", "dask-local") else 1)
 
-    if is_direct_dga:
+    if is_ragged_csr:
+        logger.info(f"Direct-to-Ragged-CSR MS Gridding -> {out_zarr} | Active Cells: {m_total} | Planes: {total_planes} | Tasks: {len(chunk_tasks)} | Mode: {parallel_mode}")
+    elif is_direct_dga:
         logger.info(f"Direct-to-DGA MS Gridding -> {out_zarr} | Active Cells: {m_total} | Planes: {total_planes} | Chunks: {target_chunks} | Tasks: {len(chunk_tasks)} | Mode: {parallel_mode}")
     else:
         logger.info(f"Direct-to-Zarr MS Gridding -> {out_zarr} | Planes: {total_planes} | Shape: {(total_planes, nv_grid, nu_stored)} | Chunks: {target_chunks} | Tasks: {len(chunk_tasks)} | Mode: {parallel_mode}")
@@ -1224,9 +1424,10 @@ def grid_ms_to_zarr(
                 offset_end=off_e,
                 n_target_samples=n_target,
                 shift_samps=b_shift,
+                chunk_idx=c_k,
                 **task_kwargs,
             )
-            for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
+            for (c_k, _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
         ]
         for fut in dask_as_completed(future_to_task):
             _, _, n_done = fut.result()
@@ -1261,9 +1462,10 @@ def grid_ms_to_zarr(
                     offset_end=off_e,
                     n_target_samples=n_target,
                     shift_samps=b_shift,
+                    chunk_idx=c_k,
                     **task_kwargs,
                 )
-                for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
+                for (c_k, _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
             ]
             for fut in dask_as_completed(future_to_task):
                 _, _, n_done = fut.result()
@@ -1284,15 +1486,16 @@ def grid_ms_to_zarr(
                     offset_end=off_e,
                     n_target_samples=n_target,
                     shift_samps=b_shift,
+                    chunk_idx=c_k,
                     **task_kwargs,
                 )
-                for (_, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
+                for (c_k, _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift) in chunk_tasks
             ]
             for fut in as_completed(future_to_task):
                 _, _, n_done = fut.result()
                 pbar.update(n_done)
     else:  # serial
-        for _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift in chunk_tasks:
+        for c_k, _, _, c_times, c_g_idx, off_s, off_e, n_target, b_shift in chunk_tasks:
             _, _, n_done = grid_chunk_to_zarr_task(
                 chunk_times=c_times,
                 grid_indices=c_g_idx,
@@ -1300,11 +1503,32 @@ def grid_ms_to_zarr(
                 offset_end=off_e,
                 n_target_samples=n_target,
                 shift_samps=b_shift,
+                chunk_idx=c_k,
                 **task_kwargs,
             )
             pbar.update(n_done)
 
     pbar.close()
+
+    if is_ragged_csr and fragments_dir is not None:
+        logger.info(f"Consolidating sharded ragged CSR fragments -> {out_zarr}...")
+        frag_files = [
+            os.path.join(fragments_dir, f)
+            for f in sorted(os.listdir(fragments_dir))
+            if f.endswith(".csr.bin")
+        ]
+        consolidate_ragged_fragments(
+            fragment_files=frag_files,
+            store_dir=out_zarr,
+            sparse_plan_uv=sparse_grid_plan["uv_indices"],
+            attrs=common_attrs,
+            active_only=True,
+            cleanup_fragments=True,
+            device=eff_device,
+        )
+        logger.info(f"Successfully consolidated Ragged CSR DGA Store -> {out_zarr}")
+        return out_zarr
+
     logger.info(f"Successfully gridded MS to Zarr -> {out_zarr}")
     return out_zarr
 
@@ -1396,9 +1620,16 @@ def make_dirty_cube(
     client: Optional[Any] = None,
     direct_to_zarr: bool = False,
     min_uv_distance_m: Optional[float] = None,
+    device: Optional[str] = None,
+    engine: Optional[str] = None,
+    raster_mode: Optional[str] = None,
+    row_chunk_size: Optional[int] = None,
     **kwargs,
 ) -> str:
     """Image MS snapshots with ducc0.wgridder and asynchronously stream directly into FITS cubes or Zarr."""
+    if isinstance(msname, CubeConfig) and cfg is None:
+        cfg = msname
+        msname = cfg.msname
     if cfg is None:
         cfg = config
 
@@ -1437,6 +1668,10 @@ def make_dirty_cube(
             u_chunk_size=u_chunk_size, v_chunk_size=v_chunk_size,
             client=client, direct_to_zarr=direct_to_zarr,
             min_uv_distance_m=min_uv_distance_m,
+            device=(device if device is not None else "cpu"),
+            engine=(engine if engine is not None else "wgridder"),
+            raster_mode=(raster_mode if raster_mode is not None else "nearest"),
+            row_chunk_size=(int(row_chunk_size) if row_chunk_size is not None else 300000),
         )
     else:
         if msname:
@@ -1449,19 +1684,34 @@ def make_dirty_cube(
             cfg.client = client
         if min_uv_distance_m is not None:
             cfg.min_uv_distance_m = min_uv_distance_m
+        if device is not None:
+            cfg.device = device
+        if engine is not None:
+            cfg.engine = engine
+        if raster_mode is not None:
+            cfg.raster_mode = raster_mode
+        if row_chunk_size is not None:
+            cfg.row_chunk_size = int(row_chunk_size)
         for k, v in kwargs.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
 
-    # Route direct-to-Zarr requests
+    # Route direct-to-Zarr and direct-raster requests
+    eff_engine = str(getattr(cfg, "engine", "wgridder") or "wgridder").strip().lower()
     if (
-        cfg.out_zarr is not None
+        eff_engine == "direct_raster"
+        or cfg.out_zarr is not None
         or getattr(cfg, "direct_to_zarr", False)
         or direct_to_zarr
         or (out_zarr is not None)
-        or cfg.uv_format in ("dga_zarr", "zarr")
+        or cfg.uv_format in ("dga_zarr", "zarr", "direct_dga", "ragged_csr")
     ):
         target_zarr = cfg.out_zarr or out_zarr or cfg.uv_zarr_path
+        if eff_engine == "direct_raster" and target_zarr is None and cfg.out_cube and not cfg.uv_only:
+            raise ValueError(
+                "engine='direct_raster' produces a ragged CSR UV store; specify out_zarr "
+                "(or direct_to_zarr=True) instead of FITS out_cube."
+            )
         return grid_ms_to_zarr(
             msname=cfg.msname,
             out_zarr=target_zarr,
@@ -1471,6 +1721,10 @@ def make_dirty_cube(
             chunk_time=chunk_time or getattr(cfg, "chunk_time", None),
             u_chunk_size=u_chunk_size or getattr(cfg, "u_chunk_size", None),
             v_chunk_size=v_chunk_size or getattr(cfg, "v_chunk_size", None),
+            device=getattr(cfg, "device", "cpu"),
+            engine=eff_engine,
+            raster_mode=getattr(cfg, "raster_mode", "nearest"),
+            row_chunk_size=getattr(cfg, "row_chunk_size", 300000),
         )
 
     msname = cfg.msname
@@ -1948,6 +2202,32 @@ def build_cli_cube(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-blank-zero-beams", dest="no_blank_zero_beams", action="store_true", default=True)
     parser.add_argument("--floating", type=int, choices=[16, 32, 64], default=32)
     parser.add_argument("--fallback-astropy", action="store_true", default=False)
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda", "auto"],
+        default="cpu",
+        help="Compute backend for ragged CSR packing and consolidation ('cpu', 'cuda', or 'auto'; default: cpu).",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["wgridder", "direct_raster"],
+        default="wgridder",
+        help="UV gridding engine: 'wgridder' (ducc0.wgridder W-stacking) or 'direct_raster' (pinned streaming GPU/CPU direct Hermitian rasterisation).",
+    )
+    parser.add_argument(
+        "--raster-mode",
+        dest="raster_mode",
+        choices=["nearest", "bilinear"],
+        default="nearest",
+        help="Grid splatting mode when --engine direct_raster is selected (default: nearest).",
+    )
+    parser.add_argument(
+        "--row-chunk-size",
+        dest="row_chunk_size",
+        type=int,
+        default=300000,
+        help="Target MS rows per streaming chunk when --engine direct_raster is selected (default: 300000).",
+    )
 
     if argv is None:
         argv = sys.argv[1:]

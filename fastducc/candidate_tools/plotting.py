@@ -43,6 +43,30 @@ from fastducc import kernels
 from fastducc.candidate_tools.utils import parse_candidate_filename
 from fastducc.candidate_tools.snippets import compute_candidate_local_rms
 
+_CONTINUUM_IMAGE_CACHE: Dict[str, Tuple[np.ndarray, WCS, str]] = {}
+
+
+def get_cached_continuum_image(fits_path: str) -> Tuple[np.ndarray, WCS, str]:
+    """
+    Retrieve or load and cache a continuum reference image in memory.
+    Returns (cdata, wcs_celestial, bunit).
+    """
+    fits_path = os.path.abspath(fits_path)
+    if fits_path in _CONTINUUM_IMAGE_CACHE:
+        return _CONTINUUM_IMAGE_CACHE[fits_path]
+    with fits.open(fits_path, memmap=False) as hdul:
+        cdata = np.squeeze(hdul[0].data).astype(np.float32, copy=False)
+        chdr = hdul[0].header
+    cw = WCS(chdr).celestial
+    bunit = str(chdr.get("BUNIT", "")).upper()
+    _CONTINUUM_IMAGE_CACHE[fits_path] = (cdata, cw, bunit)
+    return cdata, cw, bunit
+
+
+def clear_continuum_image_cache() -> None:
+    """Clear cached continuum reference images from memory."""
+    _CONTINUUM_IMAGE_CACHE.clear()
+
 
 def wrap_candidate_metadata_text(text: str, max_width: int = 33) -> str:
     """Wrap candidate summary metadata text cleanly so that no line exceeds max_width."""
@@ -269,26 +293,24 @@ def save_candidate_summary(
         if len(fits_cands) == 0:
             fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits")))
         if len(fits_cands) > 0:
-            with fits.open(fits_cands[0], memmap=False) as hdul:
-                data = hdul[0].data
-                hdr  = hdul[0].header
-            if data.ndim > 2:
-                data = np.squeeze(data)
-            cont_w = WCS(hdr)
-            cont_w_2d = cont_w.celestial
-            size_rad = spatial_size * float(pix_rad)
-            pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
-            c2d = Cutout2D(
-                data=data,
-                position=pos,
-                size=(size_rad * u.rad, size_rad * u.rad),
-                wcs=cont_w_2d,
-                mode="partial",
-                fill_value=np.nan,
-            )
-            cont_im = c2d.data
-            cont_wcs = c2d.wcs
-            cont_vmin = np.nanpercentile(cont_im, 5.0)
+            try:
+                data, cont_w_2d, _ = get_cached_continuum_image(fits_cands[0])
+                size_rad = spatial_size * float(pix_rad)
+                pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
+                c2d = Cutout2D(
+                    data=data,
+                    position=pos,
+                    size=(size_rad * u.rad, size_rad * u.rad),
+                    wcs=cont_w_2d,
+                    mode="partial",
+                    fill_value=np.nan,
+                )
+                cont_im = c2d.data.copy()
+                cont_wcs = c2d.wcs
+                cont_vmin = float(np.nanpercentile(cont_im, 5.0))
+                cont_vmax = float(np.nanpercentile(cont_im, 99.5))
+            except Exception as e:
+                logger.debug(f"Could not load continuum cutout: {e}")
             cont_vmax = np.nanpercentile(cont_im, 99.5)
 
     if np.isfinite(det_time_mjd):
@@ -734,6 +756,7 @@ def save_candidate_summary(
 
     if not defer_summary_plots:
         fig.savefig(out_fig, bbox_inches="tight")
+    fig.clf()
     plt.close(fig)
 
     out_fits = f"{out_prefix}{mjd_tag}_cutout.fits"
@@ -971,17 +994,37 @@ def save_periodicity_candidate_summary(
             equinox=equinox,
         )
 
-    # Prepare on-pulse and off-pulse cutout arrays
+    # Prepare on-pulse (or on-resonance) and off-pulse (or off-resonance) cutout arrays
+    is_nufft_mode = bool(
+        candidate.get("algo") == "nufft"
+        or "nufft" in str(method).lower()
+        or candidate.get("cutout_on_res") is not None
+        or candidate.get("spectrum_1d") is not None
+    )
     has_cutout = False
     cutout_det = None
     if cutout is not None and isinstance(cutout, np.ndarray) and cutout.size > 0:
         cutout_det = _crop_or_pad_cutout(cutout, spatial_size)
         has_cutout = True
+    elif "cutout_on_res" in candidate and candidate["cutout_on_res"] is not None:
+        cand_cut = np.asarray(candidate["cutout_on_res"])
+        if cand_cut.size > 0:
+            cutout_det = _crop_or_pad_cutout(cand_cut, spatial_size)
+            has_cutout = True
     elif "cutout" in candidate and candidate["cutout"] is not None:
         cand_cut = np.asarray(candidate["cutout"])
         if cand_cut.size > 0:
             cutout_det = _crop_or_pad_cutout(cand_cut, spatial_size)
             has_cutout = True
+    elif candidate.get("cutout_on_res_fits") and os.path.exists(str(candidate["cutout_on_res_fits"])):
+        try:
+            with fits.open(str(candidate["cutout_on_res_fits"]), memmap=False) as hdul:
+                loaded_cut = np.squeeze(hdul[0].data)
+            if loaded_cut.size > 0:
+                cutout_det = _crop_or_pad_cutout(loaded_cut, spatial_size)
+                has_cutout = True
+        except Exception as e:
+            logger.debug(f"Could not load cutout_on_res_fits '{candidate.get('cutout_on_res_fits')}': {e}")
     elif candidate.get("cutout_fits") and os.path.exists(str(candidate["cutout_fits"])):
         try:
             with fits.open(str(candidate["cutout_fits"]), memmap=False) as hdul:
@@ -1013,10 +1056,22 @@ def save_periodicity_candidate_summary(
     cutout_off_det = None
     if cutout_off is not None and isinstance(cutout_off, np.ndarray) and cutout_off.size > 0:
         cutout_off_det = _crop_or_pad_cutout(cutout_off, spatial_size)
+    elif "cutout_off_res" in candidate and candidate["cutout_off_res"] is not None:
+        cand_off = np.asarray(candidate["cutout_off_res"])
+        if cand_off.size > 0:
+            cutout_off_det = _crop_or_pad_cutout(cand_off, spatial_size)
     elif "cutout_off" in candidate and candidate["cutout_off"] is not None:
         cand_off = np.asarray(candidate["cutout_off"])
         if cand_off.size > 0:
             cutout_off_det = _crop_or_pad_cutout(cand_off, spatial_size)
+    elif candidate.get("cutout_off_res_fits") and os.path.exists(str(candidate["cutout_off_res_fits"])):
+        try:
+            with fits.open(str(candidate["cutout_off_res_fits"]), memmap=False) as hdul:
+                loaded_off = np.squeeze(hdul[0].data)
+            if loaded_off.size > 0:
+                cutout_off_det = _crop_or_pad_cutout(loaded_off, spatial_size)
+        except Exception as e:
+            logger.debug(f"Could not load cutout_off_res_fits: {e}")
     elif candidate.get("cutout_off_fits") and os.path.exists(str(candidate["cutout_off_fits"])):
         try:
             with fits.open(str(candidate["cutout_off_fits"]), memmap=False) as hdul:
@@ -1026,35 +1081,66 @@ def save_periodicity_candidate_summary(
         except Exception as e:
             logger.debug(f"Could not load cutout_off_fits: {e}")
 
-    # Prepare 1D rotational pulse profile
+    # Prepare 1D rotational pulse profile or on-source spin-frequency spectrum
     has_profile = False
     p_raw = None
-    if profile is not None and len(profile) > 0:
-        p_raw = np.asarray(profile, dtype=np.float64)
-        has_profile = True
-    elif "profile" in candidate and candidate["profile"] is not None and len(candidate["profile"]) > 0:
-        p_raw = np.asarray(candidate["profile"], dtype=np.float64)
-        has_profile = True
-    elif candidate.get("profile_npz") and os.path.exists(str(candidate["profile_npz"])):
-        try:
-            with np.load(str(candidate["profile_npz"])) as nz:
-                for k in ("profile", "p_raw", "folded_profile", "flux", "arr_0"):
-                    if k in nz:
-                        p_raw = np.asarray(nz[k], dtype=np.float64)
-                        has_profile = True
-                        break
-        except Exception as e:
-            logger.debug(f"Could not load profile_npz: {e}")
-    elif candidate.get("lightcurve_npz") and os.path.exists(str(candidate["lightcurve_npz"])):
-        try:
-            with np.load(str(candidate["lightcurve_npz"])) as nz:
-                for k in ("profile", "p_raw", "folded_profile", "flux", "arr_0"):
-                    if k in nz:
-                        p_raw = np.asarray(nz[k], dtype=np.float64)
-                        has_profile = True
-                        break
-        except Exception as e:
-            logger.debug(f"Could not load lightcurve_npz: {e}")
+    spectrum_1d = None
+    spectrum_freqs = None
+    if is_nufft_mode:
+        if candidate.get("spectrum_1d") is not None:
+            spectrum_1d = np.asarray(candidate["spectrum_1d"], dtype=np.float64)
+            spectrum_freqs = np.asarray(candidate.get("spectrum_freqs", [])) if "spectrum_freqs" in candidate else None
+            has_profile = True
+        elif profile is not None and len(profile) > 0:
+            spectrum_1d = np.asarray(profile, dtype=np.float64)
+            spectrum_freqs = np.asarray(candidate.get("spectrum_freqs", [])) if "spectrum_freqs" in candidate else None
+            has_profile = True
+        elif "profile" in candidate and candidate["profile"] is not None and len(candidate["profile"]) > 0:
+            spectrum_1d = np.asarray(candidate["profile"], dtype=np.float64)
+            spectrum_freqs = np.asarray(candidate.get("spectrum_freqs", [])) if "spectrum_freqs" in candidate else None
+            has_profile = True
+        elif candidate.get("spectrum_npz") and os.path.exists(str(candidate["spectrum_npz"])):
+            try:
+                with np.load(str(candidate["spectrum_npz"])) as nz:
+                    for k in ("spectrum", "spec_1d", "power", "profile"):
+                        if k in nz:
+                            spectrum_1d = np.asarray(nz[k], dtype=np.float64)
+                            has_profile = True
+                            break
+                    for k in ("f_hz", "freqs", "frequencies", "fkeep"):
+                        if k in nz:
+                            spectrum_freqs = np.asarray(nz[k], dtype=np.float64)
+                            break
+            except Exception as e:
+                logger.debug(f"Could not load spectrum_npz: {e}")
+
+    if not is_nufft_mode or spectrum_1d is None:
+        if profile is not None and len(profile) > 0:
+            p_raw = np.asarray(profile, dtype=np.float64)
+            has_profile = True
+        elif "profile" in candidate and candidate["profile"] is not None and len(candidate["profile"]) > 0:
+            p_raw = np.asarray(candidate["profile"], dtype=np.float64)
+            has_profile = True
+        elif candidate.get("profile_npz") and os.path.exists(str(candidate["profile_npz"])):
+            try:
+                with np.load(str(candidate["profile_npz"])) as nz:
+                    for k in ("profile", "p_raw", "folded_profile", "flux", "arr_0"):
+                        if k in nz:
+                            p_raw = np.asarray(nz[k], dtype=np.float64)
+                            has_profile = True
+                            break
+            except Exception as e:
+                logger.debug(f"Could not load profile_npz: {e}")
+        elif candidate.get("lightcurve_npz") and os.path.exists(str(candidate["lightcurve_npz"])):
+            try:
+                with np.load(str(candidate["lightcurve_npz"])) as nz:
+                    for k in ("profile", "p_raw", "folded_profile", "flux", "arr_0"):
+                        if k in nz:
+                            p_raw = np.asarray(nz[k], dtype=np.float64)
+                            has_profile = True
+                            break
+            except Exception as e:
+                logger.debug(f"Could not load lightcurve_npz: {e}")
 
     if has_profile and p_raw is not None and len(p_raw) > 0:
         p_std = float(np.std(p_raw))
@@ -1092,15 +1178,12 @@ def save_periodicity_candidate_summary(
         if fits_cands:
             try:
                 # Use latest selfcal / best calibrated image (sorted last)
-                with fits.open(fits_cands[-1], memmap=False) as hdul:
-                    cdata = np.squeeze(hdul[0].data)
-                    chdr = hdul[0].header
-                cw = WCS(chdr).celestial
+                target_fits = fits_cands[-1]
+                cdata, cw, bunit = get_cached_continuum_image(target_fits)
                 size_rad = spatial_size * float(pix_rad)
                 pos = SkyCoord(ra=np.degrees(ra_c) * u.deg, dec=np.degrees(dec_c) * u.deg, frame="icrs")
                 c2d = Cutout2D(data=cdata, position=pos, size=(size_rad * u.rad, size_rad * u.rad), wcs=cw, mode="partial", fill_value=np.nan)
-                cont_im = c2d.data
-                bunit = str(chdr.get("BUNIT", "")).upper()
+                cont_im = c2d.data.copy()
                 if "JY" in bunit and "MJY" not in bunit and "UJY" not in bunit:
                     cont_im = cont_im * 1000.0  # Convert Jy/beam to mJy/beam
                 cont_wcs = c2d.wcs
@@ -1228,8 +1311,9 @@ def save_periodicity_candidate_summary(
             ax_cut.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
             ax_cut.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
             cb2 = fig.colorbar(im_cut, ax=ax_cut, orientation="horizontal", fraction=0.046, pad=0.10)
-            cb2.set_label("Folded Dirty Intensity")
-            ax_cut.set_title(f"On-Pulse Cutout (S/N={snr_val:.2f})")
+            cb2.set_label("Folded Dirty Intensity" if not is_nufft_mode else "NUFFT Spectral Power")
+            cut_title = f"On-Resonance Cutout (f={f_hz:.6f} Hz, S/N={snr_val:.2f})" if is_nufft_mode else f"On-Pulse Cutout (S/N={snr_val:.2f})"
+            ax_cut.set_title(cut_title)
         else:
             ax_cut = fig.add_subplot(gs[0, 2])
             ax_cut.set_facecolor("#222222")
@@ -1238,7 +1322,8 @@ def save_periodicity_candidate_summary(
                 ha="center", va="center", color="silver", weight="bold", fontsize=12,
                 transform=ax_cut.transAxes,
             )
-            ax_cut.set_title(f"On-Pulse Cutout (S/N={snr_val:.2f})")
+            cut_title = f"On-Resonance Cutout (f={f_hz:.6f} Hz)" if is_nufft_mode else f"On-Pulse Cutout (S/N={snr_val:.2f})"
+            ax_cut.set_title(cut_title)
             ax_cut.set_xticks([])
             ax_cut.set_yticks([])
     
@@ -1257,12 +1342,27 @@ def save_periodicity_candidate_summary(
             ax_cut_off.plot([c_x], [c_y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
             ax_cut_off.plot([c_x], [c_y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
             cb3 = fig.colorbar(im_cut_off, ax=ax_cut_off, orientation="horizontal", fraction=0.046, pad=0.10)
-            cb3.set_label("Folded Dirty Intensity")
-            ax_cut_off.set_title("Off-Pulse Cutout")
+            cb3.set_label("Folded Dirty Intensity" if not is_nufft_mode else "NUFFT Spectral Power")
+            ax_cut_off.set_title("Off-Resonance Cutout" if is_nufft_mode else "Off-Pulse Cutout")
     
-        # Bottom Row Left: Folded Pulse Profile (2 Full Cycles)
+        # Bottom Row Left: Profile / Spectrum
         ax_lc = fig.add_subplot(gs[1, 0:ncols - 1])
-        if has_profile and p2_raw is not None and p2_box is not None and phase2 is not None:
+        if is_nufft_mode and spectrum_1d is not None and len(spectrum_1d) > 0:
+            spec_norm = spectrum_1d / (np.max(spectrum_1d) if np.max(spectrum_1d) > 0 else 1.0)
+            if spectrum_freqs is not None and len(spectrum_freqs) == len(spectrum_1d):
+                f_axis_mhz = (spectrum_freqs - f_hz) * 1e3
+                ax_lc.plot(f_axis_mhz, spec_norm, color="crimson", lw=1.6, label="On-Source Spin-Frequency Spectrum P(f)")
+                ax_lc.axvline(0.0, color="navy", ls="--", lw=1.2, label=f"f₀ = {f_hz:.6f} Hz")
+                ax_lc.set_xlabel("Spin Frequency Offset from f₀ (mHz)")
+                ax_lc.set_xlim(-20.0, 20.0)
+            else:
+                ax_lc.plot(spec_norm, color="crimson", lw=1.6, label="On-Source Spin-Frequency Spectrum P(f)")
+                ax_lc.set_xlabel("Frequency Channels")
+            ax_lc.set_ylabel("Normalized Power")
+            ax_lc.set_title(f"On-Source Spin Frequency Spectrum P(f) | f₀ = {f_hz:.6f} Hz (P = {period_s*1000.0:.3f} ms) | S/N = {snr_val:.2f}")
+            ax_lc.grid(True, alpha=0.3)
+            ax_lc.legend(loc="upper right", framealpha=0.9)
+        elif has_profile and p2_raw is not None and p2_box is not None and phase2 is not None:
             ax_lc.step(phase2, p2_raw, where="mid", color="tab:blue", lw=1.5, label="Raw Folded Profile", zorder=2)
             ax_lc.plot(phase2, p2_box, color="tab:green", lw=1.8, label=f"Boxcar Matched Filter (w={width_bins} bins, duty={duty_cycle*100.0:.1f}%)", zorder=3)
             peak_b = int(candidate.get("best_b", np.argmax(p_norm) if p_norm is not None else 0))
@@ -1283,19 +1383,14 @@ def save_periodicity_candidate_summary(
         else:
             ax_lc.set_facecolor("#222222")
             ax_lc.text(
-                0.5, 0.5, "NO PROFILE DATA AVAILABLE",
+                0.5, 0.5, "NO SPECTRUM / PROFILE DATA AVAILABLE",
                 ha="center", va="center", color="silver", weight="bold", fontsize=14,
                 transform=ax_lc.transAxes,
             )
-            ax_lc.set_title(f"Folded Pulse Profile | P = {period_s*1000.0:.3f} ms (f = {f_hz:.4f} Hz) | S/N = {snr_val:.2f}")
+            lbl = "Spin Frequency Spectrum" if is_nufft_mode else "Folded Pulse Profile"
+            ax_lc.set_title(f"{lbl} | P = {period_s*1000.0:.3f} ms (f = {f_hz:.4f} Hz) | S/N = {snr_val:.2f}")
             ax_lc.set_xticks([])
             ax_lc.set_yticks([])
-        ax_lc.axvline(1.0, color="gray", ls=":", lw=1.2, alpha=0.7)
-        ax_lc.set_xlabel("Rotational Phase [0..2]")
-        ax_lc.set_ylabel("Normalized Flux / S/N")
-        ax_lc.set_title(f"Folded Pulse Profile | P = {period_s*1000.0:.3f} ms (f = {f_hz:.4f} Hz) | S/N = {snr_val:.2f}")
-        ax_lc.grid(True, alpha=0.3)
-        ax_lc.legend(loc="upper right", framealpha=0.9)
     
         # Bottom Row Right: FastDUCC-style AnchoredText Summary Box
         ax_txt = fig.add_subplot(gs[1, ncols - 1])
@@ -1369,6 +1464,7 @@ def save_periodicity_candidate_summary(
         fig.text(0.5, 0.01, meta_footer, ha="center", va="bottom", fontsize=8, color="gray", alpha=0.7)
     
         fig.savefig(out_fig, bbox_inches="tight")
+        fig.clf()
         plt.close(fig)
 
     # Save Cutout FITS with WCS & metadata if available
@@ -1431,8 +1527,28 @@ def save_periodicity_candidate_summary(
         hdr_full["DM"] = float(dm_val)
         fits.writeto(out_fits_full, fullframe.astype(np.float32), header=hdr_full, overwrite=True)
 
-    # Save 1D Folded Pulse Profile NPZ if available
+    # Save 1D Folded Pulse Profile NPZ or Spin-Frequency Spectrum NPZ if available
     out_npz = ""
+    out_spec_npz = ""
+    if is_nufft_mode and spectrum_1d is not None:
+        if out_dir_profiles:
+            os.makedirs(out_dir_profiles, exist_ok=True)
+            out_spec_npz = os.path.join(out_dir_profiles, f"{base_stem}_nufft_spectrum.npz")
+        else:
+            out_spec_npz = f"{out_prefix}_nufft_spectrum.npz"
+        np_save_dict = {
+            "spectrum": spectrum_1d.astype(np.float32),
+            "period_s": float(period_s),
+            "f_hz": float(f_hz),
+            "dm": float(dm_val),
+            "snr": float(snr_val),
+            "srcname": str(srcname),
+        }
+        if spectrum_freqs is not None:
+            np_save_dict["fkeep"] = spectrum_freqs.astype(np.float64)
+            np_save_dict["freqs"] = spectrum_freqs.astype(np.float64)
+        np.savez(out_spec_npz, **np_save_dict)
+
     if has_profile and p_norm is not None:
         if out_dir_profiles:
             os.makedirs(out_dir_profiles, exist_ok=True)
@@ -1456,11 +1572,15 @@ def save_periodicity_candidate_summary(
         "summary_plot": out_fig,
         "fits_cutout": out_fits,
         "cutout_fits": out_fits,
+        "cutout_on_res_fits": out_fits if is_nufft_mode else "",
         "cutout_off_fits": out_fits_off,
+        "cutout_off_res_fits": out_fits_off if is_nufft_mode else "",
         "fits_fullframe": out_fits_full,
         "fullframe_fits": out_fits_full,
         "profile_npz": out_npz,
         "lightcurve_npz": out_npz,
+        "spectrum_npz": out_spec_npz if is_nufft_mode else "",
+        "nufft_spectrum": out_spec_npz if is_nufft_mode else "",
     }
 
 

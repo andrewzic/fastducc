@@ -227,7 +227,9 @@ def setup_slurm_cluster(
         })
 
     # Worker extra arguments and walltime lifetime management
-    worker_extra = ["--nthreads", "1", "--memory-limit", "0"]
+    # Note: Do not pass --nthreads or --memory-limit here; SLURMCluster natively generates them
+    # from cores and memory arguments.
+    worker_extra = []
     if walltime:
         try:
             parts = walltime.split(":")
@@ -380,12 +382,18 @@ def get_dask_client(
         scratch_root = os.environ.get("GLOBAL_SCRATCH_DIR") or "/aphid/scratch-3month/azic/lotrun_periodicity"
         dask_spill_dir = os.environ.get("JOBFS") or os.path.join(scratch_root, "dask_spill")
         os.makedirs(dask_spill_dir, exist_ok=True)
-        logger.info(f"Launching Dask LocalCluster ({n_w} workers, memory_limit={local_memory_limit}, local_dir={dask_spill_dir})...")
+        mem_limit = local_memory_limit
+        if str(mem_limit).strip() in ("0", "none", "None", ""):
+            mem_limit = 0
+        logger.info(
+            f"Launching Dask LocalCluster ({n_w} workers x {threads_per_worker} threads, "
+            f"memory_limit={mem_limit}, local_dir={dask_spill_dir})..."
+        )
         cluster = LocalCluster(
             n_workers=n_w,
             threads_per_worker=int(threads_per_worker),
             processes=(dask_scheduler == "processes"),
-            memory_limit=local_memory_limit,
+            memory_limit=mem_limit,
             local_directory=dask_spill_dir,
             dashboard_address=":0",
         )

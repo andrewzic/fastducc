@@ -156,7 +156,12 @@ class CubeConfig:
     min_uv_distance_m: Optional[float] = None
     sparse_grid_plan: Optional[Dict[str, Any]] = None
     direct_dga: bool = False
+    ragged_csr: bool = False
     pad_radius: int = 12
+    device: str = "cpu"
+    engine: str = "wgridder"
+    raster_mode: str = "nearest"
+    row_chunk_size: int = 300000
 
     @classmethod
     def from_namespace(cls, args: Any, **overrides) -> CubeConfig:
