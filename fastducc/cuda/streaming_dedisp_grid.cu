@@ -637,6 +637,758 @@ extern "C" __global__ void dedisperse_and_rasterise_collapsed_kernel(
 }
 
 
+// =============================================================================
+// DUCC W-Gridder Piecewise Polynomial & W-Phase CUDA Device Functions
+// Adapted from DUCC (src/ducc0/math/gridding_kernel.h, wgridder_impl.h,
+// and not_yet_integrated/wgridder_sycl.h).
+// =============================================================================
+
+namespace {
+
+constexpr double kTwoPiD = 6.283185307179586476925286766559;
+constexpr float kTwoPiF = 6.283185307179586476925286766559f;
+
+/**
+ * DUCC coordinate-to-grid index mapping (Wgridder::getpix in wgridder_impl.h:685-695).
+ * Inputs u_lam, v_lam are in wavelengths.
+ */
+__device__ __forceinline__ void ducc_getpix(
+    const double u_lam,
+    const double v_lam,
+    const double pixsize_x,
+    const double pixsize_y,
+    const int grid_nu,
+    const int nv,
+    const int supp,
+    float& ufrac,
+    float& vfrac,
+    int& iu0,
+    int& iv0
+) {
+    const double ushift = static_cast<double>(supp) * (-0.5) + 1.0 + static_cast<double>(grid_nu);
+    const double vshift = static_cast<double>(supp) * (-0.5) + 1.0 + static_cast<double>(nv);
+    const int maxiu0 = (grid_nu + supp) - ((supp + 1) / 2);
+    const int maxiv0 = (nv + supp) - ((supp + 1) / 2);
+
+    double u = u_lam * pixsize_x;
+    u = (u - floor(u)) * static_cast<double>(grid_nu);
+    iu0 = min(static_cast<int>(u + ushift) - grid_nu, maxiu0);
+    ufrac = static_cast<float>(u - static_cast<double>(iu0));
+
+    double v = v_lam * pixsize_y;
+    v = (v - floor(v)) * static_cast<double>(nv);
+    iv0 = min(static_cast<int>(v + vshift) - nv, maxiv0);
+    vfrac = static_cast<float>(v - static_cast<double>(iv0));
+}
+
+/**
+ * DUCC w-sign canonicalisation (FixW) and w-phase preconditioning
+ * (Wgridder::compute_phases in wgridder_impl.h:1162-1176):
+ *   exp(2 * pi * i * imflip * (u * lshift + v * mshift + w * nshift))
+ * with range reduction (tmp - floor(tmp)) prior to single-precision trig evaluation.
+ */
+__device__ __forceinline__ void ducc_fixw_and_phase(
+    double& u_lam,
+    double& v_lam,
+    double& w_lam,
+    float& vr,
+    float& vi,
+    const double lshift,
+    const double mshift,
+    const double nshift,
+    const int do_shift
+) {
+    float imflip = 1.0f;
+    if (w_lam < 0.0) {
+        u_lam = -u_lam;
+        v_lam = -v_lam;
+        w_lam = -w_lam;
+        imflip = -1.0f;
+    }
+    if (do_shift != 0) {
+        const double tmp = static_cast<double>(imflip) * (u_lam * lshift + v_lam * mshift + w_lam * nshift);
+        const float ang = kTwoPiF * static_cast<float>(tmp - floor(tmp));
+        float s = 0.0f;
+        float c = 1.0f;
+        __sincosf(ang, &s, &c);
+        const float nvr = vr * c - vi * s;
+        const float nvi = vr * s + vi * c;
+        vr = nvr;
+        vi = nvi;
+    }
+    vi *= imflip;
+}
+
+/**
+ * Register-only separable 2D piecewise polynomial evaluation adapted from
+ * DUCC TemplateKernel::eval2 (gridding_kernel.h:456-483) and
+ * KernelComputer::compute_uv (wgridder_sycl.h:892-916).
+ *
+ * ``poly_coeffs`` has shape ``((supp + 1) / 2, deg + 1)`` where
+ * ``deg = supp + 3 + (supp & 1)`` is always odd (deg in {7, 9, 11}).
+ */
+__device__ __forceinline__ void ducc_eval_poly_uv(
+    const float ufrac,
+    const float vfrac,
+    const int supp,
+    const int deg,
+    const float* __restrict__ poly_coeffs,
+    float* __restrict__ ku,
+    float* __restrict__ kv
+) {
+    const float x0 = -2.0f * ufrac + static_cast<float>(supp - 1);
+    const float y0 = -2.0f * vfrac + static_cast<float>(supp - 1);
+    const float x2 = x0 * x0;
+    const float y2 = y0 * y0;
+    const int lim = (supp + 1) >> 1;
+    const int stride = deg + 1;
+
+    for (int i = 0; i < lim; ++i) {
+        const float* __restrict__ row = poly_coeffs + i * stride;
+        float tx = row[0];
+        float tx2 = row[1];
+        float ty = row[0];
+        float ty2 = row[1];
+        for (int j = 2; j < deg; j += 2) {
+            const float c_even = row[j];
+            const float c_odd = row[j + 1];
+            tx = fmaf(tx, x2, c_even);
+            ty = fmaf(ty, y2, c_even);
+            tx2 = fmaf(tx2, x2, c_odd);
+            ty2 = fmaf(ty2, y2, c_odd);
+        }
+        const float prod_x = tx * x0;
+        const float prod_y = ty * y0;
+        ku[i] = tx2 + prod_x;
+        kv[i] = ty2 + prod_y;
+        ku[supp - 1 - i] = tx2 - prod_x;
+        kv[supp - 1 - i] = ty2 - prod_y;
+    }
+}
+
+/**
+ * Register-only separable 3D (u, v, w) piecewise polynomial evaluation adapted
+ * from DUCC TemplateKernel::eval2s (gridding_kernel.h:375-434) and
+ * KernelComputer::compute_uvw (wgridder_sycl.h:917-952).
+ */
+__device__ __forceinline__ void ducc_eval_poly_uvw(
+    const float ufrac,
+    const float vfrac,
+    const float z_in,
+    int nth,
+    const int supp,
+    const int deg,
+    const float* __restrict__ poly_coeffs,
+    float* __restrict__ ku,
+    float* __restrict__ kv
+) {
+    const float x0 = -2.0f * ufrac + static_cast<float>(supp - 1);
+    const float y0 = -2.0f * vfrac + static_cast<float>(supp - 1);
+    float z0 = (z_in - static_cast<float>(nth)) * 2.0f + static_cast<float>(supp - 1);
+    const float x2 = x0 * x0;
+    const float y2 = y0 * y0;
+    const float z2 = z0 * z0;
+    const int lim = (supp + 1) >> 1;
+    const int stride = deg + 1;
+
+    if (nth >= lim) {
+        nth = supp - 1 - nth;
+        z0 = -z0;
+    }
+    const float* __restrict__ zrow = poly_coeffs + nth * stride;
+    float tz = zrow[0];
+    float tz2 = zrow[1];
+    for (int j = 2; j < deg; j += 2) {
+        tz = fmaf(tz, z2, zrow[j]);
+        tz2 = fmaf(tz2, z2, zrow[j + 1]);
+    }
+    const float kw = fmaf(tz, z0, tz2);
+
+    for (int i = 0; i < lim; ++i) {
+        const float* __restrict__ row = poly_coeffs + i * stride;
+        float tx = row[0];
+        float tx2 = row[1];
+        float ty = row[0];
+        float ty2 = row[1];
+        for (int j = 2; j < deg; j += 2) {
+            const float c_even = row[j];
+            const float c_odd = row[j + 1];
+            tx = fmaf(tx, x2, c_even);
+            ty = fmaf(ty, y2, c_even);
+            tx2 = fmaf(tx2, x2, c_odd);
+            ty2 = fmaf(ty2, y2, c_odd);
+        }
+        const float prod_x = tx * x0;
+        const float prod_y = ty * y0;
+        ku[i] = (tx2 + prod_x) * kw;
+        kv[i] = ty2 + prod_y;
+        ku[supp - 1 - i] = (tx2 - prod_x) * kw;
+        kv[supp - 1 - i] = ty2 - prod_y;
+    }
+}
+
+/**
+ * Splat a visibility with DUCC 2D piecewise polynomial weights directly onto
+ * the Hermitian half-plane u in [0, u_half) (or sparse CSR active cells).
+ *
+ * Implements the exact DUCC complex2hartley + hartley2complex Hermitian symmetry:
+ *   G_sym(u, v) = 0.5 * (G(u, v) + conj(G((-u) mod nu, (-v) mod nv)))
+ * so every half-plane cell (including the self-conjugate columns u = 0 and
+ * u = grid_nu / 2) matches ducc0.wgridder.vis2grid without allocating the
+ * negative half-plane u > grid_nu / 2.
+ */
+__device__ __forceinline__ void splat_ducc_wgridder_2d(
+    const int t,
+    const int nt_out,
+    const int grid_nu,
+    const int nv,
+    const int u_half,
+    const int supp,
+    const int iu0,
+    const int iv0,
+    const float vr,
+    const float vi,
+    const float w_val,
+    const float* __restrict__ ku,
+    const float* __restrict__ kv,
+    const int* __restrict__ uv_to_m,
+    const int sparse_output,
+    float2* __restrict__ grid_vis,
+    float* __restrict__ grid_wgt
+) {
+    for (int cu = 0; cu < supp; ++cu) {
+        int iu = iu0 + cu;
+        if (iu < 0) {
+            iu += grid_nu;
+        } else if (iu >= grid_nu) {
+            iu -= grid_nu;
+        }
+        const int xu = (iu == 0) ? 0 : (grid_nu - iu);
+        const bool do_pos = (iu < u_half);
+        const bool do_neg = (xu < u_half);
+        if (!do_pos && !do_neg) {
+            continue;
+        }
+
+        const float ku_val = 0.5f * ku[cu];
+        const float vr_u = vr * ku_val;
+        const float vi_u = vi * ku_val;
+        const float w_u = w_val * ku_val;
+
+        for (int cv = 0; cv < supp; ++cv) {
+            int iv = iv0 + cv;
+            if (iv < 0) {
+                iv += nv;
+            } else if (iv >= nv) {
+                iv -= nv;
+            }
+            const float kv_val = kv[cv];
+            const float kw = w_u * kv_val;
+            if (kw <= 0.0f) {
+                continue;
+            }
+            const float re_tap = vr_u * kv_val;
+            const float im_tap = vi_u * kv_val;
+
+            if (do_pos) {
+                accumulate_grid_cell(
+                    t, nt_out, nv, u_half,
+                    static_cast<long long>(iu),
+                    static_cast<long long>(iv),
+                    re_tap, im_tap, kw,
+                    uv_to_m, sparse_output, grid_vis, grid_wgt
+                );
+            }
+            if (do_neg) {
+                const int xv = (iv == 0) ? 0 : (nv - iv);
+                accumulate_grid_cell(
+                    t, nt_out, nv, u_half,
+                    static_cast<long long>(xu),
+                    static_cast<long long>(xv),
+                    re_tap, -im_tap, kw,
+                    uv_to_m, sparse_output, grid_vis, grid_wgt
+                );
+            }
+        }
+    }
+}
+
+}  // namespace
+
+
+/**
+ * Fused full-channel-collapse dedispersion and DUCC w-gridder direct-to-CSR /
+ * half-plane rasterisation kernel (Regime A for mode="wgridder").
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: snapshot time t (coalesced), y: baseline]
+ *   grid  = (ceil(nt_out / 32), min(65535, ceil(nbl / 8)), 1)
+ */
+extern "C" __global__ void dedisperse_and_wgridder_collapsed_kernel(
+    const float2* __restrict__ vis_3d,
+    const float* __restrict__ wgt_3d,
+    const double* __restrict__ uvw_3d,
+    const int* __restrict__ delays,
+    const int* __restrict__ raw_valid_chans,
+    const int* __restrict__ dedisp_valid_chans,
+    const int* __restrict__ uv_to_m,
+    const float* __restrict__ poly_coeffs,
+    float2* __restrict__ grid_vis,
+    float* __restrict__ grid_wgt,
+    int nbl,
+    int nchan,
+    int nt_in,
+    int nt_out,
+    int grid_nu,
+    int nv,
+    int u_half,
+    double pixsize_x,
+    double pixsize_y,
+    double mean_freq_hz,
+    double min_uv_distance_m,
+    int min_valid_channels,
+    int supp,
+    int deg,
+    double lshift,
+    double mshift,
+    double nshift,
+    int do_shift,
+    int flip_u,
+    int flip_v,
+    int flip_w,
+    int sparse_output
+) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nt_out) {
+        return;
+    }
+    if (!is_snapshot_valid(t, nchan, 1, min_valid_channels, raw_valid_chans, dedisp_valid_chans)) {
+        return;
+    }
+
+    const size_t bl_vis_stride = static_cast<size_t>(nchan) * static_cast<size_t>(nt_in);
+    const size_t bl_uvw_stride = 3ULL * static_cast<size_t>(nt_in);
+    const double freq_over_c = mean_freq_hz / kSpeedOfLightMps;
+    const double su = (flip_u != 0) ? -1.0 : 1.0;
+    const double sv = (flip_v != 0) ? -1.0 : 1.0;
+    const double sw = (flip_w != 0) ? -1.0 : 1.0;
+
+    float ku[8];
+    float kv[8];
+
+    for (int bl = blockIdx.y * blockDim.y + threadIdx.y; bl < nbl; bl += gridDim.y * blockDim.y) {
+        const size_t base_vis = static_cast<size_t>(bl) * bl_vis_stride;
+        const size_t base_uvw = static_cast<size_t>(bl) * bl_uvw_stride;
+
+        const double u_m_t = uvw_3d[base_uvw + static_cast<size_t>(t)];
+        const double v_m_t = uvw_3d[base_uvw + static_cast<size_t>(nt_in) + static_cast<size_t>(t)];
+        const double w_m_t = uvw_3d[base_uvw + 2ULL * static_cast<size_t>(nt_in) + static_cast<size_t>(t)];
+
+        double sum_re = 0.0;
+        double sum_im = 0.0;
+        double sum_w = 0.0;
+
+        for (int c = 0; c < nchan; ++c) {
+            const int d = delays[c];
+            const int t_src = t + d;
+            if (t_src < 0 || t_src >= nt_in) {
+                continue;
+            }
+            const size_t vis_idx = base_vis + static_cast<size_t>(c) * static_cast<size_t>(nt_in) + static_cast<size_t>(t_src);
+            const float w = wgt_3d[vis_idx];
+            if (w <= 0.0f || !isfinite(w)) {
+                continue;
+            }
+            const float2 v = vis_3d[vis_idx];
+            if (!isfinite(v.x) || !isfinite(v.y)) {
+                continue;
+            }
+            if (min_uv_distance_m > 0.0) {
+                const double u_src = (d == 0) ? u_m_t : uvw_3d[base_uvw + static_cast<size_t>(t_src)];
+                const double v_src = (d == 0) ? v_m_t : uvw_3d[base_uvw + static_cast<size_t>(nt_in) + static_cast<size_t>(t_src)];
+                if (!passes_uv_distance(u_src, v_src, min_uv_distance_m)) {
+                    continue;
+                }
+            }
+            const double wd = static_cast<double>(w);
+            sum_re += static_cast<double>(v.x) * wd;
+            sum_im += static_cast<double>(v.y) * wd;
+            sum_w += wd;
+        }
+
+        if (sum_w <= 0.0) {
+            continue;
+        }
+
+        double u_lam = (u_m_t * su) * freq_over_c;
+        double v_lam = (v_m_t * sv) * freq_over_c;
+        double w_lam = (w_m_t * sw) * freq_over_c;
+        if (!isfinite(u_lam) || !isfinite(v_lam) || !isfinite(w_lam)) {
+            continue;
+        }
+
+        float vr = static_cast<float>(sum_re);
+        float vi = static_cast<float>(sum_im);
+        const float out_w = static_cast<float>(sum_w);
+
+        ducc_fixw_and_phase(u_lam, v_lam, w_lam, vr, vi, lshift, mshift, nshift, do_shift);
+
+        float ufrac = 0.0f;
+        float vfrac = 0.0f;
+        int iu0 = 0;
+        int iv0 = 0;
+        ducc_getpix(u_lam, v_lam, pixsize_x, pixsize_y, grid_nu, nv, supp, ufrac, vfrac, iu0, iv0);
+        ducc_eval_poly_uv(ufrac, vfrac, supp, deg, poly_coeffs, ku, kv);
+
+        splat_ducc_wgridder_2d(
+            t, nt_out, grid_nu, nv, u_half, supp, iu0, iv0,
+            vr, vi, out_w, ku, kv,
+            uv_to_m, sparse_output, grid_vis, grid_wgt
+        );
+    }
+}
+
+
+/**
+ * Fused subband/per-channel dedispersion and DUCC w-gridder direct-to-CSR /
+ * half-plane rasterisation kernel (Regime B for mode="wgridder").
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: snapshot time t (coalesced), y: baseline]
+ *   grid  = (ceil(nt_out / 32), min(65535, ceil(nbl / 8)), 1)
+ */
+extern "C" __global__ void dedisperse_and_wgridder_subband_kernel(
+    const float2* __restrict__ vis_3d,
+    const float* __restrict__ wgt_3d,
+    const double* __restrict__ uvw_3d,
+    const int* __restrict__ delays,
+    const int* __restrict__ sub_offsets,
+    const double* __restrict__ sub_freqs_hz,
+    const int* __restrict__ sub_delays,
+    const int* __restrict__ raw_valid_chans,
+    const int* __restrict__ dedisp_valid_chans,
+    const int* __restrict__ uv_to_m,
+    const float* __restrict__ poly_coeffs,
+    float2* __restrict__ grid_vis,
+    float* __restrict__ grid_wgt,
+    int nbl,
+    int nchan,
+    int nsub_eff,
+    int nt_in,
+    int nt_out,
+    int grid_nu,
+    int nv,
+    int u_half,
+    double pixsize_x,
+    double pixsize_y,
+    double min_uv_distance_m,
+    int min_valid_channels,
+    int collapse_channels,
+    int exact_uvw,
+    int supp,
+    int deg,
+    double lshift,
+    double mshift,
+    double nshift,
+    int do_shift,
+    int flip_u,
+    int flip_v,
+    int flip_w,
+    int sparse_output
+) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nt_out) {
+        return;
+    }
+    if (!is_snapshot_valid(t, nchan, collapse_channels, min_valid_channels, raw_valid_chans, dedisp_valid_chans)) {
+        return;
+    }
+
+    const size_t bl_vis_stride = static_cast<size_t>(nchan) * static_cast<size_t>(nt_in);
+    const size_t bl_uvw_stride = 3ULL * static_cast<size_t>(nt_in);
+    const double su = (flip_u != 0) ? -1.0 : 1.0;
+    const double sv = (flip_v != 0) ? -1.0 : 1.0;
+    const double sw = (flip_w != 0) ? -1.0 : 1.0;
+
+    float ku[8];
+    float kv[8];
+
+    for (int bl = blockIdx.y * blockDim.y + threadIdx.y; bl < nbl; bl += gridDim.y * blockDim.y) {
+        const size_t base_vis = static_cast<size_t>(bl) * bl_vis_stride;
+        const size_t base_uvw = static_cast<size_t>(bl) * bl_uvw_stride;
+
+        for (int s = 0; s < nsub_eff; ++s) {
+            const int c0 = sub_offsets[s];
+            const int c1 = sub_offsets[s + 1];
+
+            double sum_re = 0.0;
+            double sum_im = 0.0;
+            double sum_w = 0.0;
+
+            for (int c = c0; c < c1; ++c) {
+                const int d = delays[c];
+                const int t_src = t + d;
+                if (t_src < 0 || t_src >= nt_in) {
+                    continue;
+                }
+                const size_t vis_idx = base_vis + static_cast<size_t>(c) * static_cast<size_t>(nt_in) + static_cast<size_t>(t_src);
+                const float w = wgt_3d[vis_idx];
+                if (w <= 0.0f || !isfinite(w)) {
+                    continue;
+                }
+                const float2 v = vis_3d[vis_idx];
+                if (!isfinite(v.x) || !isfinite(v.y)) {
+                    continue;
+                }
+                if (min_uv_distance_m > 0.0) {
+                    const double u_src = uvw_3d[base_uvw + static_cast<size_t>(t_src)];
+                    const double v_src = uvw_3d[base_uvw + static_cast<size_t>(nt_in) + static_cast<size_t>(t_src)];
+                    if (!passes_uv_distance(u_src, v_src, min_uv_distance_m)) {
+                        continue;
+                    }
+                }
+                const double wd = static_cast<double>(w);
+                sum_re += static_cast<double>(v.x) * wd;
+                sum_im += static_cast<double>(v.y) * wd;
+                sum_w += wd;
+            }
+
+            if (sum_w <= 0.0) {
+                continue;
+            }
+
+            int t_uvw = t;
+            if (exact_uvw != 0) {
+                const int ts = t + sub_delays[s];
+                t_uvw = (ts < 0) ? 0 : ((ts >= nt_in) ? (nt_in - 1) : ts);
+            }
+            const double u_m = uvw_3d[base_uvw + static_cast<size_t>(t_uvw)];
+            const double v_m = uvw_3d[base_uvw + static_cast<size_t>(nt_in) + static_cast<size_t>(t_uvw)];
+            const double w_m = uvw_3d[base_uvw + 2ULL * static_cast<size_t>(nt_in) + static_cast<size_t>(t_uvw)];
+            const double freq_over_c = sub_freqs_hz[s] / kSpeedOfLightMps;
+
+            double u_lam = (u_m * su) * freq_over_c;
+            double v_lam = (v_m * sv) * freq_over_c;
+            double w_lam = (w_m * sw) * freq_over_c;
+            if (!isfinite(u_lam) || !isfinite(v_lam) || !isfinite(w_lam)) {
+                continue;
+            }
+
+            float vr = static_cast<float>(sum_re);
+            float vi = static_cast<float>(sum_im);
+            const float out_w = static_cast<float>(sum_w);
+
+            ducc_fixw_and_phase(u_lam, v_lam, w_lam, vr, vi, lshift, mshift, nshift, do_shift);
+
+            float ufrac = 0.0f;
+            float vfrac = 0.0f;
+            int iu0 = 0;
+            int iv0 = 0;
+            ducc_getpix(u_lam, v_lam, pixsize_x, pixsize_y, grid_nu, nv, supp, ufrac, vfrac, iu0, iv0);
+            ducc_eval_poly_uv(ufrac, vfrac, supp, deg, poly_coeffs, ku, kv);
+
+            splat_ducc_wgridder_2d(
+                t, nt_out, grid_nu, nv, u_half, supp, iu0, iv0,
+                vr, vi, out_w, ku, kv,
+                uv_to_m, sparse_output, grid_vis, grid_wgt
+            );
+        }
+    }
+}
+
+
+/**
+ * 3D (u, v, w) DUCC piecewise polynomial w-stacking splat kernel for a single
+ * w-plane ``p0`` (matching Wgridder::x2grid_c_helper<SUPP, true> in
+ * wgridder_impl.h:1178-1273).
+ *
+ * Also records seed coordinates (uc, vc) and (-uc mod nu, -vc mod nv) into
+ * ``fresnel_seed`` on the first plane pass when ``record_seed != 0``.
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: subband/channel s, y: baseline bl]
+ *   grid  = (ceil(nsub_eff / 32), min(65535, ceil(nbl / 8)), 1)
+ */
+extern "C" __global__ void ducc_wgridder_3d_plane_splat_kernel(
+    const float2* __restrict__ vis_sub,
+    const float* __restrict__ wgt_sub,
+    const double* __restrict__ uvw_sub_m,
+    const double* __restrict__ sub_freqs_hz,
+    const float* __restrict__ poly_coeffs,
+    float2* __restrict__ plane_grid,
+    unsigned char* __restrict__ fresnel_seed,
+    int nbl,
+    int nsub_eff,
+    int grid_nu,
+    int nv,
+    double pixsize_x,
+    double pixsize_y,
+    int supp,
+    int deg,
+    double lshift,
+    double mshift,
+    double nshift,
+    int do_shift,
+    int flip_u,
+    int flip_v,
+    int flip_w,
+    int p0,
+    double w0,
+    double xdw,
+    double wshift,
+    int record_seed
+) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= nsub_eff) {
+        return;
+    }
+
+    const double freq_over_c = sub_freqs_hz[s] / kSpeedOfLightMps;
+    const double su = (flip_u != 0) ? -1.0 : 1.0;
+    const double sv = (flip_v != 0) ? -1.0 : 1.0;
+    const double sw = (flip_w != 0) ? -1.0 : 1.0;
+    const int half_supp = supp >> 1;
+
+    float ku[8];
+    float kv[8];
+
+    for (int bl = blockIdx.y * blockDim.y + threadIdx.y; bl < nbl; bl += gridDim.y * blockDim.y) {
+        const size_t idx = static_cast<size_t>(bl) * static_cast<size_t>(nsub_eff) + static_cast<size_t>(s);
+        const float w = wgt_sub[idx];
+        if (w <= 0.0f || !isfinite(w)) {
+            continue;
+        }
+        const float2 v = vis_sub[idx];
+        if (!isfinite(v.x) || !isfinite(v.y)) {
+            continue;
+        }
+
+        const size_t uvw_off = (static_cast<size_t>(bl) * static_cast<size_t>(nsub_eff) + static_cast<size_t>(s)) * 3ULL;
+        double u_lam = (uvw_sub_m[uvw_off + 0ULL] * su) * freq_over_c;
+        double v_lam = (uvw_sub_m[uvw_off + 1ULL] * sv) * freq_over_c;
+        double w_lam = (uvw_sub_m[uvw_off + 2ULL] * sw) * freq_over_c;
+        if (!isfinite(u_lam) || !isfinite(v_lam) || !isfinite(w_lam)) {
+            continue;
+        }
+
+        float vr = v.x * w;
+        float vi = v.y * w;
+        if (vr == 0.0f && vi == 0.0f) {
+            continue;
+        }
+
+        ducc_fixw_and_phase(u_lam, v_lam, w_lam, vr, vi, lshift, mshift, nshift, do_shift);
+
+        float ufrac = 0.0f;
+        float vfrac = 0.0f;
+        int iu0 = 0;
+        int iv0 = 0;
+        ducc_getpix(u_lam, v_lam, pixsize_x, pixsize_y, grid_nu, nv, supp, ufrac, vfrac, iu0, iv0);
+
+        if (record_seed != 0 && fresnel_seed != nullptr) {
+            int uc = (iu0 + half_supp) % grid_nu;
+            if (uc < 0) uc += grid_nu;
+            int vc = (iv0 + half_supp) % nv;
+            if (vc < 0) vc += nv;
+            const int xuc = (uc == 0) ? 0 : (grid_nu - uc);
+            const int xvc = (vc == 0) ? 0 : (nv - vc);
+            fresnel_seed[static_cast<size_t>(uc) * static_cast<size_t>(nv) + static_cast<size_t>(vc)] = 1;
+            fresnel_seed[static_cast<size_t>(xuc) * static_cast<size_t>(nv) + static_cast<size_t>(xvc)] = 1;
+        }
+
+        const int minplane = max(0, static_cast<int>((w_lam + wshift) * xdw));
+        if (minplane <= p0 && (minplane + supp) > p0) {
+            const int nth = p0 - minplane;
+            const float z_in = static_cast<float>(xdw * (w0 - w_lam));
+            ducc_eval_poly_uvw(ufrac, vfrac, z_in, nth, supp, deg, poly_coeffs, ku, kv);
+
+            for (int cu = 0; cu < supp; ++cu) {
+                int iu = iu0 + cu;
+                if (iu < 0) iu += grid_nu;
+                else if (iu >= grid_nu) iu -= grid_nu;
+                const float ku_val = ku[cu];
+                const float vr_u = vr * ku_val;
+                const float vi_u = vi * ku_val;
+                const size_t row_base = static_cast<size_t>(iu) * static_cast<size_t>(nv);
+                for (int cv = 0; cv < supp; ++cv) {
+                    int iv = iv0 + cv;
+                    if (iv < 0) iv += nv;
+                    else if (iv >= nv) iv -= nv;
+                    const float kv_val = kv[cv];
+                    const size_t cell = row_base + static_cast<size_t>(iv);
+                    atomicAdd(&plane_grid[cell].x, vr_u * kv_val);
+                    atomicAdd(&plane_grid[cell].y, vi_u * kv_val);
+                }
+            }
+        }
+    }
+}
+
+
+/**
+ * Accumulate one w-plane's backward 2D FFT grid (grid_nu, nv) into the real
+ * image-space accumulator ``rgrid`` (grid_nu, nv) with the exact DUCC w-screen
+ * phase factor (Wgridder::grid2rgrid_c_overwrite_wscreen_add in
+ * wgridder_impl.h:1750-1808):
+ *   nm1 = (-x^2 - y^2) / (sqrt(1 - x^2 - y^2) + 1)
+ *   phs = -w * (nm1 + nshift)
+ *   ang = 2 * pi * (phs - floor(phs))
+ *   rgrid(ix, jx) += grid(ix, jx).real * cos(ang) - grid(ix, jx).imag * sin(ang)
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: jx in [0, nv), y: ix in [0, grid_nu)]
+ *   grid  = (ceil(nv / 32), ceil(grid_nu / 8), 1)
+ */
+extern "C" __global__ void ducc_wscreen_accumulate_kernel(
+    const float2* __restrict__ plane_grid,
+    float* __restrict__ rgrid,
+    int grid_nu,
+    int nv,
+    int nxdirty,
+    int nydirty,
+    double pixsize_x,
+    double pixsize_y,
+    double lshift,
+    double mshift,
+    double nshift,
+    double w_plane
+) {
+    const int jx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ix = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ix >= grid_nu || jx >= nv) {
+        return;
+    }
+
+    const int hnx = nxdirty / 2;
+    const int hny = nydirty / 2;
+    int kx = (ix <= grid_nu / 2) ? ix : (ix - grid_nu);
+    kx = max(-hnx, min(hnx, kx));
+    int ky = (jx <= nv / 2) ? jx : (jx - nv);
+    ky = max(-hny, min(hny, ky));
+
+    const double x = lshift + static_cast<double>(kx) * pixsize_x;
+    const double y = mshift + static_cast<double>(ky) * pixsize_y;
+    const double xsq = x * x;
+    const double ysq = y * y;
+    const double tmp = 1.0 - xsq - ysq;
+
+    float ang = 0.0f;
+    if (tmp > 0.0) {
+        const double nm1 = (-xsq - ysq) / (sqrt(tmp) + 1.0);
+        const double phs = -w_plane * (nm1 + nshift);
+        ang = kTwoPiF * static_cast<float>(phs - floor(phs));
+    }
+
+    float s = 0.0f;
+    float c = 1.0f;
+    __sincosf(ang, &s, &c);
+
+    const size_t idx = static_cast<size_t>(ix) * static_cast<size_t>(nv) + static_cast<size_t>(jx);
+    const float2 g = plane_grid[idx];
+    rgrid[idx] += g.x * c - g.y * s;
+}
+
+
 /**
  * Fused subband/per-channel dedispersion and direct-to-grid rasterisation
  * kernel (Regime B: collapse_channels=False or nsubbands > 1) with in-register
@@ -1023,4 +1775,467 @@ extern "C" __global__ void normalise_sparse_grid_kernel(
         }
         out_dga[idx] = val;
     }
+}
+
+
+/**
+ * Normalise dense UV raster grid (nt_out, nv, u_half) by per-snapshot natural
+ * weight scale ``snap_inv_w[t]`` (e.g., ``1.0f / (wgt_max[t] * n_valid[t])``
+ * matching ``fastducc.imaging.grid_chunk_uv_cube`` and ``ducc0.wgridder.vis2grid``).
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: spatial cell s (coalesced), y: snapshot t]
+ *   grid  = (ceil((nv * u_half) / 32), min(65535, ceil(nt_out / 8)), 1)
+ */
+extern "C" __global__ void normalise_raster_grid_snapshot_kernel(
+    const float2* __restrict__ grid_vis,
+    const float* __restrict__ grid_wgt,
+    const float* __restrict__ snap_inv_w,
+    const int* __restrict__ raw_valid_chans,
+    const int* __restrict__ dedisp_valid_chans,
+    float2* __restrict__ out_uv,
+    int nt_out,
+    int nv,
+    int u_half,
+    int nchan,
+    int collapse_channels,
+    int min_valid_channels,
+    float uv_threshold
+) {
+    const size_t spatial = static_cast<size_t>(nv) * static_cast<size_t>(u_half);
+    const size_t s = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(blockDim.x) + static_cast<size_t>(threadIdx.x);
+    if (s >= spatial) {
+        return;
+    }
+
+    const float thr_sq = (uv_threshold > 0.0f) ? (uv_threshold * uv_threshold) : 0.0f;
+
+    for (int t = blockIdx.y * blockDim.y + threadIdx.y; t < nt_out; t += gridDim.y * blockDim.y) {
+        const size_t idx = static_cast<size_t>(t) * spatial + s;
+        float2 val = make_float2(0.0f, 0.0f);
+
+        if (is_snapshot_valid(t, nchan, collapse_channels, min_valid_channels, raw_valid_chans, dedisp_valid_chans)) {
+            const float inv_w = snap_inv_w[t];
+            const float w = grid_wgt[idx];
+            if (inv_w > 0.0f && isfinite(inv_w) && w > 0.0f && isfinite(w)) {
+                const float2 raw = grid_vis[idx];
+                const float rx = raw.x * inv_w;
+                const float ry = raw.y * inv_w;
+                if (isfinite(rx) && isfinite(ry)) {
+                    if (thr_sq <= 0.0f || (rx * rx + ry * ry) > thr_sq) {
+                        val = make_float2(rx, ry);
+                    }
+                }
+            }
+        }
+        out_uv[idx] = val;
+    }
+}
+
+
+/**
+ * Normalise sparse active-cell DGA raster grid (M, nt_out) by per-snapshot
+ * natural weight scale ``snap_inv_w[t]``.
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: snapshot t (coalesced), y: active cell m]
+ *   grid  = (ceil(nt_out / 32), min(65535, ceil(M / 8)), 1)
+ */
+extern "C" __global__ void normalise_sparse_grid_snapshot_kernel(
+    const float2* __restrict__ sparse_vis,
+    const float* __restrict__ sparse_wgt,
+    const float* __restrict__ snap_inv_w,
+    const int* __restrict__ raw_valid_chans,
+    const int* __restrict__ dedisp_valid_chans,
+    float2* __restrict__ out_dga,
+    int m_active,
+    int nt_out,
+    int nchan,
+    int collapse_channels,
+    int min_valid_channels,
+    float uv_threshold
+) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nt_out) {
+        return;
+    }
+
+    const bool snap_ok = is_snapshot_valid(
+        t, nchan, collapse_channels, min_valid_channels, raw_valid_chans, dedisp_valid_chans
+    );
+    const float inv_w = snap_ok ? snap_inv_w[t] : 0.0f;
+    const bool scale_ok = (inv_w > 0.0f) && isfinite(inv_w);
+    const float thr_sq = (uv_threshold > 0.0f) ? (uv_threshold * uv_threshold) : 0.0f;
+
+    for (int m = blockIdx.y * blockDim.y + threadIdx.y; m < m_active; m += gridDim.y * blockDim.y) {
+        const size_t idx = static_cast<size_t>(m) * static_cast<size_t>(nt_out) + static_cast<size_t>(t);
+        float2 val = make_float2(0.0f, 0.0f);
+
+        if (scale_ok) {
+            const float w = sparse_wgt[idx];
+            if (w > 0.0f && isfinite(w)) {
+                const float2 raw = sparse_vis[idx];
+                const float rx = raw.x * inv_w;
+                const float ry = raw.y * inv_w;
+                if (isfinite(rx) && isfinite(ry)) {
+                    if (thr_sq <= 0.0f || (rx * rx + ry * ry) > thr_sq) {
+                        val = make_float2(rx, ry);
+                    }
+                }
+            }
+        }
+        out_dga[idx] = val;
+    }
+}
+
+
+/**
+ * Compute per-snapshot DUCC vis2grid natural weight normalisation scale
+ * ``snap_inv_w[t]`` for ``t in [0, nt_out)`` matching
+ * ``fastducc.imaging.grid_chunk_uv_cube``:
+ *   - For each snapshot ``t``, reduces channels into ``nsub_eff`` subbands.
+ *   - Finds ``wgt_max[t] = max_{bl, s} w_sub[bl, s, t]`` and
+ *     ``n_valid[t] = count_{bl, s}(w_sub[bl, s, t] > 0)``.
+ *   - If ``divide_by_n != 0``: ``snap_inv_w[t] = 1.0f / (wgt_max[t] * n_valid[t])``
+ *     else: ``snap_inv_w[t] = 1.0f / wgt_max[t]``.
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: baseline tile, y: subband tile]
+ *   grid  = (nt_out, 1, 1)
+ */
+extern "C" __global__ void compute_snapshot_vis2grid_norm_kernel(
+    const float2* __restrict__ vis_3d,
+    const float* __restrict__ wgt_3d,
+    const double* __restrict__ uvw_3d,
+    const int* __restrict__ delays,
+    const int* __restrict__ sub_offsets,
+    const int* __restrict__ raw_valid_chans,
+    const int* __restrict__ dedisp_valid_chans,
+    float* __restrict__ snap_inv_w,
+    int nbl,
+    int nchan,
+    int nsub_eff,
+    int nt_in,
+    int nt_out,
+    double min_uv_distance_m,
+    int min_valid_channels,
+    int collapse_channels,
+    int divide_by_n
+) {
+    __shared__ float s_max_w[256];
+    __shared__ int s_cnt_w[256];
+
+    const int t = blockIdx.x;
+    if (t >= nt_out) {
+        return;
+    }
+
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    float local_max = 0.0f;
+    int local_cnt = 0;
+
+    if (is_snapshot_valid(t, nchan, collapse_channels, min_valid_channels, raw_valid_chans, dedisp_valid_chans)) {
+        const size_t bl_vis_stride = static_cast<size_t>(nchan) * static_cast<size_t>(nt_in);
+        const size_t bl_uvw_stride = 3ULL * static_cast<size_t>(nt_in);
+
+        for (int s = threadIdx.y; s < nsub_eff; s += blockDim.y) {
+            const int c0 = sub_offsets[s];
+            const int c1 = sub_offsets[s + 1];
+            for (int bl = threadIdx.x; bl < nbl; bl += blockDim.x) {
+                const size_t base_vis = static_cast<size_t>(bl) * bl_vis_stride;
+                const size_t base_uvw = static_cast<size_t>(bl) * bl_uvw_stride;
+                double sum_w = 0.0;
+                for (int c = c0; c < c1; ++c) {
+                    const int d = delays[c];
+                    const int t_src = t + d;
+                    if (t_src < 0 || t_src >= nt_in) {
+                        continue;
+                    }
+                    const size_t vis_idx = base_vis + static_cast<size_t>(c) * static_cast<size_t>(nt_in) + static_cast<size_t>(t_src);
+                    const float w = wgt_3d[vis_idx];
+                    if (w <= 0.0f || !isfinite(w)) {
+                        continue;
+                    }
+                    const float2 v = vis_3d[vis_idx];
+                    if (!isfinite(v.x) || !isfinite(v.y)) {
+                        continue;
+                    }
+                    if (min_uv_distance_m > 0.0) {
+                        const double u_src = uvw_3d[base_uvw + static_cast<size_t>(t_src)];
+                        const double v_src = uvw_3d[base_uvw + static_cast<size_t>(nt_in) + static_cast<size_t>(t_src)];
+                        if (!passes_uv_distance(u_src, v_src, min_uv_distance_m)) {
+                            continue;
+                        }
+                    }
+                    sum_w += static_cast<double>(w);
+                }
+                const float wf = static_cast<float>(sum_w);
+                if (wf > 0.0f) {
+                    local_cnt += 1;
+                    if (wf > local_max) {
+                        local_max = wf;
+                    }
+                }
+            }
+        }
+    }
+
+    s_max_w[tid] = local_max;
+    s_cnt_w[tid] = local_cnt;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_max_w[tid + stride] > s_max_w[tid]) {
+                s_max_w[tid] = s_max_w[tid + stride];
+            }
+            s_cnt_w[tid] += s_cnt_w[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        const float wmax = s_max_w[0];
+        const int nval = s_cnt_w[0];
+        if (wmax > 0.0f && nval > 0) {
+            double denom = static_cast<double>(wmax);
+            if (divide_by_n == 1) {
+                denom *= static_cast<double>(nval);
+            } else if (divide_by_n == 2) {
+                const int nsub_norm = (collapse_channels != 0 && nsub_eff <= 1) ? 1 : max(1, nsub_eff);
+                const double nbl_eff = fmax(1.0, static_cast<double>(nval) / static_cast<double>(nsub_norm));
+                denom *= nbl_eff;
+            }
+            snap_inv_w[t] = static_cast<float>(1.0 / denom);
+        } else {
+            snap_inv_w[t] = 0.0f;
+        }
+    }
+}
+
+
+/**
+ * Apply DUCC w-axis correction function ``corfunc((nm1 + nshift) * dw) / ((nm1 + 1) * nu * nv)``
+ * to the accumulated real image grid ``rgrid`` (grid_nu, nv) matching
+ * ``Wgridder::apply_w_corrections_rgrid`` (``wgridder_impl.h:1811-1871``).
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: jx in [0, nv), y: ix in [0, grid_nu)]
+ *   grid  = (ceil(nv / 32), ceil(grid_nu / 8), 1)
+ */
+extern "C" __global__ void ducc_apply_w_corrections_rgrid_kernel(
+    float* __restrict__ rgrid,
+    const double* __restrict__ cor_x,
+    const double* __restrict__ cor_wgtpsi,
+    int n_cor,
+    int grid_nu,
+    int nv,
+    int nxdirty,
+    int nydirty,
+    double pixsize_x,
+    double pixsize_y,
+    double lshift,
+    double mshift,
+    double nshift,
+    double dw,
+    int divide_by_n
+) {
+    const int jx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ix = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ix >= grid_nu || jx >= nv) {
+        return;
+    }
+
+    const int hnx = nxdirty / 2;
+    const int hny = nydirty / 2;
+    int kx = (ix <= grid_nu / 2) ? ix : (ix - grid_nu);
+    kx = max(-hnx, min(hnx, kx));
+    int ky = (jx <= nv / 2) ? jx : (jx - nv);
+    ky = max(-hny, min(hny, ky));
+
+    const double x = lshift + static_cast<double>(kx) * pixsize_x;
+    const double y = mshift + static_cast<double>(ky) * pixsize_y;
+    const double xsq = x * x;
+    const double ysq = y * y;
+    const double tmp = 1.0 - xsq - ysq;
+
+    double fct = 0.0;
+    if (tmp >= 0.0) {
+        const double nm1 = (-xsq - ysq) / (sqrt(tmp) + 1.0);
+        const double v_arg = (nm1 + nshift) * dw;
+        double sum_c = 0.0;
+        for (int i = 0; i < n_cor; ++i) {
+            sum_c += cor_wgtpsi[i] * cos(cor_x[i] * v_arg);
+        }
+        fct = 1.0 / sum_c;
+        if (divide_by_n != 0) {
+            fct /= (nm1 + 1.0);
+        }
+    } else if (divide_by_n == 0) {
+        const double v_arg = (-sqrt(-tmp) - 1.0 + nshift) * dw;
+        double sum_c = 0.0;
+        for (int i = 0; i < n_cor; ++i) {
+            sum_c += cor_wgtpsi[i] * cos(cor_x[i] * v_arg);
+        }
+        fct = 1.0 / sum_c;
+    }
+
+    const float tfct = static_cast<float>(fct / (static_cast<double>(grid_nu) * static_cast<double>(nv)));
+    const size_t idx = static_cast<size_t>(ix) * static_cast<size_t>(nv) + static_cast<size_t>(jx);
+    rgrid[idx] *= tfct;
+}
+
+
+/**
+ * Convert forward 2D complex FFT output ``fft_rgrid`` (grid_nu, nv) of real
+ * ``rgrid`` into DUCC's 2D Fast Hartley Transform buffer ``fht`` (grid_nu, nv):
+ *   fht(u, v) = Re(F(u, v)) - Im(F(u, v))
+ * (because the 2D FHT cas(2*pi*(u*x/nu + v*y/nv)) = cos(...) + sin(...) = Re(F(u,v)) - Im(F(u,v))).
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: v in [0, nv), y: u in [0, grid_nu)]
+ *   grid  = (ceil(nv / 32), ceil(grid_nu / 8), 1)
+ */
+extern "C" __global__ void ducc_fft_to_fht_kernel(
+    const float2* __restrict__ fft_rgrid,
+    float* __restrict__ fht,
+    int grid_nu,
+    int nv
+) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= grid_nu || v >= nv) {
+        return;
+    }
+    const size_t idx = static_cast<size_t>(u) * static_cast<size_t>(nv) + static_cast<size_t>(v);
+    const float2 val = fft_rgrid[idx];
+    fht[idx] = val.x - val.y;
+}
+
+
+/**
+ * Separable 1D circular box dilation along v (step 1 of DUCC apply_uv_fresnel_mask).
+ */
+extern "C" __global__ void ducc_fresnel_dilate_v_kernel(
+    const unsigned char* __restrict__ seed,
+    unsigned char* __restrict__ tmp,
+    int grid_nu,
+    int nv,
+    int dv_f
+) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= grid_nu || v >= nv) {
+        return;
+    }
+    const size_t row = static_cast<size_t>(u) * static_cast<size_t>(nv);
+    unsigned char hit = 0;
+    for (int dv = -dv_f; dv <= dv_f; ++dv) {
+        int iv = (v - dv) % nv;
+        if (iv < 0) iv += nv;
+        if (seed[row + static_cast<size_t>(iv)] != 0) {
+            hit = 1;
+            break;
+        }
+    }
+    tmp[row + static_cast<size_t>(v)] = hit;
+}
+
+
+/**
+ * Separable 1D circular box dilation along u + in-place Fresnel zeroing of
+ * ``fht`` (step 2 of DUCC apply_uv_fresnel_mask in wgridder_impl.h:1928-1946).
+ */
+extern "C" __global__ void ducc_fresnel_dilate_u_and_mask_kernel(
+    const unsigned char* __restrict__ tmp,
+    float* __restrict__ fht,
+    int grid_nu,
+    int nv,
+    int du_f
+) {
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= grid_nu || v >= nv) {
+        return;
+    }
+    bool hit = false;
+    for (int du = -du_f; du <= du_f; ++du) {
+        int iu = (u - du) % grid_nu;
+        if (iu < 0) iu += grid_nu;
+        if (tmp[static_cast<size_t>(iu) * static_cast<size_t>(nv) + static_cast<size_t>(v)] != 0) {
+            hit = true;
+            break;
+        }
+    }
+    if (!hit) {
+        fht[static_cast<size_t>(u) * static_cast<size_t>(nv) + static_cast<size_t>(v)] = 0.0f;
+    }
+}
+
+
+/**
+ * Convert masked 2D FHT buffer ``fht`` (grid_nu, nv) into Hermitian half-plane
+ * complex UV grid ``(nv, u_half)`` (or sparse active-cell DGA column ``(M, nt_out)``
+ * for snapshot ``t``) via DUCC ``hartley2complex``:
+ *   G(u, v) = 0.5 * (fht(u, v) + fht(-u mod nu, -v mod nv))
+ *           + 0.5j * (fht(-u mod nu, -v mod nv) - fht(u, v))
+ * scaled by ``snap_scale`` (e.g. ``1.0f / n_valid``).
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: u in [0, u_half), y: v in [0, nv)]
+ *   grid  = (ceil(u_half / 32), ceil(nv / 8), 1)
+ */
+extern "C" __global__ void ducc_fht_to_halfplane_kernel(
+    const float* __restrict__ fht,
+    const int* __restrict__ uv_to_m,
+    float2* __restrict__ out_uv,
+    int t,
+    int nt_out,
+    int grid_nu,
+    int nv,
+    int u_half,
+    float snap_scale,
+    float uv_threshold,
+    int sparse_output
+) {
+    const int u = blockIdx.x * blockDim.x + threadIdx.x;
+    const int v = blockIdx.y * blockDim.y + threadIdx.y;
+    if (u >= u_half || v >= nv) {
+        return;
+    }
+
+    const size_t uv_offset = static_cast<size_t>(v) * static_cast<size_t>(u_half) + static_cast<size_t>(u);
+    size_t dst_idx = 0ULL;
+    if (uv_to_m != nullptr) {
+        const int m_idx = uv_to_m[uv_offset];
+        if (m_idx < 0) {
+            if (sparse_output == 0) {
+                out_uv[static_cast<size_t>(t) * static_cast<size_t>(nv) * static_cast<size_t>(u_half) + uv_offset] =
+                    make_float2(0.0f, 0.0f);
+            }
+            return;
+        }
+        if (sparse_output != 0) {
+            dst_idx = static_cast<size_t>(m_idx) * static_cast<size_t>(nt_out) + static_cast<size_t>(t);
+        } else {
+            dst_idx = static_cast<size_t>(t) * static_cast<size_t>(nv) * static_cast<size_t>(u_half) + uv_offset;
+        }
+    } else {
+        dst_idx = static_cast<size_t>(t) * static_cast<size_t>(nv) * static_cast<size_t>(u_half) + uv_offset;
+    }
+
+    const int xu = (u == 0) ? 0 : (grid_nu - u);
+    const int xv = (v == 0) ? 0 : (nv - v);
+    const float a = fht[static_cast<size_t>(u) * static_cast<size_t>(nv) + static_cast<size_t>(v)];
+    const float b = fht[static_cast<size_t>(xu) * static_cast<size_t>(nv) + static_cast<size_t>(xv)];
+
+    const float rx = 0.5f * (a + b) * snap_scale;
+    const float ry = 0.5f * (b - a) * snap_scale;
+    const float thr_sq = (uv_threshold > 0.0f) ? (uv_threshold * uv_threshold) : 0.0f;
+
+    float2 val = make_float2(0.0f, 0.0f);
+    if (isfinite(rx) && isfinite(ry) && (thr_sq <= 0.0f || (rx * rx + ry * ry) > thr_sq)) {
+        val = make_float2(rx, ry);
+    }
+    out_uv[dst_idx] = val;
 }

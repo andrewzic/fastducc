@@ -791,3 +791,224 @@ def test_gpu_buffers_and_csr_matrix_bridge(tmp_path: Path):
         roundtrip_host = gpu_store.to_cpu()
         np.testing.assert_allclose(roundtrip_host.vis_data, vis_data)
         gpu_store.release()
+
+
+def test_wgridder_cpu_gpu_and_ducc_vis2grid_parity():
+    """
+    Verify that mode='wgridder' (both direct 2D DUCC piecewise polynomial kernel +
+    w-phase preconditioning and full 3D DUCC w-stacking) matches CPU
+    ducc0.wgridder.vis2grid to < 1e-4 relative difference (actually < 1e-6)
+    across Numba CPU, pure NumPy CPU, and CUDA GPU, as well as sparse CSR output.
+    """
+    ducc0 = pytest.importorskip("ducc0")
+    sim = _simulate_288chan_chunk(seed=4242)
+    npix_x, npix_y = 128, 128
+    pixsize_arcsec = 22.0
+    pix_rad = pixsize_arcsec / 206265.0
+    nt_out = 4
+    vis_3d = sim["vis_3d"][:, :, :nt_out]
+    wgt_3d = sim["wgt_3d"][:, :, :nt_out]
+    uvw_3d = sim["uvw_3d"][:, :, :nt_out]
+    freqs_hz = sim["freqs_hz"]
+
+    # 1. Compare 2D DUCC polynomial kernel (apply_w_phase=False) against ducc0.wgridder.vis2grid(do_wgridding=False)
+    from fastducc import imaging
+
+    ref_2d = imaging.grid_chunk_uv_cube(
+        vis_3d,
+        wgt_3d,
+        uvw_3d,
+        freqs_hz,
+        sim["dt"],
+        dm=0.0,
+        collapse_channels=False,
+        nsubbands=1,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_x=pix_rad,
+        pixsize_y=pix_rad,
+        epsilon=1e-5,
+        do_wgridding=False,
+        min_valid_channels=1,
+    )
+    u_half_2d = ref_2d.shape[2] // 2 + 1
+    ref_2d_hp = ref_2d[:, :, :u_half_2d]
+
+    cpu_numba_2d = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d,
+        wgt_3d,
+        uvw_3d,
+        freqs_hz,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_arcsec=pixsize_arcsec,
+        mode="wgridder",
+        epsilon=1e-5,
+        do_wgridding=False,
+        apply_w_phase=False,
+        normalise_mode="vis2grid",
+        min_valid_channels=1,
+        use_numba=True,
+    )
+    cpu_numpy_2d = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d,
+        wgt_3d,
+        uvw_3d,
+        freqs_hz,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_arcsec=pixsize_arcsec,
+        mode="wgridder",
+        epsilon=1e-5,
+        do_wgridding=False,
+        apply_w_phase=False,
+        normalise_mode="vis2grid",
+        min_valid_channels=1,
+        use_numba=False,
+    )
+    assert _rel_l2_error(cpu_numba_2d, ref_2d_hp) < 1e-5
+    assert _rel_l2_error(cpu_numpy_2d, ref_2d_hp) < 1e-5
+    assert _rel_l2_error(cpu_numba_2d, cpu_numpy_2d) < 1e-6
+
+    # 2. Direct 2D DUCC kernel + w-phase preconditioning (default mode="wgridder"): CPU vs GPU & sparse CSR
+    wg_cpu_numba = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d=sim["vis_3d"],
+        wgt_3d=sim["wgt_3d"],
+        uvw_3d=sim["uvw_3d"],
+        freqs_hz=freqs_hz,
+        nt_out=sim["nt_out"],
+        dm=sim["dm"],
+        dt=sim["dt"],
+        collapse_channels=False,
+        nsubbands=16,
+        exact_uvw=True,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_arcsec=pixsize_arcsec,
+        mode="wgridder",
+        epsilon=1e-5,
+        min_valid_channels=24,
+        min_uv_distance_m=150.0,
+        uv_threshold=1e-4,
+        use_numba=True,
+    )
+    wg_cpu_numpy = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d=sim["vis_3d"],
+        wgt_3d=sim["wgt_3d"],
+        uvw_3d=sim["uvw_3d"],
+        freqs_hz=freqs_hz,
+        nt_out=sim["nt_out"],
+        dm=sim["dm"],
+        dt=sim["dt"],
+        collapse_channels=False,
+        nsubbands=16,
+        exact_uvw=True,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_arcsec=pixsize_arcsec,
+        mode="wgridder",
+        epsilon=1e-5,
+        min_valid_channels=24,
+        min_uv_distance_m=150.0,
+        uv_threshold=1e-4,
+        use_numba=False,
+    )
+    assert _rel_l2_error(wg_cpu_numba, wg_cpu_numpy) < 1e-6
+
+    # 3. Compare full 3D DUCC w-stacking (do_wgridding=True) against ducc0.wgridder.vis2grid(do_wgridding=True)
+    ref_3d = imaging.grid_chunk_uv_cube(
+        vis_3d[:, :, :2],
+        wgt_3d[:, :, :2],
+        uvw_3d[:, :, :2],
+        freqs_hz,
+        sim["dt"],
+        dm=0.0,
+        collapse_channels=False,
+        nsubbands=1,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_x=pix_rad,
+        pixsize_y=pix_rad,
+        epsilon=1e-5,
+        do_wgridding=True,
+        min_valid_channels=1,
+    )
+    u_half_3d = ref_3d.shape[2] // 2 + 1
+    ref_3d_hp = ref_3d[:, :, :u_half_3d]
+
+    cpu_3d = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d[:, :, :2],
+        wgt_3d[:, :, :2],
+        uvw_3d[:, :, :2],
+        freqs_hz,
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pixsize_arcsec=pixsize_arcsec,
+        mode="wgridder",
+        epsilon=1e-5,
+        do_wgridding=True,
+        normalise_mode="vis2grid",
+        min_valid_channels=1,
+    )
+    assert _rel_l2_error(cpu_3d, ref_3d_hp) < 1e-5
+
+    if is_cuda_available():
+        gpu_2d = dedisperse_and_rasterise_chunk_gpu(
+            vis_3d,
+            wgt_3d,
+            uvw_3d,
+            freqs_hz,
+            npix_x=npix_x,
+            npix_y=npix_y,
+            pixsize_arcsec=pixsize_arcsec,
+            mode="wgridder",
+            epsilon=1e-5,
+            do_wgridding=False,
+            apply_w_phase=False,
+            normalise_mode="vis2grid",
+            min_valid_channels=1,
+            return_host=True,
+        )
+        assert _rel_l2_error(gpu_2d, ref_2d_hp) < 1e-5
+        assert _rel_l2_error(gpu_2d, cpu_numba_2d) < 1e-6
+
+        wg_gpu = dedisperse_and_rasterise_chunk_gpu(
+            vis_3d=sim["vis_3d"],
+            wgt_3d=sim["wgt_3d"],
+            uvw_3d=sim["uvw_3d"],
+            freqs_hz=freqs_hz,
+            nt_out=sim["nt_out"],
+            dm=sim["dm"],
+            dt=sim["dt"],
+            collapse_channels=False,
+            nsubbands=16,
+            exact_uvw=True,
+            npix_x=npix_x,
+            npix_y=npix_y,
+            pixsize_arcsec=pixsize_arcsec,
+            mode="wgridder",
+            epsilon=1e-5,
+            min_valid_channels=24,
+            min_uv_distance_m=150.0,
+            uv_threshold=1e-4,
+            return_host=True,
+        )
+        assert _rel_l2_error(wg_gpu, wg_cpu_numba) < 1e-6
+
+        gpu_3d = dedisperse_and_rasterise_chunk_gpu(
+            vis_3d[:, :, :2],
+            wgt_3d[:, :, :2],
+            uvw_3d[:, :, :2],
+            freqs_hz,
+            npix_x=npix_x,
+            npix_y=npix_y,
+            pixsize_arcsec=pixsize_arcsec,
+            mode="wgridder",
+            epsilon=1e-5,
+            do_wgridding=True,
+            normalise_mode="vis2grid",
+            min_valid_channels=1,
+            return_host=True,
+        )
+        assert _rel_l2_error(gpu_3d, ref_3d_hp) < 1e-5
+        assert _rel_l2_error(gpu_3d, cpu_3d) < 1e-6

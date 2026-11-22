@@ -675,6 +675,7 @@ def _run_stage234_gpu(
     save_fullframes: bool,
     inplace_preprocess: bool,
     gpu_store_to_release: Optional[Any],
+    raster_mode: str = "",
 ) -> Dict[str, Any]:
     """Execute zero-copy Stage 2/3/4 directly on GPU buffers."""
     _ensure_periodicity_importable()
@@ -847,6 +848,22 @@ def _run_stage234_gpu(
             d_cos_buf = cp.empty((eff_slab_size, m_total), dtype=cp.complex64)
             d_sin_buf = cp.empty((eff_slab_size, m_total), dtype=cp.complex64)
 
+            d_cfu: Optional[Any] = None
+            d_cfv: Optional[Any] = None
+            if str(raster_mode).strip().lower() in ("wgridder", "ducc_wgridder"):
+                from fastducc.gpu_raster import build_ducc_corfunc, eval_ducc_corfunc, select_ducc_kernel_params
+
+                kpar = select_ducc_kernel_params(epsilon=float(epsilon), do_wgridding=False)
+                cor_x, cor_wgt = build_ducc_corfunc(int(kpar["W"]), float(kpar["beta"]), float(kpar["e0"]))
+                cfu_h = eval_ducc_corfunc(
+                    np.arange(int(nx) // 2 + 1, dtype=np.float64) / float(grid_nu), cor_x, cor_wgt
+                ).astype(np.float32)
+                cfv_h = eval_ducc_corfunc(
+                    np.arange(int(ny) // 2 + 1, dtype=np.float64) / float(nv), cor_x, cor_wgt
+                ).astype(np.float32)
+                d_cfu = cp.asarray(cfu_h, dtype=cp.float32)
+                d_cfv = cp.asarray(cfv_h, dtype=cp.float32)
+
             for slab_off in range(0, int(nkeep), eff_slab_size):
                 b_slab = min(eff_slab_size, int(nkeep) - slab_off)
                 evaluate_ragged_temporal_nufft_slab_gpu(
@@ -873,6 +890,8 @@ def _run_stage234_gpu(
                         nx=nx,
                         out=out_sub,
                         workspace=ws,
+                        corfunc_u=d_cfu,
+                        corfunc_v=d_cfv,
                     )
                     if not use_vram_cube:
                         host_blk = cp.asnumpy(out_sub).astype(np.float32, copy=False)
@@ -1052,6 +1071,7 @@ def _run_stage234_cpu(
     cutout_size: int,
     save_fullframes: bool,
     nthreads: int,
+    raster_mode: str = "",
 ) -> Dict[str, Any]:
     """Execute CPU fallback Stage 2/3/4 from a host :class:`RaggedDGAStore`."""
     _ensure_periodicity_importable()
@@ -1126,6 +1146,23 @@ def _run_stage234_cpu(
     idx_y = np.concatenate([np.arange(nv - half_ny, nv), np.arange(0, ny - half_ny)]).astype(np.int64)
     idx_x = np.concatenate([np.arange(grid_nu - half_nx, grid_nu), np.arange(0, nx - half_nx)]).astype(np.int64)
 
+    deapod_2d_sq: Optional[np.ndarray] = None
+    if str(raster_mode).strip().lower() in ("wgridder", "ducc_wgridder"):
+        from fastducc.gpu_raster import build_ducc_corfunc, eval_ducc_corfunc, select_ducc_kernel_params
+
+        kpar = select_ducc_kernel_params(epsilon=float(epsilon), do_wgridding=False)
+        cor_x, cor_wgt = build_ducc_corfunc(int(kpar["W"]), float(kpar["beta"]), float(kpar["e0"]))
+        cfu_h = eval_ducc_corfunc(
+            np.arange(int(nx) // 2 + 1, dtype=np.float64) / float(grid_nu), cor_x, cor_wgt
+        ).astype(np.float32)
+        cfv_h = eval_ducc_corfunc(
+            np.arange(int(ny) // 2 + 1, dtype=np.float64) / float(nv), cor_x, cor_wgt
+        ).astype(np.float32)
+        dx_abs = np.abs(np.arange(int(nx), dtype=np.int64) - half_nx)
+        dy_abs = np.abs(np.arange(int(ny), dtype=np.int64) - half_ny)
+        deapod_2d = cfv_h[dy_abs][:, None] * cfu_h[dx_abs][None, :]
+        deapod_2d_sq = (deapod_2d * deapod_2d).astype(np.float32)
+
     os.makedirs(scratch_dir, exist_ok=True)
     power_mmap_path = os.path.join(
         scratch_dir, f"{ms_base}_nufft_power_dm{dm_val:.2f}_{uuid.uuid4().hex[:8]}.mmap"
@@ -1160,6 +1197,8 @@ def _run_stage234_cpu(
             crop_cos = dirty_cos[:, idx_y[:, None], idx_x[None, :]]
             crop_sin = dirty_sin[:, idx_y[:, None], idx_x[None, :]]
             power_blk = (crop_cos * crop_cos + crop_sin * crop_sin).astype(np.float32, copy=False)
+            if deapod_2d_sq is not None:
+                power_blk = (power_blk * deapod_2d_sq[None, :, :]).astype(np.float32, copy=False)
             _pwrite_all(power_fd, power_blk, ks * slice_bytes)
             del grid_cos, grid_sin, dirty_cos, dirty_sin, crop_cos, crop_sin, power_blk
             if (ke * slice_bytes - synced_upto) >= _POWER_SYNC_BYTES or ke == int(nkeep):
@@ -1402,6 +1441,7 @@ def run_gpu_nufft_from_store(
             save_fullframes=bool(save_fullframes),
             inplace_preprocess=bool(inplace_preprocess),
             gpu_store_to_release=gpu_store if release_store else None,
+            raster_mode=str(merged_attrs.get("raster_mode", "")),
         )
 
     host_store = gpu_store_to_host_ragged(
@@ -1445,6 +1485,7 @@ def run_gpu_nufft_from_store(
         cutout_size=int(cutout_size),
         save_fullframes=bool(save_fullframes),
         nthreads=int(nthreads),
+        raster_mode=str(merged_attrs.get("raster_mode", "")),
     )
 
 

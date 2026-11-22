@@ -360,6 +360,17 @@ def _prescan_ms_metadata(
                     )
                 else:
                     scan_vals = np.zeros(ts_starts.size, dtype=np.int64)
+            elif is_sorted and ts_starts is not None and int(ts_starts.size) > 0:
+                if has_scan:
+                    scan_all = np.asarray(t_main.getcol("SCAN_NUMBER"), dtype=np.int64)
+                    scan_vals = scan_all[ts_starts]
+                    del scan_all
+                else:
+                    scan_vals = np.zeros(ts_starts.size, dtype=np.int64)
+                a1 = np.asarray(t_main.getcol("ANTENNA1"), dtype=np.int64)
+                a2 = np.asarray(t_main.getcol("ANTENNA2"), dtype=np.int64)
+                bl_keys = (a1 << 32) | (a2 & 0xFFFFFFFF)
+                del a1, a2
             else:
                 scan_vals = (
                     np.asarray(t_main.getcol("SCAN_NUMBER"), dtype=np.int64)
@@ -369,6 +380,7 @@ def _prescan_ms_metadata(
                 a1 = np.asarray(t_main.getcol("ANTENNA1"), dtype=np.int64)
                 a2 = np.asarray(t_main.getcol("ANTENNA2"), dtype=np.int64)
                 bl_keys = (a1 << 32) | (a2 & 0xFFFFFFFF)
+                del a1, a2
 
             sample_cell = np.asarray(t_main.getcell(data_column, 0))
             if sample_cell.ndim == 1:
@@ -440,17 +452,20 @@ def _prescan_ms_metadata(
     )
     if all_sorted_disjoint:
         unique_times = np.concatenate([e.t_vals[e.ts_starts] for e in entries])
-        scan_per_time = np.concatenate(
-            [
-                (e.scan_vals if e.is_uniform_bl else e.scan_vals[e.ts_starts])
-                for e in entries
-            ]
-        )
+        scan_per_time = np.concatenate([e.scan_vals for e in entries])
     else:
         all_times = np.concatenate([e.t_vals for e in entries])
         all_scans = np.concatenate(
             [
-                (np.repeat(e.scan_vals, e.nbl_step) if e.is_uniform_bl else e.scan_vals)
+                (
+                    np.repeat(e.scan_vals, e.nbl_step)
+                    if e.is_uniform_bl
+                    else (
+                        np.repeat(e.scan_vals, e.ts_ends - e.ts_starts)
+                        if (e.is_time_sorted and e.ts_starts is not None and e.ts_ends is not None)
+                        else e.scan_vals
+                    )
+                )
                 for e in entries
             ]
         )
@@ -1154,6 +1169,7 @@ def _stream_gpu(
     nsubbands: int,
     exact_uvw: bool,
     mode: str,
+    wgridder_kwargs: Optional[Dict[str, Any]],
     min_valid_channels: int,
     min_uv_distance_m: Optional[float],
     uv_threshold: float,
@@ -1391,6 +1407,7 @@ def _stream_gpu(
                 uv_threshold=float(uv_threshold),
                 return_sparse=False,
                 return_host=False,
+                **(wgridder_kwargs or {}),
             )
             if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
                 d_uv_chunk = _shift_time_series_gpu(d_uv_chunk, shift_samps, method=shift_method, axis=0)
@@ -1425,9 +1442,11 @@ def _stream_gpu(
 
             for k in range(n_chunks):
                 t_w0 = time.time()
-                chunk_spec, nrow_k, chunk_io_s = next_fut.result()
-                io_wait_s += float(chunk_io_s)
+                chunk_spec, nrow_k, _chunk_io_s = next_fut.result()
+                io_wait_s += max(0.0, time.time() - t_w0)
                 slot = k % 2
+                if k + 1 < n_chunks:
+                    next_fut = executor.submit(_io_read_chunk, chunks[k + 1], (k + 1) % 2)
 
                 t_gpu0 = time.time()
                 pool = host_pools[slot]
@@ -1510,9 +1529,6 @@ def _stream_gpu(
                     ev_stage_done = cp.cuda.Event()
                     ev_stage_done.record(compute_stream)
 
-                    if k + 1 < n_chunks:
-                        next_fut = executor.submit(_io_read_chunk, chunks[k + 1], (k + 1) % 2)
-
                     if chunk_spec.is_last_in_block:
                         # Emit all remaining timestamps in <= 4096-sample slices
                         need_pre_shift = (
@@ -1592,6 +1608,9 @@ def _stream_gpu(
                 pass
             executor.shutdown(wait=True)
             # Release pinned host pools and streaming scratch buffers to CuPy pool before consolidation
+            d_vis_stage = d_wgt_stage = d_uvw_stage = None
+            src_vis = src_wgt = src_uvw = None
+            cur_vis = cur_wgt = cur_uvw = None
             host_pools.clear()
             d_rows.clear()
             del d_vis_pool, d_wgt_pool, d_uvw_pool
@@ -1785,6 +1804,7 @@ def _stream_cpu(
     nsubbands: int,
     exact_uvw: bool,
     mode: str,
+    wgridder_kwargs: Optional[Dict[str, Any]],
     min_valid_channels: int,
     min_uv_distance_m: Optional[float],
     uv_threshold: float,
@@ -1930,6 +1950,7 @@ def _stream_cpu(
             uv_threshold=float(uv_threshold),
             return_sparse=False,
             use_numba=bool(use_numba),
+            **(wgridder_kwargs or {}),
         )
         if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
             uv_chunk = timeshift.shift_time_series(uv_chunk, shift_samps, method=shift_method, axis=0)
@@ -2154,6 +2175,21 @@ def stream_ms_to_ragged_csr(
     nsubbands: int = 1,
     exact_uvw: bool = True,
     mode: str = "nearest",
+    epsilon: float = 1e-5,
+    do_wgridding: bool = False,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    allow_nshift: bool = True,
+    apply_w_phase: bool = True,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    flip_w: bool = False,
+    divide_by_n: bool = True,
+    normalise_mode: Optional[str] = None,
+    oversample: Optional[bool] = None,
+    supp: Optional[int] = None,
     min_valid_channels: int = 24,
     min_uv_distance_m: Optional[float] = None,
     uv_threshold: float = 1e-4,
@@ -2240,10 +2276,34 @@ def stream_ms_to_ragged_csr(
         pix_rad=eff_pix_rad,
         grid_nu=grid_nu,
         nv=nv,
+        mode=str(mode),
+        epsilon=float(epsilon),
+        do_wgridding=bool(do_wgridding),
+        sigma_min=float(sigma_min),
+        sigma_max=float(sigma_max),
+        oversample=oversample,
     )
     eff_grid_nu = int(geom["grid_nu"])
     eff_nv = int(geom["nv"])
     u_half = int(geom["u_half"])
+
+    wgridder_kwargs = {
+        "epsilon": float(epsilon),
+        "do_wgridding": bool(do_wgridding),
+        "sigma_min": float(sigma_min),
+        "sigma_max": float(sigma_max),
+        "center_x": float(center_x),
+        "center_y": float(center_y),
+        "allow_nshift": bool(allow_nshift),
+        "apply_w_phase": bool(apply_w_phase),
+        "flip_u": bool(flip_u),
+        "flip_v": bool(flip_v),
+        "flip_w": bool(flip_w),
+        "divide_by_n": bool(divide_by_n),
+        "normalise_mode": normalise_mode,
+        "oversample": oversample,
+        "supp": supp,
+    }
 
     chan_freq = meta["chan_freq"]
     dt_nominal = float(meta["time_info"]["dt_nominal"])
@@ -2286,6 +2346,7 @@ def stream_ms_to_ragged_csr(
             nsubbands=int(nsubbands),
             exact_uvw=bool(exact_uvw),
             mode=str(mode),
+            wgridder_kwargs=wgridder_kwargs,
             min_valid_channels=int(min_valid_channels),
             min_uv_distance_m=min_uv_distance_m,
             uv_threshold=float(uv_threshold),
@@ -2327,6 +2388,7 @@ def stream_ms_to_ragged_csr(
         nsubbands=int(nsubbands),
         exact_uvw=bool(exact_uvw),
         mode=str(mode),
+        wgridder_kwargs=wgridder_kwargs,
         min_valid_channels=int(min_valid_channels),
         min_uv_distance_m=min_uv_distance_m,
         uv_threshold=float(uv_threshold),
