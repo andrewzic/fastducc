@@ -2217,9 +2217,9 @@ def build_cli_cube(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--raster-mode",
         dest="raster_mode",
-        choices=["nearest", "bilinear"],
-        default="nearest",
-        help="Grid splatting mode when --engine direct_raster is selected (default: nearest).",
+        choices=["nearest", "bilinear", "wgridder"],
+        default="wgridder",
+        help="Grid splatting mode when --engine direct_raster is selected (default: wgridder).",
     )
     parser.add_argument(
         "--row-chunk-size",

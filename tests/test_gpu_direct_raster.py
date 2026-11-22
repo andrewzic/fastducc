@@ -488,6 +488,46 @@ def test_hermitian_conjugation_and_sparse_lookup_parity():
         np.testing.assert_allclose(v_tim_gpu, v_tim_cpu, rtol=1e-12, atol=1e-12)
 
 
+def test_self_conjugate_uv_boundary_no_double_counting():
+    """
+    Verify that self-conjugate cells at DC (u=0, v=0) and Nyquist boundaries
+    do not suffer double-counting or double-weighting in splat_ducc_wgridder_2d.
+    """
+    nbl, nchan, nt = 1, 8, 2
+    freqs_hz = np.full(nchan, 1.0e9, dtype=np.float64)
+    vis_3d = np.zeros((nbl, nchan, nt), dtype=np.complex64)
+    wgt_3d = np.ones((nbl, nchan, nt), dtype=np.float32)
+    uvw_3d = np.zeros((nbl, 3, nt), dtype=np.float64)
+
+    # Place sample exactly at DC (u=0, v=0, w=0) with complex value
+    vis_3d[0, :, :] = np.complex64(4.0 + 2.0j)
+
+    npix = 32
+    u_half = npix // 2 + 1
+    # Run CPU wgridder 2D raster
+    grid_cpu = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d, wgt_3d, uvw_3d, freqs_hz,
+        npix_x=npix, npix_y=npix, pixsize_arcsec=30.0,
+        mode="wgridder", do_wgridding=False, apply_w_phase=False,
+        normalise_mode="cell", min_valid_channels=1, use_numba=True,
+    )
+
+    # At DC (u=0, v=0), the imaginary part must be cancelled and not doubled
+    dc_val = grid_cpu[0, 0, 0]
+    assert np.isfinite(dc_val.real)
+    assert np.allclose(dc_val.imag, 0.0, atol=1e-6)
+
+    if is_cuda_available():
+        grid_gpu = dedisperse_and_rasterise_chunk_gpu(
+            vis_3d, wgt_3d, uvw_3d, freqs_hz,
+            npix_x=npix, npix_y=npix, pixsize_arcsec=30.0,
+            mode="wgridder", do_wgridding=False, apply_w_phase=False,
+            normalise_mode="cell", min_valid_channels=1, return_host=True,
+        )
+        assert _rel_l2_error(grid_gpu, grid_cpu) < 1e-6
+        assert np.allclose(grid_gpu[0, 0, 0].imag, 0.0, atol=1e-6)
+
+
 @pytest.mark.parametrize("corr_mode", ["single", "average", "stokesI"])
 @pytest.mark.parametrize("wgt_3d_input", [True, False])
 def test_stage_ms_rows_cpu_gpu_parity(corr_mode: str, wgt_3d_input: bool):

@@ -3870,7 +3870,7 @@ def dedisperse_and_rasterise_chunk(
     delays: Optional[Any] = None,
     *,
     device: str = "auto",
-    mode: str = "nearest",
+    mode: str = "wgridder",
     return_host: bool = True,
     **kwargs: Any,
 ) -> Any:

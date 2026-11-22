@@ -17,8 +17,8 @@ Architecture:
      and ``compute_stream`` transfer, stage (:func:`stage_ms_rows_gpu`),
      optionally shift sub-sample block offsets on GPU, maintain the causal
      dedispersion lookahead buffer across chunks within each scan, rasterise
-     (:func:`dedisperse_and_rasterise_chunk_gpu`), and pack active UV samples
-     in VRAM (:func:`pack_uv_chunk_to_ragged_gpu`).
+     (:func:`dedisperse_and_rasterise_chunk_gpu` with direct-to-sparse output),
+     and pack active UV samples in VRAM (:func:`pack_chunk_to_ragged_gpu`).
   4. Zero-fragment VRAM consolidation via
      :func:`fastducc.ragged_gpu.consolidate_device_chunks_to_gpu_store`,
      returning a :class:`GPURaggedDGAStore` (and optional
@@ -78,6 +78,7 @@ from fastducc.ragged import (
     _scatter_fragment_samples_numba,
     pack_chunk_to_ragged_csr,
 )
+from fastducc.ragged_gpu import pack_chunk_to_ragged_gpu, pack_uv_chunk_to_ragged_gpu
 
 logger = logging.getLogger("fastducc.gpu_direct_cube")
 
@@ -1354,12 +1355,16 @@ def _stream_gpu(
             return chunk_spec, seg.nrow, float(time.time() - t0_io)
 
         def _io_close_tables() -> None:
-            for tbl in table_cache.values():
+            close_errs = []
+            for path, tbl in table_cache.items():
                 try:
                     tbl.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    close_errs.append((path, exc))
             table_cache.clear()
+            if close_errs:
+                err_msgs = "; ".join(f"{p}: {e}" for p, e in close_errs)
+                logger.warning("Errors while closing casacore tables: %s", err_msgs)
 
         def _emit_from_staged(
             d_vis_stage: "cp.ndarray",
@@ -1382,7 +1387,7 @@ def _stream_gpu(
             else:
                 w_vis, w_wgt, w_uvw = d_vis_stage, d_wgt_stage, d_uvw_stage
 
-            d_uv_chunk = dedisperse_and_rasterise_chunk_gpu(
+            d_sparse_chunk = dedisperse_and_rasterise_chunk_gpu(
                 vis_3d=w_vis,
                 wgt_3d=w_wgt,
                 uvw_3d=w_uvw,
@@ -1405,29 +1410,29 @@ def _stream_gpu(
                 min_valid_channels=int(min_valid_channels),
                 min_uv_distance_m=min_uv_distance_m,
                 uv_threshold=float(uv_threshold),
-                return_sparse=False,
+                flat_indices=d_flat_indices,
+                m_active=m_padded,
+                return_sparse=True,
                 return_host=False,
                 **(wgridder_kwargs or {}),
             )
             if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
-                d_uv_chunk = _shift_time_series_gpu(d_uv_chunk, shift_samps, method=shift_method, axis=0)
+                d_sparse_chunk = _shift_time_series_gpu(d_sparse_chunk, shift_samps, method=shift_method, axis=-1)
 
             t_chunk_host = np.asarray(
                 grid_indices[emit_cursor : emit_cursor + nt_emit], dtype=np.float64
             ) * dt_nominal
             d_t_chunk = cp.asarray(t_chunk_host, dtype=cp.float64)
 
-            d_c_idx, d_c_cnt, d_v_data, d_v_times = pack_uv_chunk_to_ragged_gpu(
-                d_uv_chunk,
-                d_flat_indices,
+            d_c_idx, d_c_cnt, d_v_data, d_v_times = pack_chunk_to_ragged_gpu(
+                d_sparse_chunk,
                 d_t_chunk,
                 threshold=float(uv_threshold),
                 return_host=False,
-                check_bounds=False,
             )
             if int(d_v_data.size) > 0:
                 device_chunks.append((d_c_idx, d_c_cnt, d_v_data, d_v_times))
-            del d_uv_chunk, d_t_chunk
+            del d_sparse_chunk, d_t_chunk
             if w_vis is not d_vis_stage:
                 del w_vis, w_wgt, w_uvw
 
@@ -1604,8 +1609,8 @@ def _stream_gpu(
         finally:
             try:
                 executor.submit(_io_close_tables).result(timeout=30)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("ThreadPoolExecutor failed closing tables cleanly: %s", exc)
             executor.shutdown(wait=True)
             # Release pinned host pools and streaming scratch buffers to CuPy pool before consolidation
             d_vis_stage = d_wgt_stage = d_uvw_stage = None
@@ -1925,7 +1930,7 @@ def _stream_cpu(
         else:
             w_vis, w_wgt, w_uvw = vis_in, wgt_in, uvw_in
 
-        uv_chunk = dedisperse_and_rasterise_chunk_cpu(
+        dga_sub = dedisperse_and_rasterise_chunk_cpu(
             vis_3d=w_vis,
             wgt_3d=w_wgt,
             uvw_3d=w_uvw,
@@ -1948,21 +1953,21 @@ def _stream_cpu(
             min_valid_channels=int(min_valid_channels),
             min_uv_distance_m=min_uv_distance_m,
             uv_threshold=float(uv_threshold),
-            return_sparse=False,
+            flat_indices=flat_indices_host,
+            m_active=m_padded,
+            return_sparse=True,
             use_numba=bool(use_numba),
             **(wgridder_kwargs or {}),
         )
         if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
-            uv_chunk = timeshift.shift_time_series(uv_chunk, shift_samps, method=shift_method, axis=0)
+            dga_sub = timeshift.shift_time_series(dga_sub, shift_samps, method=shift_method, axis=-1)
 
         t_chunk = np.asarray(grid_indices[cur_emit : cur_emit + nt_emit], dtype=np.float64) * dt_nominal
-        flat_cube = uv_chunk.reshape(nt_emit, -1)
-        if sparse_grid_plan is not None:
-            dga_sub = np.ascontiguousarray(flat_cube[:, flat_indices_host].T, dtype=np.complex64)
-        else:
-            dga_sub = np.ascontiguousarray(flat_cube.T, dtype=np.complex64)
         c_idx, c_cnt, f_vis, f_times = pack_chunk_to_ragged_csr(
-            dga_sub, t_chunk, threshold=float(uv_threshold), device="cpu"
+            np.ascontiguousarray(dga_sub, dtype=np.complex64),
+            t_chunk,
+            threshold=float(uv_threshold),
+            device="cpu",
         )
         if f_vis.size > 0:
             cpu_chunks.append((c_idx, c_cnt, f_vis, f_times))
@@ -2089,12 +2094,16 @@ def _stream_cpu(
 
             compute_s += float(time.time() - t_cmp0)
     finally:
-        for tbl in table_cache.values():
+        close_errs = []
+        for path, tbl in table_cache.items():
             try:
                 tbl.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                close_errs.append((path, exc))
         table_cache.clear()
+        if close_errs:
+            err_msgs = "; ".join(f"{p}: {e}" for p, e in close_errs)
+            logger.warning("Errors while closing casacore tables in _stream_cpu: %s", err_msgs)
 
     t_cons0 = time.time()
     host_store = _consolidate_host_chunks_in_memory(
@@ -2174,7 +2183,7 @@ def stream_ms_to_ragged_csr(
     collapse_channels: bool = False,
     nsubbands: int = 1,
     exact_uvw: bool = True,
-    mode: str = "nearest",
+    mode: str = "wgridder",
     epsilon: float = 1e-5,
     do_wgridding: bool = False,
     sigma_min: float = 1.1,
