@@ -532,28 +532,37 @@ def save_candidate_summary(
     morph_res = None
     if cutout_det is not None and cutout_det.size > 0:
         try:
-            from fastducc.filters import evaluate_candidate_morphology_and_flux
+            from fastducc.filters import evaluate_candidate_morphology_and_flux, extract_beam_pix
             on_bins_t = None
             if "t0_idx" in candidate:
                 on_bins_t = list(range(int(candidate["t0_idx"]), int(candidate.get("t1_idx_excl", int(candidate["t0_idx"]) + w))))
+            bmaj_pix, bmin_pix = extract_beam_pix(candidate, pixscale_rad=pix_rad)
             morph_res = evaluate_candidate_morphology_and_flux(
                 cutout=cutout_det,
                 profile=lc_full,
                 on_bins=on_bins_t,
+                is_synthesis_image=True,
+                bmaj_pix=bmaj_pix,
+                bmin_pix=bmin_pix,
             )
         except Exception as e:
             logger.debug(f"Could not compute transient morphology metrics: {e}")
 
     morph_str = ""
     if morph_res is not None:
-        status_pt = "Pass" if morph_res["is_point_like"] else "FAIL (Extended)"
+        status_pt = "POINT-LIKE" if morph_res["is_point_like"] else "RESOLVED / EXTENDED"
         status_flx = "Pass" if morph_res["is_valid_flux"] else "FAIL (Neg Trough)"
+        extra_morph = ""
+        if "fwhm_eff_pix" in morph_res and morph_res["fwhm_eff_pix"] > 0:
+            extra_morph = f" | FWHM: {morph_res['fwhm_eff_pix']:.1f}p"
         morph_str = (
             f"\nMorphology: {status_pt}\n"
-            f"  HP Lag-1: {morph_res['hp_lag1']:.3f} | Sharp: {morph_res['sharpness']:.2f}\n"
+            f"  HP Lag-1: {morph_res['hp_lag1']:.3f} | Sharp: {morph_res['sharpness']:.2f}{extra_morph}\n"
             f"Flux Quality: {status_flx}\n"
             f"  On-Share: {morph_res['on_flux_share']:.2f} | On-SNR: {morph_res['on_snr']:.1f}"
         )
+    else:
+        morph_str = "\nMorphology: NOT_EVALUATED"
 
     txt = (
         f"Name: {srcname}\n"
@@ -1196,16 +1205,20 @@ def save_periodicity_candidate_summary(
     morph_res = None
     if cutout_det is not None:
         try:
-            from fastducc.filters import evaluate_candidate_morphology_and_flux
+            from fastducc.filters import evaluate_candidate_morphology_and_flux, extract_beam_pix
             on_bins_list = None
             if has_profile and p_raw is not None:
                 peak_b = int(candidate.get("best_b", np.argmax(p_raw)))
                 on_bins_list = [(peak_b + offset) % len(p_raw) for offset in range(width_bins)]
+            bmaj_pix, bmin_pix = extract_beam_pix(candidate, pixscale_rad=pix_rad)
             morph_res = evaluate_candidate_morphology_and_flux(
                 cutout=cutout_det,
                 cutout_off=cutout_off_det,
                 profile=p_raw if has_profile else None,
                 on_bins=on_bins_list,
+                is_synthesis_image=True,
+                bmaj_pix=bmaj_pix,
+                bmin_pix=bmin_pix,
             )
         except Exception as e:
             logger.debug(f"Could not compute morphology and flux metrics: {e}")
@@ -1438,16 +1451,19 @@ def save_periodicity_candidate_summary(
 
         # Morphology & Flux Quality Status
         if morph_res is not None:
-            status_pt = "Pass" if morph_res["is_point_like"] else "FAIL (Extended)"
+            status_pt = "POINT-LIKE" if morph_res["is_point_like"] else "RESOLVED / EXTENDED"
             status_flx = "Pass" if morph_res["is_valid_flux"] else "FAIL (Neg Trough)"
+            extra_morph = ""
+            if "fwhm_eff_pix" in morph_res and morph_res["fwhm_eff_pix"] > 0:
+                extra_morph = f" | FWHM: {morph_res['fwhm_eff_pix']:.1f}p"
             morph_str = (
                 f"\nMorphology: {status_pt}\n"
-                f"  HP Lag-1: {morph_res['hp_lag1']:.3f} | Sharp: {morph_res['sharpness']:.2f}\n"
+                f"  HP Lag-1: {morph_res['hp_lag1']:.3f} | Sharp: {morph_res['sharpness']:.2f}{extra_morph}\n"
                 f"Flux Quality: {status_flx}\n"
                 f"  On-Share: {morph_res['on_flux_share']:.2f} | On-SNR: {morph_res['on_snr']:.1f}"
             )
         else:
-            morph_str = ""
+            morph_str = "\nMorphology: NOT_EVALUATED"
 
         iso_cand = candidate.get("spec_isolation_ratio")
         iso_str = f"\nIso Ratio: {float(iso_cand):.2f}" if (iso_cand is not None and np.isfinite(float(iso_cand))) else ""

@@ -4,6 +4,117 @@ import numpy as np
 from scipy.ndimage import maximum_filter
 
 
+def extract_beam_pix(
+    candidate: Optional[Dict[str, Any]] = None,
+    header: Optional[Any] = None,
+    pixscale_rad: Optional[float] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Extract synthesized beam major and minor FWHM in pixels from candidate metadata,
+    FITS header, or explicit pixel scale.
+
+    Parameters
+    ----------
+    candidate : dict, optional
+        Candidate metadata dictionary.
+    header : Header-like or dict, optional
+        FITS header containing BMAJ/BMIN/CDELT.
+    pixscale_rad : float, optional
+        Pixel scale in radians.
+
+    Returns
+    -------
+    (bmaj_pix, bmin_pix) : Tuple of Optional[float]
+    """
+    cand = candidate or {}
+    hdr = header or cand.get("header") or {}
+
+    bmaj_pix = cand.get("bmaj_pix")
+    bmin_pix = cand.get("bmin_pix")
+    if bmaj_pix is not None and bmin_pix is not None:
+        try:
+            return float(bmaj_pix), float(bmin_pix)
+        except (ValueError, TypeError):
+            pass
+
+    # Determine pixel scale
+    p_rad = None
+    if pixscale_rad is not None:
+        p_rad = float(pixscale_rad)
+    else:
+        for k in ("pixsize_rad", "pixscale_rad", "pix_rad"):
+            if cand.get(k) is not None:
+                try:
+                    p_rad = float(cand[k])
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+    p_deg = None
+    p_arcsec = None
+    if p_rad is not None and p_rad > 0:
+        p_deg = float(np.degrees(p_rad))
+        p_arcsec = p_deg * 3600.0
+    elif hasattr(hdr, "get"):
+        cdelt2 = hdr.get("CDELT2")
+        if cdelt2 is not None:
+            try:
+                p_deg = abs(float(cdelt2))
+                p_arcsec = p_deg * 3600.0
+            except (ValueError, TypeError):
+                pass
+
+    # Extract BMAJ / BMIN
+    bmaj_val = None
+    bmin_val = None
+    if hasattr(hdr, "get"):
+        bmaj_val = hdr.get("BMAJ")
+        bmin_val = hdr.get("BMIN")
+
+    if bmaj_val is None:
+        bmaj_val = cand.get("bmaj", cand.get("bmaj_deg", cand.get("bmaj_arcsec")))
+    if bmin_val is None:
+        bmin_val = cand.get("bmin", cand.get("bmin_deg", cand.get("bmin_arcsec")))
+
+    out_bmaj_pix = None
+    out_bmin_pix = None
+
+    if bmaj_val is not None:
+        try:
+            bv = float(bmaj_val)
+            if bv < 1.0 and p_deg is not None and p_deg > 0:
+                out_bmaj_pix = abs(bv / p_deg)
+            elif bv >= 1.0 and p_arcsec is not None and p_arcsec > 0:
+                out_bmaj_pix = abs(bv / p_arcsec)
+        except (ValueError, TypeError):
+            pass
+
+    if bmin_val is not None:
+        try:
+            bv = float(bmin_val)
+            if bv < 1.0 and p_deg is not None and p_deg > 0:
+                out_bmin_pix = abs(bv / p_deg)
+            elif bv >= 1.0 and p_arcsec is not None and p_arcsec > 0:
+                out_bmin_pix = abs(bv / p_arcsec)
+        except (ValueError, TypeError):
+            pass
+
+    # Check beam_fwhm_arcsec
+    if out_bmaj_pix is None or out_bmin_pix is None:
+        fwhm_sec = cand.get("beam_fwhm_arcsec", cand.get("bmaj_arcsec"))
+        if fwhm_sec is not None and p_arcsec is not None and p_arcsec > 0:
+            try:
+                sec_pix = float(fwhm_sec) / p_arcsec
+                if out_bmaj_pix is None:
+                    out_bmaj_pix = sec_pix
+                if out_bmin_pix is None:
+                    out_bmin_pix = sec_pix
+            except (ValueError, TypeError):
+                pass
+
+    return out_bmaj_pix, out_bmin_pix
+
+
 def evaluate_candidate_morphology_and_flux(
     cutout: np.ndarray,
     cutout_off: Optional[np.ndarray] = None,
@@ -11,9 +122,14 @@ def evaluate_candidate_morphology_and_flux(
     on_bins: Optional[Sequence[int]] = None,
     off_bins: Optional[Sequence[int]] = None,
     *,
-    box_size: int = 5,
-    max_hp_lag1: float = 0.25,
-    min_sharpness: float = 0.25,
+    is_synthesis_image: bool = True,
+    bmaj_pix: Optional[float] = None,
+    bmin_pix: Optional[float] = None,
+    box_size: Optional[int] = None,
+    max_hp_lag1: Optional[float] = None,
+    min_sharpness: Optional[float] = None,
+    max_fwhm_factor: float = 2.0,
+    max_axial_ratio: float = 2.5,
     min_on_flux_share: float = 0.40,
     min_on_snr: float = 2.5,
 ) -> Dict[str, Any]:
@@ -22,11 +138,14 @@ def evaluate_candidate_morphology_and_flux(
     structures (diffuse blobs, sidelobe ridges, annular rings) and negative off-pulse
     trough artifacts.
 
-    1. Morphology Filter (Lightweight Unsharp Mask + 2D ACF + Peak Sharpness):
-       - Subtracts local background via uniform_filter (box_size x box_size, O(N)).
+    1. Morphology Filter (Beam-Aware Unsharp Mask + 2D ACF + Gaussian Fit / Sharpness):
+       - If is_synthesis_image=True, accommodates synthesized beam PSF oversampling
+         (expected lag-1 autocorrelation r1 > 0.50 in dirty maps).
        - Evaluates normalized 2D Autocorrelation Function (ACF) of high-pass residual.
        - Evaluates peak sharpness (relative drop to 4-connected neighbors).
-       - Passes point sources even if sitting on correlated diffuse background emission.
+       - Fits a 2D Gaussian / second moments to confirm the source is unresolved
+         (FWHM <= max_fwhm_factor * W_beam) and non-elongated (axial_ratio <= max_axial_ratio).
+       - Rejects annular rings / central depressions and diffuse extended structures.
 
     2. Flux Integrity Filter (On-to-Detection Flux Share & On-Pulse Significance):
        - Detects false positives driven purely by deep negative off-pulse baseline troughs
@@ -47,12 +166,26 @@ def evaluate_candidate_morphology_and_flux(
         Indices of phase bins defining the on-pulse window.
     off_bins : sequence of int, optional
         Indices of phase bins defining the off-pulse window.
+    is_synthesis_image : bool, optional
+        Whether the cutout is an interferometric synthesis image / dirty map convolved
+        with a synthesized beam PSF (default: True).
+    bmaj_pix : float, optional
+        Synthesized beam major axis FWHM in pixels.
+    bmin_pix : float, optional
+        Synthesized beam minor axis FWHM in pixels.
     box_size : int, optional
-        Size of smoothing kernel for unsharp mask (default: 5).
+        Size of smoothing kernel for unsharp mask. If None, automatically derived
+        (9+ for synthesis images, 5 for non-synthesis).
     max_hp_lag1 : float, optional
-        Maximum allowed ACF Lag-1 correlation on high-pass residual (default: 0.25).
+        Maximum allowed ACF Lag-1 correlation on high-pass residual. Defaults to
+        0.75 for synthesis images and 0.25 for non-synthesis images.
     min_sharpness : float, optional
-        Minimum allowed peak sharpness relative drop (default: 0.25).
+        Minimum allowed peak sharpness relative drop. Defaults to adaptive threshold
+        based on synthesized beam PSF (~0.05-0.08) for synthesis images, 0.25 for non-synthesis.
+    max_fwhm_factor : float, optional
+        Maximum allowed effective FWHM in units of synthesized beam FWHM (default: 2.0).
+    max_axial_ratio : float, optional
+        Maximum allowed major-to-minor axial ratio to reject elongated ridges (default: 2.5).
     min_on_flux_share : float, optional
         Minimum fraction of detection flux coming from on-pulse (default: 0.40).
     min_on_snr : float, optional
@@ -65,15 +198,19 @@ def evaluate_candidate_morphology_and_flux(
             "is_point_like": bool,
             "is_valid_flux": bool,
             "passed_all": bool,
+            "morphology_verdict": str,
             "hp_lag1": float,
             "hp_lag2": float,
             "sharpness": float,
+            "fwhm_eff_pix": float,
+            "axial_ratio": float,
             "on_flux_share": float,
             "on_snr": float,
             "rejection_reasons": List[str],
         }
     """
     from scipy.ndimage import uniform_filter
+    from scipy.optimize import curve_fit
 
     reasons: List[str] = []
     cut = np.asarray(cutout, dtype=np.float64)
@@ -82,27 +219,67 @@ def evaluate_candidate_morphology_and_flux(
     hp_lag1 = 0.0
     hp_lag2 = 0.0
     sharpness = 1.0
+    fwhm_eff = 0.0
+    axial_ratio = 1.0
     is_point_like = True
 
     if cut.ndim == 2 and cut.size >= 16:
         ny, nx = cut.shape
         cy, cx = ny // 2, nx // 2
-        
-        # 1. Peak sharpness at central candidate position
-        y_min, y_max = max(0, cy - 1), min(ny - 1, cy + 1)
-        x_min, x_max = max(0, cx - 1), min(nx - 1, cx + 1)
-        neighbors = [cut[y_min, cx], cut[y_max, cx], cut[cy, x_min], cut[cy, x_max]]
-        peak_val = cut[cy, cx]
-        if peak_val > 0:
-            sharpness = float((peak_val - np.mean(neighbors)) / peak_val)
+
+        # 1. Determine synthesized beam reference size (in pixels)
+        if bmaj_pix is not None and bmin_pix is not None:
+            w_beam = float(np.sqrt(float(bmaj_pix) * float(bmin_pix)))
+        elif bmaj_pix is not None:
+            w_beam = float(bmaj_pix)
+        elif bmin_pix is not None:
+            w_beam = float(bmin_pix)
+        else:
+            w_beam = 4.0 if is_synthesis_image else 1.5
+
+        # 2. Calibrate thresholds based on synthesis mode
+        if is_synthesis_image:
+            expected_sharp = float(1.0 - np.exp(-4.0 * np.log(2.0) / (w_beam**2)))
+            eff_min_sharp = min_sharpness if min_sharpness is not None else max(0.05, 0.45 * expected_sharp)
+            eff_max_lag1 = max_hp_lag1 if max_hp_lag1 is not None else 0.75
+            eff_box = box_size if box_size is not None else max(9, int(round(2.0 * w_beam)) | 1)
+        else:
+            eff_min_sharp = min_sharpness if min_sharpness is not None else 0.25
+            eff_max_lag1 = max_hp_lag1 if max_hp_lag1 is not None else 0.25
+            eff_box = box_size if box_size is not None else 5
+
+        # Border background estimate
+        border = np.concatenate([cut[0, :], cut[-1, :], cut[:, 0], cut[:, -1]])
+        bg = float(np.median(border))
+
+        # Peak search near center (within central search window)
+        search_r = max(2, int(round(w_beam * 0.75)))
+        y_lo, y_hi = max(0, cy - search_r), min(ny, cy + search_r + 1)
+        x_lo, x_hi = max(0, cx - search_r), min(nx, cx + search_r + 1)
+        central_sub = cut[y_lo:y_hi, x_lo:x_hi]
+        py_rel, px_rel = np.unravel_index(np.argmax(central_sub), central_sub.shape)
+        py = y_lo + py_rel
+        px = x_lo + px_rel
+        peak_val = float(cut[py, px])
+        peak_exc = peak_val - bg
+
+        # 4-connected sharpness around candidate peak
+        nb = [
+            cut[max(0, py - 1), px],
+            cut[min(ny - 1, py + 1), px],
+            cut[py, max(0, px - 1)],
+            cut[py, min(nx - 1, px + 1)],
+        ]
+        if peak_exc > 0:
+            sharpness = float((peak_val - np.mean(nb)) / peak_exc)
+        elif peak_val > 0:
+            sharpness = float((peak_val - np.mean(nb)) / peak_val)
         else:
             sharpness = 0.0
 
-        # 2. Unsharp Mask: subtract local background
-        bg = uniform_filter(cut, size=box_size, mode="nearest")
-        hp = cut - bg
-
-        # 3. 2D ACF of high-pass residual via FFT
+        # Unsharp Mask & 2D ACF
+        bg_unsharp = uniform_filter(cut, size=eff_box, mode="nearest")
+        hp = cut - bg_unsharp
         hp_sub = hp - np.mean(hp)
         var = np.sum(hp_sub**2)
         if var > 0:
@@ -110,10 +287,8 @@ def evaluate_candidate_morphology_and_flux(
             acf = np.fft.ifft2(np.abs(f)**2).real
             acf = np.fft.fftshift(acf) / var
             mid_y, mid_x = acf.shape[0] // 2, acf.shape[1] // 2
-
             l1_vals = [acf[mid_y + 1, mid_x], acf[mid_y - 1, mid_x], acf[mid_y, mid_x + 1], acf[mid_y, mid_x - 1]]
             hp_lag1 = float(np.mean(l1_vals))
-
             if acf.shape[0] >= 5 and acf.shape[1] >= 5:
                 l2_vals = [acf[mid_y + 2, mid_x], acf[mid_y - 2, mid_x], acf[mid_y, mid_x + 2], acf[mid_y, mid_x - 2]]
                 hp_lag2 = float(np.mean(l2_vals))
@@ -123,13 +298,76 @@ def evaluate_candidate_morphology_and_flux(
             hp_lag1 = 0.0
             hp_lag2 = 0.0
 
-        # Morphology decision
-        if hp_lag1 > max_hp_lag1:
+        # Gaussian Fit for 2D size and axial ratio
+        fit_ok = False
+        if is_synthesis_image and peak_exc > 0:
+            def gauss_model(coords, A, x_c, y_c, sig_x, sig_y, bg_val):
+                y, x = coords
+                return bg_val + A * np.exp(-0.5 * (((x - x_c) / sig_x)**2 + ((y - y_c) / sig_y)**2))
+
+            Y, X = np.indices((ny, nx))
+            sig0 = max(1.0, w_beam / 2.355)
+            try:
+                popt, _ = curve_fit(
+                    gauss_model,
+                    (Y.ravel(), X.ravel()),
+                    cut.ravel(),
+                    p0=[peak_exc, px, py, sig0, sig0, bg],
+                    bounds=(
+                        [0.0, max(0, px - 4), max(0, py - 4), 0.5, 0.5, -np.inf],
+                        [np.inf, min(nx - 1, px + 4), min(ny - 1, py + 4), 30.0, 30.0, np.inf],
+                    ),
+                    maxfev=200,
+                )
+                sig_x, sig_y = abs(popt[3]), abs(popt[4])
+                fwhm_eff = float(2.355 * np.sqrt(sig_x * sig_y))
+                axial_ratio = float(max(sig_x, sig_y) / max(0.1, min(sig_x, sig_y)))
+                fit_ok = True
+            except Exception:
+                fit_ok = False
+
+        if not fit_ok and is_synthesis_image:
+            # Fallback aperture second moments
+            r_aper = max(6, int(round(1.5 * w_beam)))
+            Y, X = np.ogrid[:ny, :nx]
+            R = np.sqrt((X - px)**2 + (Y - py)**2)
+            aper = R <= r_aper
+            I_pos = np.maximum(cut - bg, 0.0) * aper
+            tot_flux = np.sum(I_pos)
+            if tot_flux > 0:
+                mu_x = np.sum(X * I_pos) / tot_flux
+                mu_y = np.sum(Y * I_pos) / tot_flux
+                mxx = np.sum((X - mu_x)**2 * I_pos) / tot_flux
+                myy = np.sum((Y - mu_y)**2 * I_pos) / tot_flux
+                mxy = np.sum((X - mu_x) * (Y - mu_y) * I_pos) / tot_flux
+                t1 = (mxx + myy) / 2.0
+                t2 = np.sqrt(((mxx - myy) / 2.0)**2 + mxy**2)
+                lam1, lam2 = t1 + t2, max(0.0, t1 - t2)
+                sig_maj, sig_min = np.sqrt(lam1), np.sqrt(lam2)
+                axial_ratio = float(sig_maj / max(sig_min, 0.3))
+                fwhm_eff = float(2.355 * np.sqrt(sig_maj * sig_min))
+
+        # Morphological decisions
+        if hp_lag1 > eff_max_lag1:
             is_point_like = False
-            reasons.append(f"Extended ACF (HP Lag-1 = {hp_lag1:.3f} > {max_hp_lag1:.2f})")
-        if sharpness < min_sharpness:
+            reasons.append(f"Extended ACF (HP Lag-1 = {hp_lag1:.3f} > {eff_max_lag1:.2f})")
+        if sharpness < eff_min_sharp:
             is_point_like = False
-            reasons.append(f"Flat peak morphology (Sharpness = {sharpness:.3f} < {min_sharpness:.2f})")
+            reasons.append(f"Flat peak morphology (Sharpness = {sharpness:.3f} < {eff_min_sharp:.2f})")
+
+        if is_synthesis_image:
+            max_allowed_fwhm = max_fwhm_factor * w_beam
+            if fwhm_eff > max_allowed_fwhm:
+                is_point_like = False
+                reasons.append(f"Resolved source size (FWHM = {fwhm_eff:.1f} > {max_allowed_fwhm:.1f} pix)")
+            if axial_ratio > max_axial_ratio:
+                is_point_like = False
+                reasons.append(f"Elongated ridge artifact (Axial ratio = {axial_ratio:.2f} > {max_axial_ratio:.2f})")
+            global_max = float(np.max(cut))
+            center_val = float(cut[cy, cx])
+            if center_val < 0.4 * global_max and np.hypot(py - cy, px - cx) > (w_beam * 0.65):
+                is_point_like = False
+                reasons.append(f"Annular ring artifact (Center={center_val:.2g} < 0.4*Max={global_max:.2g})")
 
     # 4. Flux Integrity Check (Pulse Profile or Cutouts)
     is_valid_flux = True
@@ -192,14 +430,23 @@ def evaluate_candidate_morphology_and_flux(
             reasons.append(f"Insignificant on-pulse flux (On-SNR = {on_snr:.2f} < {min_on_snr:.2f})")
 
     passed_all = is_point_like and is_valid_flux
+    if is_point_like and is_valid_flux:
+        morphology_verdict = "POINT-LIKE"
+    elif not is_point_like:
+        morphology_verdict = "RESOLVED / EXTENDED"
+    else:
+        morphology_verdict = "DUBIOUS (Flux)"
 
     return {
         "is_point_like": is_point_like,
         "is_valid_flux": is_valid_flux,
         "passed_all": passed_all,
+        "morphology_verdict": morphology_verdict,
         "hp_lag1": hp_lag1,
         "hp_lag2": hp_lag2,
         "sharpness": sharpness,
+        "fwhm_eff_pix": fwhm_eff,
+        "axial_ratio": axial_ratio,
         "on_flux_share": on_flux_share,
         "on_snr": on_snr,
         "rejection_reasons": reasons,

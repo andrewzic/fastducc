@@ -73,5 +73,71 @@ class TestFilters(unittest.TestCase):
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["ra_deg"], 190.0)
 
+    def test_evaluate_candidate_morphology_synthesis(self):
+        # 1. Synthesized beam point source (FWHM = 3 to 5 pixels) MUST pass as is_point_like = True
+        Y, X = np.ogrid[:32, :32]
+        rng = np.random.default_rng(42)
+
+        for fwhm in [3.0, 4.0, 5.0]:
+            im_beam = np.exp(-4.0 * np.log(2.0) * ((X - 16)**2 + (Y - 16)**2) / fwhm**2)
+            im_noisy = im_beam + rng.normal(0, 0.05, im_beam.shape)
+            res = filters.evaluate_candidate_morphology_and_flux(
+                im_noisy,
+                is_synthesis_image=True,
+                bmaj_pix=fwhm,
+                bmin_pix=fwhm,
+            )
+            self.assertTrue(
+                res["is_point_like"],
+                f"Synthesized beam point source with FWHM={fwhm} failed morphology: {res['rejection_reasons']}",
+            )
+            self.assertEqual(res["morphology_verdict"], "POINT-LIKE")
+
+        # 2. Extended diffuse Gaussian blob (FWHM = 15 pixels) MUST be rejected as is_point_like = False
+        im_diff = np.exp(-4.0 * np.log(2.0) * ((X - 16)**2 + (Y - 16)**2) / 15.0**2)
+        im_diff_noisy = im_diff + rng.normal(0, 0.05, im_diff.shape)
+        res_diff = filters.evaluate_candidate_morphology_and_flux(
+            im_diff_noisy,
+            is_synthesis_image=True,
+            bmaj_pix=4.0,
+            bmin_pix=4.0,
+        )
+        self.assertFalse(res_diff["is_point_like"], "Extended diffuse blob should be rejected")
+        self.assertEqual(res_diff["morphology_verdict"], "RESOLVED / EXTENDED")
+
+        # 3a. Annular ring artifact MUST be rejected
+        R = np.sqrt((X - 16)**2 + (Y - 16)**2)
+        im_ring = np.exp(-0.5 * (R - 6.0)**2 / 1.5**2)
+        res_ring = filters.evaluate_candidate_morphology_and_flux(
+            im_ring,
+            is_synthesis_image=True,
+            bmaj_pix=4.0,
+            bmin_pix=4.0,
+        )
+        self.assertFalse(res_ring["is_point_like"], "Annular ring artifact should be rejected")
+
+        # 3b. Ridge artifact (elongated stripe) MUST be rejected
+        im_ridge = np.exp(-0.5 * ((X - 16)**2 / 1.5**2 + (Y - 16)**2 / 12.0**2))
+        res_ridge = filters.evaluate_candidate_morphology_and_flux(
+            im_ridge,
+            is_synthesis_image=True,
+            bmaj_pix=4.0,
+            bmin_pix=4.0,
+        )
+        self.assertFalse(res_ridge["is_point_like"], "Elongated ridge artifact should be rejected")
+
+    def test_evaluate_candidate_morphology_backward_compatibility(self):
+        # In non-synthesis mode, 1-pixel spike passes, diffuse / extended fails
+        im_spike = np.zeros((32, 32))
+        im_spike[16, 16] = 10.0
+        res = filters.evaluate_candidate_morphology_and_flux(im_spike, is_synthesis_image=False)
+        self.assertTrue(res["is_point_like"])
+
+        # Wide source fails in non-synthesis mode
+        Y, X = np.ogrid[:32, :32]
+        im_wide = np.exp(-0.5 * ((X - 16)**2 + (Y - 16)**2) / 3.0**2)
+        res_wide = filters.evaluate_candidate_morphology_and_flux(im_wide, is_synthesis_image=False)
+        self.assertFalse(res_wide["is_point_like"])
+
 if __name__ == "__main__":
     unittest.main()
