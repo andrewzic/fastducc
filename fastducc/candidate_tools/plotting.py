@@ -1359,7 +1359,33 @@ def save_periodicity_candidate_summary(
                 ax_lc.plot(spec_norm, color="crimson", lw=1.6, label="On-Source Spin-Frequency Spectrum P(f)")
                 ax_lc.set_xlabel("Frequency Channels")
             ax_lc.set_ylabel("Normalized Power")
-            ax_lc.set_title(f"On-Source Spin Frequency Spectrum P(f) | f₀ = {f_hz:.6f} Hz (P = {period_s*1000.0:.3f} ms) | S/N = {snr_val:.2f}")
+            iso_val = candidate.get("spec_isolation_ratio")
+            if iso_val is None and spectrum_freqs is not None and len(spectrum_freqs) == len(spectrum_1d):
+                try:
+                    from periodicity.gpu_stats import compute_spectral_isolation_metrics
+                    k_cand = int(np.argmin(np.abs(spectrum_freqs - f_hz)))
+                    iso_calc, cnt_calc = compute_spectral_isolation_metrics(spectrum_1d, spectrum_freqs, k_idx=k_cand, f0=f_hz)
+                    iso_val = iso_calc
+                    candidate["spec_isolation_ratio"] = float(iso_calc)
+                    candidate["spec_local_contrast"] = float(cnt_calc)
+                except Exception:
+                    pass
+
+            iso_title_tok = f" | Iso Ratio: {float(iso_val):.2f}" if (iso_val is not None and np.isfinite(float(iso_val))) else ""
+            ax_lc.set_title(f"On-Source Spin Frequency Spectrum P(f) | f₀ = {f_hz:.6f} Hz (P = {period_s*1000.0:.3f} ms){iso_title_tok} | S/N = {snr_val:.2f}")
+            if iso_val is not None and np.isfinite(float(iso_val)):
+                ax_lc.text(
+                    0.03,
+                    0.88,
+                    f"Iso Ratio: {float(iso_val):.2f}",
+                    transform=ax_lc.transAxes,
+                    fontsize=9.5,
+                    fontweight="bold",
+                    color="#cf222e",
+                    va="top",
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.9, edgecolor="#cf222e"),
+                    zorder=10,
+                )
             ax_lc.grid(True, alpha=0.3)
             ax_lc.legend(loc="upper right", framealpha=0.9)
         elif has_profile and p2_raw is not None and p2_box is not None and phase2 is not None:
@@ -1423,6 +1449,9 @@ def save_periodicity_candidate_summary(
         else:
             morph_str = ""
 
+        iso_cand = candidate.get("spec_isolation_ratio")
+        iso_str = f"\nIso Ratio: {float(iso_cand):.2f}" if (iso_cand is not None and np.isfinite(float(iso_cand))) else ""
+
         txt = (
             f"Name: {srcname}\n"
             f"Field: {field}\n"
@@ -1440,6 +1469,7 @@ def save_periodicity_candidate_summary(
             f"Method: {method}\n"
             f"PSRCAT: {psrcat_str}\n"
             f"RACS: {racs_str}"
+            f"{iso_str}"
             f"{morph_str}"
         )
     
@@ -1547,6 +1577,10 @@ def save_periodicity_candidate_summary(
         if spectrum_freqs is not None:
             np_save_dict["fkeep"] = spectrum_freqs.astype(np.float64)
             np_save_dict["freqs"] = spectrum_freqs.astype(np.float64)
+        if candidate.get("spec_isolation_ratio") is not None and np.isfinite(float(candidate["spec_isolation_ratio"])):
+            np_save_dict["spec_isolation_ratio"] = float(candidate["spec_isolation_ratio"])
+        if candidate.get("spec_local_contrast") is not None and np.isfinite(float(candidate["spec_local_contrast"])):
+            np_save_dict["spec_local_contrast"] = float(candidate["spec_local_contrast"])
         np.savez(out_spec_npz, **np_save_dict)
 
     if has_profile and p_norm is not None:

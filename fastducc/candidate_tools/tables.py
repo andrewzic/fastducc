@@ -112,7 +112,8 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
         return Table(names=[
             "srcname","x","y","l","m",
             "ra_rad","dec_rad","ra_deg","dec_deg","ra_hms","dec_dms",
-            "dm","snr","f_hz","period_s","nharm_used","algo","phase_center_field"
+            "dm","snr","f_hz","period_s","nharm_used","algo","phase_center_field",
+            "spec_isolation_ratio","spec_local_contrast"
         ])
 
     def col(key, default=np.nan):
@@ -182,6 +183,7 @@ def candidates_to_astropy_table_periodicity(annotated: List[Dict[str, Any]]) -> 
         "cont_flux_jy", "cont_rms_jy", "cont_snr",
         "continuum_association", "cand_classification", "candidate_flag",
         "is_point_like", "is_valid_flux", "morphology_verdict",
+        "spec_isolation_ratio", "spec_local_contrast",
     ]
     for opt in optional_cols:
         vals = col(opt, None)
