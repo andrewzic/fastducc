@@ -2580,7 +2580,729 @@ def stream_ms_to_ragged_csr(
     )
 
 
+def iter_ms_to_ragged_csr_subbanded(
+    msname: Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]],
+    dm_trials: Sequence[float],
+    *,
+    dm_indices: Optional[Sequence[int]] = None,
+    tolerance_samples: float = 1.25,
+    start_time_idx: Optional[int] = None,
+    end_time_idx: Optional[int] = None,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    time_step: Optional[float] = None,
+    time_tolerance: float = 1e-3,
+    max_blank_factor: float = 10.0,
+    regularize_time: bool = True,
+    sync_tolerance: float = 0.05,
+    shift_method: str = "fft",
+    shift_domain: str = "native",
+    spw: int = 0,
+    chan_sel: Optional[Tuple[int, Optional[int]]] = None,
+    data_column: str = "DATA",
+    corr_mode: str = "single",
+    single_pol: str = "XX",
+    basis: str = "linear",
+    average_correlations: bool = True,
+    corr_index: Optional[int] = None,
+    use_weight_spectrum: bool = True,
+    field_name: Optional[str] = None,
+    npix_x: int = 384,
+    npix_y: int = 384,
+    pixsize_arcsec: float = 22.0,
+    pix_rad: Optional[float] = None,
+    grid_nu: Optional[int] = None,
+    nv: Optional[int] = None,
+    align_to: str = "fmax",
+    nsubbands: int = 16,
+    exact_uvw: bool = True,
+    mode: str = "wgridder",
+    epsilon: float = 1e-5,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    allow_nshift: bool = True,
+    apply_w_phase: bool = True,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    flip_w: bool = False,
+    divide_by_n: bool = True,
+    normalise_mode: Optional[str] = None,
+    oversample: Optional[bool] = None,
+    supp: Optional[int] = None,
+    min_valid_channels: int = 24,
+    min_uv_distance_m: Optional[float] = None,
+    uv_threshold: float = 1e-4,
+    row_chunk_size: int = 300_000,
+    sparse_grid_plan: Optional[Dict[str, Any]] = None,
+    active_only: bool = True,
+    device: str = "auto",
+    device_id: int = 0,
+    return_csr_matrix: bool = False,
+    use_numba: bool = True,
+) -> Iterator[Tuple[int, float, DirectRasterResult]]:
+    """
+    Two-Tier Subbanded multi-DM streaming generator.
+
+    Streams the Measurement Set **once per coarse DM trial** (rather than once
+    per fine DM trial):
+      - Tier 1: Coarse intra-subband dedispersion & active UV-cell rasterisation
+        into ``V_active[M_active, N_sub, nt_tier1]`` once per chunk.
+      - Tier 2: Vectorised active-cell dedispersion across all fine DM trials
+        assigned to the coarse bin, followed by CSR fragment packing.
+      - Yields ``(dm_idx, dm_val, DirectRasterResult)`` one fine DM at a time
+        so downstream GPU NUFFT search can process and release each store
+        within bounded VRAM.
+    """
+    dm_list = [float(d) for d in dm_trials]
+    if not dm_list:
+        return
+    idx_list = list(range(len(dm_list))) if dm_indices is None else [int(i) for i in dm_indices]
+    if len(idx_list) != len(dm_list):
+        raise ValueError("dm_indices length must match dm_trials length.")
+
+    t_wall0 = time.time()
+    eff_device = _resolve_device(device)
+    ms_paths = _normalise_ms_list(msname)
+
+    t_pre0 = time.time()
+    meta = _prescan_ms_metadata(
+        ms_paths,
+        spw=int(spw),
+        chan_sel=chan_sel,
+        data_column=str(data_column),
+        use_weight_spectrum=bool(use_weight_spectrum),
+        field_name=field_name,
+        start_time_idx=start_time_idx,
+        end_time_idx=end_time_idx,
+        start_time=start_time,
+        end_time=end_time,
+        time_step=time_step,
+        time_tolerance=float(time_tolerance),
+        max_blank_factor=float(max_blank_factor),
+        regularize_time=bool(regularize_time),
+        sync_tolerance=float(sync_tolerance),
+    )
+    t_prescan = float(time.time() - t_pre0)
+
+    eff_pix_rad = float(pix_rad) if pix_rad is not None else (float(pixsize_arcsec) / 206265.0)
+    eff_pix_arcsec = eff_pix_rad * 206265.0
+    geom = compute_raster_grid_geometry(
+        npix_x=int(npix_x),
+        npix_y=int(npix_y),
+        pix_rad=eff_pix_rad,
+        grid_nu=grid_nu,
+        nv=nv,
+        mode=str(mode),
+        epsilon=float(epsilon),
+        do_wgridding=False,
+        sigma_min=float(sigma_min),
+        sigma_max=float(sigma_max),
+        oversample=oversample,
+    )
+    eff_grid_nu = int(geom["grid_nu"])
+    eff_nv = int(geom["nv"])
+    u_half = int(geom["u_half"])
+
+    wgridder_kwargs = {
+        "epsilon": float(epsilon),
+        "sigma_min": float(sigma_min),
+        "sigma_max": float(sigma_max),
+        "center_x": float(center_x),
+        "center_y": float(center_y),
+        "allow_nshift": bool(allow_nshift),
+        "apply_w_phase": bool(apply_w_phase),
+        "flip_u": bool(flip_u),
+        "flip_v": bool(flip_v),
+        "flip_w": bool(flip_w),
+        "divide_by_n": bool(divide_by_n),
+        "normalise_mode": normalise_mode,
+        "oversample": oversample,
+        "supp": supp,
+    }
+
+    chan_freq = meta["chan_freq"]
+    time_info = meta["time_info"]
+    dt_nominal = float(time_info["dt_nominal"])
+    total_planes = int(time_info["total_planes"])
+    grid_indices = time_info["grid_indices"]
+    nbl = int(meta["nbl"])
+    nchan = int(meta["nchan"])
+    nchan_full = int(meta["nchan_full"])
+    ncorr = int(meta["ncorr"])
+
+    eff_nsub = max(1, min(int(nsubbands), nchan)) if nchan > 0 else 1
+    plan = dedisp.DedispersionPlan(
+        freqs_hz=chan_freq,
+        tsamp_s=dt_nominal,
+        dm_min=float(min(dm_list)),
+        dm_max=float(max(dm_list)),
+        tolerance_samples=float(tolerance_samples),
+        dedisp_mode="subbanded",
+        n_subbands=eff_nsub,
+    )
+
+    # Group supplied fine DM trials onto the plan's coarse DM centres
+    coarse_groups: Dict[int, List[int]] = {}
+    for pos_i, dm_f in enumerate(dm_list):
+        ic = int(np.argmin(np.abs(plan.coarse_dms - dm_f)))
+        coarse_groups.setdefault(ic, []).append(pos_i)
+
+    logger.info(
+        "[Subbanded Multi-DM] Partitioned %d fine DM trials into %d coarse MS passes "
+        "(n_subbands=%d, coarse_dm_step=%.2f pc cm^-3, prescan=%.2fs).",
+        len(dm_list),
+        len(coarse_groups),
+        eff_nsub,
+        plan.coarse_dm_step,
+        t_prescan,
+    )
+
+    sparse_plan_uv_host, flat_indices_host = _resolve_plan_buffers(sparse_grid_plan, eff_nv, u_half)
+    m_padded = int(sparse_plan_uv_host.shape[0])
+    mode_id = _normalise_mode(mode)
+    use_snap_norm, _ = _resolve_normalise_mode(mode_id, normalise_mode)
+
+    need_shift_halo = bool(
+        regularize_time
+        and any(abs(float(b.get("shift_samps", 0.0))) > 1e-7 for b in time_info["blocks"])
+    )
+    has_any_wgt_spec = any(e.has_weight_spectrum for e in meta["entries"])
+    has_any_flag_row = any(e.has_flag_row for e in meta["entries"])
+
+    for coarse_pass_i, (ic, fine_positions) in enumerate(sorted(coarse_groups.items())):
+        t_pass0 = time.time()
+        dm_coarse = float(plan.coarse_dms[ic])
+        fine_dms_bin = [dm_list[p] for p in fine_positions]
+        fine_ids_bin = [idx_list[p] for p in fine_positions]
+        n_fine_bin = len(fine_dms_bin)
+
+        intra_delays_host = plan.get_intra_delays(dm_coarse, align_to=align_to).astype(np.int32)
+        inter_delays_bin = np.stack(
+            [plan.get_inter_delays(dm_f, align_to=align_to).astype(np.int32) for dm_f in fine_dms_bin],
+            axis=0,
+        )
+        if np.any(intra_delays_host < 0) or np.any(inter_delays_bin < 0):
+            raise ValueError(
+                "Two-tier subbanded multi-DM streaming requires non-negative causal delays "
+                "(use align_to='fmax' with dm >= 0)."
+            )
+        max_intra = int(np.max(intra_delays_host)) if intra_delays_host.size > 0 else 0
+        max_inter = int(np.max(inter_delays_bin)) if inter_delays_bin.size > 0 else 0
+        max_delay = max_intra + max_inter
+        req_overlap = max(max_delay, _SHIFT_HALO_SAMPLES) if need_shift_halo else max_delay
+
+        logger.info(
+            "[Subbanded Pass %d/%d] Coarse DM=%.2f pc cm^-3 covering %d fine trial(s): %s "
+            "(max_intra=%d, max_inter=%d samps)",
+            coarse_pass_i + 1,
+            len(coarse_groups),
+            dm_coarse,
+            n_fine_bin,
+            [round(d, 2) for d in fine_dms_bin],
+            max_intra,
+            max_inter,
+        )
+
+        if eff_device == "cuda":
+            from fastducc.ragged_gpu import consolidate_device_chunks_to_gpu_store
+
+            with cp.cuda.Device(int(device_id)):
+                free_vram, _ = cp.cuda.Device(int(device_id)).mem_info
+                row_bytes_est = (
+                    24 + nchan * ncorr * 9 + (nchan * ncorr * 4 if has_any_wgt_spec else ncorr * 4) + 9
+                )
+                max_rows_vram = max(1, int(0.20 * free_vram) // max(1, row_bytes_est))
+                eff_row_chunk = min(int(row_chunk_size), max_rows_vram)
+
+                # Account for Tier 1 active_dga (M * N_sub * 12B) + Tier 2 batch (n_fine * M * 8B)
+                stage_bytes_per_t = max(
+                    1,
+                    (24 * nbl * nchan)
+                    + (48 * nbl)
+                    + (16 * eff_nsub * m_padded)
+                    + (10 * n_fine_bin * m_padded),
+                )
+                vram_nt_cap = max(32, int(0.30 * free_vram) // stage_bytes_per_t)
+                max_nt_new = min(_MAX_NT_EMIT, max(16, vram_nt_cap - req_overlap))
+
+                chunks, max_chunk_rows, total_rows = _plan_streaming_chunks(
+                    meta, row_chunk_size=eff_row_chunk, max_nt_new=max_nt_new
+                )
+
+                # Stage packed CSR fragments on host RAM per fine DM so peak VRAM stays bounded
+                host_chunks_per_dm: List[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = [
+                    [] for _ in range(n_fine_bin)
+                ]
+                io_wait_s = t_prescan if coarse_pass_i == 0 else 0.0
+                gpu_compute_s = 0.0
+
+                if chunks:
+                    max_nt_stage = max(req_overlap + max(c.nt_new for c in chunks), req_overlap + 1)
+                    tail_cap = max(1, req_overlap)
+
+                    h2d_stream = cp.cuda.Stream(non_blocking=True)
+                    compute_stream = cp.cuda.Stream(non_blocking=True)
+                    slot_h2d_done: List[Optional[Any]] = [None, None]
+                    ev_stage_done: Optional[Any] = None
+
+                    host_pools = [
+                        _alloc_pinned_pool(max_chunk_rows, nchan, ncorr, has_any_wgt_spec, has_any_flag_row),
+                        _alloc_pinned_pool(max_chunk_rows, nchan, ncorr, has_any_wgt_spec, has_any_flag_row),
+                    ]
+                    wgt_row_shape = (max_chunk_rows, nchan, ncorr) if has_any_wgt_spec else (max_chunk_rows, ncorr)
+                    d_rows = {
+                        "uvw": cp.empty((max_chunk_rows, 3), dtype=cp.float64),
+                        "data": cp.empty((max_chunk_rows, nchan, ncorr), dtype=cp.complex64),
+                        "wgt": cp.empty(wgt_row_shape, dtype=cp.float32),
+                        "flag": cp.empty((max_chunk_rows, nchan, ncorr), dtype=cp.uint8),
+                        "bl_idx": cp.empty((max_chunk_rows,), dtype=cp.int32),
+                        "t_rel": cp.empty((max_chunk_rows,), dtype=cp.int32),
+                        "flag_row": cp.empty((max_chunk_rows,), dtype=cp.uint8) if has_any_flag_row else None,
+                    }
+                    d_vis_pool = cp.empty(nbl * nchan * max_nt_stage, dtype=cp.complex64)
+                    d_wgt_pool = cp.empty(nbl * nchan * max_nt_stage, dtype=cp.float32)
+                    d_uvw_pool = cp.empty(nbl * 3 * max_nt_stage, dtype=cp.float64)
+                    d_vis_tail_pool = cp.empty(nbl * nchan * tail_cap, dtype=cp.complex64)
+                    d_wgt_tail_pool = cp.empty(nbl * nchan * tail_cap, dtype=cp.float32)
+                    d_uvw_tail_pool = cp.empty(nbl * 3 * tail_cap, dtype=cp.float64)
+                    d_flat_indices = cp.asarray(flat_indices_host, dtype=cp.int64)
+                    d_inter_delays_bin = cp.asarray(inter_delays_bin, dtype=cp.int32)
+
+                    table_cache: Dict[str, Any] = {}
+
+                    def _io_read_chunk(chunk_spec: _ChunkSpec, slot: int) -> Tuple[_ChunkSpec, int, float]:
+                        t0_io = time.time()
+                        ev = slot_h2d_done[slot]
+                        if ev is not None:
+                            ev.synchronize()
+                        pool = host_pools[slot]
+                        seg = chunk_spec.segments[0]
+                        tbl = table_cache.get(seg.ms_path)
+                        if tbl is None:
+                            tbl = table(seg.ms_path, readonly=True, ack=False)
+                            table_cache[seg.ms_path] = tbl
+                        _read_segment_columns(
+                            tbl,
+                            seg,
+                            data_column=data_column,
+                            nchan=nchan,
+                            nchan_full=nchan_full,
+                            ncorr=ncorr,
+                            chan_sel=chan_sel,
+                            out_uvw=pool["uvw"],
+                            out_data=pool["data"],
+                            out_wgt=pool["wgt"],
+                            out_flag=pool["flag"],
+                            out_flag_row=pool.get("flag_row"),
+                            out_bl_idx=pool["bl_idx"],
+                            out_t_rel=pool["t_rel"],
+                        )
+                        return chunk_spec, seg.nrow, float(time.time() - t0_io)
+
+                    def _io_close_tables() -> None:
+                        for path, tbl in table_cache.items():
+                            try:
+                                tbl.close()
+                            except Exception as exc:
+                                logger.warning("Error closing table %s: %s", path, exc)
+                        table_cache.clear()
+
+                    def _emit_multi_gpu(
+                        d_vis_stage: "cp.ndarray",
+                        d_wgt_stage: "cp.ndarray",
+                        d_uvw_stage: "cp.ndarray",
+                        nt_emit: int,
+                        emit_cursor: int,
+                        shift_samps: float,
+                        already_shifted: bool = False,
+                    ) -> None:
+                        if nt_emit <= 0:
+                            return
+                        if (not already_shifted) and regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "native":
+                            w_vis = _shift_time_series_gpu(d_vis_stage, shift_samps, method=shift_method, axis=-1)
+                            w_wgt = cp.maximum(
+                                _shift_time_series_gpu(d_wgt_stage, shift_samps, method=shift_method, axis=-1),
+                                np.float32(0.0),
+                            )
+                            w_uvw = _shift_time_series_gpu(d_uvw_stage, shift_samps, method=shift_method, axis=-1)
+                        else:
+                            w_vis, w_wgt, w_uvw = d_vis_stage, d_wgt_stage, d_uvw_stage
+
+                        nt_tier1 = min(int(w_vis.shape[2]), nt_emit + max_inter)
+                        tier1_res = dedisperse_and_rasterise_subband_gpu(
+                            vis_3d=w_vis,
+                            wgt_3d=w_wgt,
+                            uvw_3d=w_uvw,
+                            freqs_hz=chan_freq,
+                            intra_delays=intra_delays_host,
+                            n_subbands=eff_nsub,
+                            nt_out=nt_tier1,
+                            dm_coarse=dm_coarse,
+                            dt=dt_nominal,
+                            align_to=align_to,
+                            exact_uvw=bool(exact_uvw),
+                            npix_x=int(npix_x),
+                            npix_y=int(npix_y),
+                            pixsize_arcsec=float(eff_pix_arcsec),
+                            pix_rad=float(geom["pix_rad"]),
+                            grid_nu=int(eff_grid_nu),
+                            nv=int(eff_nv),
+                            mode=mode,
+                            min_valid_channels=int(min_valid_channels),
+                            min_uv_distance_m=min_uv_distance_m,
+                            flat_indices=d_flat_indices,
+                            m_active=m_padded,
+                            return_weights=(not use_snap_norm),
+                            return_host=False,
+                            **wgridder_kwargs,
+                        )
+                        if use_snap_norm:
+                            d_active_dga, d_active_wgt = tier1_res, None
+                        else:
+                            d_active_dga, d_active_wgt = tier1_res
+
+                        # Tier 2: dedisperse ALL fine DMs in this coarse bin in a single kernel launch
+                        d_dedisp_batch = dedisperse_active_cell_matrix_gpu(
+                            d_active_dga,
+                            d_inter_delays_bin,
+                            nt_out=nt_emit,
+                            active_wgt=d_active_wgt,
+                            uv_threshold=float(uv_threshold),
+                            return_host=False,
+                        )
+                        del d_active_dga
+                        if d_active_wgt is not None:
+                            del d_active_wgt
+
+                        t_chunk_host = np.asarray(
+                            grid_indices[emit_cursor : emit_cursor + nt_emit], dtype=np.float64
+                        ) * dt_nominal
+                        d_t_chunk = cp.asarray(t_chunk_host, dtype=cp.float64)
+
+                        for j_dm in range(n_fine_bin):
+                            d_slice = d_dedisp_batch[j_dm]
+                            if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
+                                d_slice = _shift_time_series_gpu(d_slice, shift_samps, method=shift_method, axis=-1)
+                            c_idx, c_cnt, v_data, v_times = pack_chunk_to_ragged_gpu(
+                                d_slice,
+                                d_t_chunk,
+                                threshold=float(uv_threshold),
+                                return_host=True,
+                            )
+                            if int(v_data.size) > 0:
+                                host_chunks_per_dm[j_dm].append((c_idx, c_cnt, v_data, v_times))
+
+                        del d_dedisp_batch, d_t_chunk
+                        if w_vis is not d_vis_stage:
+                            del w_vis, w_wgt, w_uvw
+
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    try:
+                        cur_block_idx = -1
+                        n_tail = 0
+                        emit_cursor = 0
+                        next_fut = executor.submit(_io_read_chunk, chunks[0], 0)
+                        n_chunks = len(chunks)
+
+                        for k in range(n_chunks):
+                            t_w0 = time.time()
+                            chunk_spec, nrow_k, _ = next_fut.result()
+                            io_wait_s += max(0.0, time.time() - t_w0)
+                            slot = k % 2
+                            if k + 1 < n_chunks:
+                                next_fut = executor.submit(_io_read_chunk, chunks[k + 1], (k + 1) % 2)
+
+                            t_gpu0 = time.time()
+                            pool = host_pools[slot]
+                            if chunk_spec.block_idx != cur_block_idx:
+                                cur_block_idx = chunk_spec.block_idx
+                                n_tail = 0
+                                emit_cursor = chunk_spec.t_idx_start
+
+                            nt_staged = n_tail + chunk_spec.nt_new
+                            if nt_staged > max_nt_stage:
+                                max_nt_stage = nt_staged
+                                d_vis_pool = cp.empty(nbl * nchan * max_nt_stage, dtype=cp.complex64)
+                                d_wgt_pool = cp.empty(nbl * nchan * max_nt_stage, dtype=cp.float32)
+                                d_uvw_pool = cp.empty(nbl * 3 * max_nt_stage, dtype=cp.float64)
+
+                            with h2d_stream:
+                                if ev_stage_done is not None:
+                                    h2d_stream.wait_event(ev_stage_done)
+                                if nrow_k > 0:
+                                    d_rows["uvw"][:nrow_k].set(pool["uvw"][:nrow_k], stream=h2d_stream)
+                                    d_rows["data"][:nrow_k].set(pool["data"][:nrow_k], stream=h2d_stream)
+                                    d_rows["wgt"][:nrow_k].set(pool["wgt"][:nrow_k], stream=h2d_stream)
+                                    d_rows["flag"][:nrow_k].set(pool["flag"][:nrow_k], stream=h2d_stream)
+                                    d_rows["bl_idx"][:nrow_k].set(pool["bl_idx"][:nrow_k], stream=h2d_stream)
+                                    d_rows["t_rel"][:nrow_k].set(pool["t_rel"][:nrow_k], stream=h2d_stream)
+                                    if has_any_flag_row and d_rows["flag_row"] is not None:
+                                        d_rows["flag_row"][:nrow_k].set(pool["flag_row"][:nrow_k], stream=h2d_stream)
+                                ev_h2d = cp.cuda.Event()
+                                ev_h2d.record(h2d_stream)
+                                slot_h2d_done[slot] = ev_h2d
+
+                            with compute_stream:
+                                compute_stream.wait_event(ev_h2d)
+                                d_vis_stage = d_vis_pool[: nbl * nchan * nt_staged].reshape((nbl, nchan, nt_staged))
+                                d_wgt_stage = d_wgt_pool[: nbl * nchan * nt_staged].reshape((nbl, nchan, nt_staged))
+                                d_uvw_stage = d_uvw_pool[: nbl * 3 * nt_staged].reshape((nbl, 3, nt_staged))
+                                d_vis_stage.fill(0)
+                                d_wgt_stage.fill(0)
+                                d_uvw_stage.fill(0)
+                                if n_tail > 0:
+                                    d_vis_stage[:, :, :n_tail] = d_vis_tail_pool[: nbl * nchan * n_tail].reshape((nbl, nchan, n_tail))
+                                    d_wgt_stage[:, :, :n_tail] = d_wgt_tail_pool[: nbl * nchan * n_tail].reshape((nbl, nchan, n_tail))
+                                    d_uvw_stage[:, :, :n_tail] = d_uvw_tail_pool[: nbl * 3 * n_tail].reshape((nbl, 3, n_tail))
+
+                                if nrow_k > 0:
+                                    stage_ms_rows_gpu(
+                                        bl_idx=d_rows["bl_idx"][:nrow_k],
+                                        t_rel=d_rows["t_rel"][:nrow_k],
+                                        uvw_rows=d_rows["uvw"][:nrow_k],
+                                        data_rows=d_rows["data"][:nrow_k],
+                                        wgt_rows=d_rows["wgt"][:nrow_k],
+                                        flag_rows=d_rows["flag"][:nrow_k],
+                                        flag_row=(
+                                            d_rows["flag_row"][:nrow_k]
+                                            if (has_any_flag_row and chunk_spec.segments[0].has_flag_row and d_rows["flag_row"] is not None)
+                                            else None
+                                        ),
+                                        nbl=nbl,
+                                        nt_stage=nt_staged,
+                                        t_offset=n_tail,
+                                        vis_3d=d_vis_stage,
+                                        wgt_3d=d_wgt_stage,
+                                        uvw_3d=d_uvw_stage,
+                                        corr_mode=corr_mode,
+                                        basis=basis,
+                                        single_pol=single_pol,
+                                        average_correlations=average_correlations,
+                                        corr_index=corr_index,
+                                        labels=meta["labels"],
+                                        lbl2idx=meta["lbl2idx"],
+                                        min_uv_distance_m=min_uv_distance_m,
+                                        return_host=False,
+                                    )
+                                ev_stage_done = cp.cuda.Event()
+                                ev_stage_done.record(compute_stream)
+
+                                if chunk_spec.is_last_in_block:
+                                    need_pre_shift = (
+                                        nt_staged > _MAX_NT_EMIT
+                                        and regularize_time
+                                        and abs(chunk_spec.shift_samps) > 1e-7
+                                        and shift_domain == "native"
+                                    )
+                                    if need_pre_shift:
+                                        src_vis = _shift_time_series_gpu(d_vis_stage, chunk_spec.shift_samps, method=shift_method, axis=-1)
+                                        src_wgt = cp.maximum(
+                                            _shift_time_series_gpu(d_wgt_stage, chunk_spec.shift_samps, method=shift_method, axis=-1),
+                                            np.float32(0.0),
+                                        )
+                                        src_uvw = _shift_time_series_gpu(d_uvw_stage, chunk_spec.shift_samps, method=shift_method, axis=-1)
+                                    else:
+                                        src_vis, src_wgt, src_uvw = d_vis_stage, d_wgt_stage, d_uvw_stage
+
+                                    rem = nt_staged
+                                    offset_rem = 0
+                                    while rem > 0:
+                                        nt_emit = min(_MAX_NT_EMIT, rem)
+                                        if offset_rem == 0:
+                                            cur_vis, cur_wgt, cur_uvw = src_vis, src_wgt, src_uvw
+                                        else:
+                                            cur_vis = cp.ascontiguousarray(src_vis[:, :, offset_rem:])
+                                            cur_wgt = cp.ascontiguousarray(src_wgt[:, :, offset_rem:])
+                                            cur_uvw = cp.ascontiguousarray(src_uvw[:, :, offset_rem:])
+                                        _emit_multi_gpu(
+                                            cur_vis, cur_wgt, cur_uvw, nt_emit, emit_cursor,
+                                            chunk_spec.shift_samps, already_shifted=need_pre_shift,
+                                        )
+                                        emit_cursor += nt_emit
+                                        offset_rem += nt_emit
+                                        rem -= nt_emit
+                                    if need_pre_shift:
+                                        del src_vis, src_wgt, src_uvw
+                                    n_tail = 0
+                                else:
+                                    nt_emit = min(_MAX_NT_EMIT, max(0, nt_staged - req_overlap))
+                                    n_next_tail = nt_staged - nt_emit
+                                    if n_next_tail > tail_cap:
+                                        tail_cap = n_next_tail
+                                        d_vis_tail_pool = cp.empty(nbl * nchan * tail_cap, dtype=cp.complex64)
+                                        d_wgt_tail_pool = cp.empty(nbl * nchan * tail_cap, dtype=cp.float32)
+                                        d_uvw_tail_pool = cp.empty(nbl * 3 * tail_cap, dtype=cp.float64)
+                                    if n_next_tail > 0:
+                                        d_vis_tail_pool[: nbl * nchan * n_next_tail].reshape((nbl, nchan, n_next_tail))[:] = d_vis_stage[:, :, nt_emit:]
+                                        d_wgt_tail_pool[: nbl * nchan * n_next_tail].reshape((nbl, nchan, n_next_tail))[:] = d_wgt_stage[:, :, nt_emit:]
+                                        d_uvw_tail_pool[: nbl * 3 * n_next_tail].reshape((nbl, 3, n_next_tail))[:] = d_uvw_stage[:, :, nt_emit:]
+                                    if nt_emit > 0:
+                                        _emit_multi_gpu(
+                                            d_vis_stage, d_wgt_stage, d_uvw_stage, nt_emit, emit_cursor,
+                                            chunk_spec.shift_samps,
+                                        )
+                                        emit_cursor += nt_emit
+                                    n_tail = n_next_tail
+
+                            gpu_compute_s += max(0.0, time.time() - t_gpu0)
+
+                        h2d_stream.synchronize()
+                        compute_stream.synchronize()
+                    finally:
+                        try:
+                            executor.submit(_io_close_tables).result(timeout=30)
+                        except Exception as exc:
+                            logger.warning("ThreadPoolExecutor failed closing tables cleanly: %s", exc)
+                        executor.shutdown(wait=True)
+                        host_pools.clear()
+                        d_rows.clear()
+                        del d_vis_pool, d_wgt_pool, d_uvw_pool
+                        del d_vis_tail_pool, d_wgt_tail_pool, d_uvw_tail_pool
+                        del d_flat_indices, d_inter_delays_bin
+                        cp.get_default_memory_pool().free_all_blocks()
+
+                pass_stream_s = float(time.time() - t_pass0)
+                per_dm_stream_s = pass_stream_s / float(max(1, n_fine_bin))
+
+                # Consolidate and yield each fine DM store one at a time to minimise peak VRAM
+                d_sparse_uv = cp.asarray(sparse_plan_uv_host, dtype=cp.int32)
+                for j_dm in range(n_fine_bin):
+                    dm_val = fine_dms_bin[j_dm]
+                    dm_idx_val = fine_ids_bin[j_dm]
+                    t_cons0 = time.time()
+                    common_attrs = _build_common_attrs(
+                        meta=meta,
+                        geom=geom,
+                        eff_grid_nu=eff_grid_nu,
+                        eff_nv=eff_nv,
+                        u_half=u_half,
+                        npix_x=npix_x,
+                        npix_y=npix_y,
+                        pixsize_arcsec=eff_pix_arcsec,
+                        dm=dm_val,
+                        mode=mode,
+                        m_padded=m_padded,
+                        dedisp_mode="subbanded",
+                        nsubbands=eff_nsub,
+                    )
+                    dev_chunks_j = [
+                        (cp.asarray(ci), cp.asarray(cc), cp.asarray(vd), cp.asarray(vt))
+                        for ci, cc, vd, vt in host_chunks_per_dm[j_dm]
+                    ]
+                    host_chunks_per_dm[j_dm].clear()
+
+                    gpu_dict = consolidate_device_chunks_to_gpu_store(
+                        device_chunks=dev_chunks_j,
+                        sparse_plan_uv=d_sparse_uv,
+                        active_only=bool(active_only),
+                        store_dir=None,
+                        attrs=common_attrs,
+                    )
+                    del dev_chunks_j
+                    out_attrs = dict(gpu_dict["attrs"])
+                    m_active_j = int(out_attrs["m_total"])
+                    nnz_j = int(out_attrs["nnz_total"])
+                    gpu_store = from_gpu_buffers(
+                        cell_offsets=gpu_dict["cell_offsets"],
+                        cell_uv=gpu_dict["cell_uv"],
+                        vis_data=gpu_dict["vis_data"],
+                        vis_times=gpu_dict["vis_times"],
+                        attrs=out_attrs,
+                        store_dir="",
+                        copy_to_host=False,
+                        device_id=int(device_id),
+                    )
+                    csr_mat = (
+                        build_gpu_csr_matrix(gpu_store, total_planes=total_planes, dt=dt_nominal)
+                        if return_csr_matrix
+                        else None
+                    )
+                    cons_s = float(time.time() - t_cons0)
+                    yield dm_idx_val, dm_val, DirectRasterResult(
+                        gpu_store=gpu_store,
+                        store=None,
+                        csr_matrix=csr_mat,
+                        attrs=out_attrs,
+                        time_info=time_info,
+                        io_s=io_wait_s / float(max(1, n_fine_bin)),
+                        gpu_s=gpu_compute_s / float(max(1, n_fine_bin)),
+                        consolidate_s=cons_s,
+                        total_s=per_dm_stream_s + cons_s,
+                        nrows=total_rows,
+                        m_total=m_active_j,
+                        nnz_total=nnz_j,
+                        device="cuda",
+                    )
+                del d_sparse_uv
+                cp.get_default_memory_pool().free_all_blocks()
+        else:
+            # CPU fallback: stream each fine DM via stream_ms_to_ragged_csr(dedisp_mode="subbanded")
+            for dm_idx_val, dm_val in zip(fine_ids_bin, fine_dms_bin):
+                res = stream_ms_to_ragged_csr(
+                    msname,
+                    start_time_idx=start_time_idx,
+                    end_time_idx=end_time_idx,
+                    start_time=start_time,
+                    end_time=end_time,
+                    time_step=time_step,
+                    time_tolerance=time_tolerance,
+                    max_blank_factor=max_blank_factor,
+                    regularize_time=regularize_time,
+                    sync_tolerance=sync_tolerance,
+                    shift_method=shift_method,
+                    shift_domain=shift_domain,
+                    spw=spw,
+                    chan_sel=chan_sel,
+                    data_column=data_column,
+                    corr_mode=corr_mode,
+                    single_pol=single_pol,
+                    basis=basis,
+                    average_correlations=average_correlations,
+                    corr_index=corr_index,
+                    use_weight_spectrum=use_weight_spectrum,
+                    field_name=field_name,
+                    npix_x=npix_x,
+                    npix_y=npix_y,
+                    pixsize_arcsec=pixsize_arcsec,
+                    pix_rad=pix_rad,
+                    grid_nu=grid_nu,
+                    nv=nv,
+                    dm=dm_val,
+                    dedisp_mode="subbanded",
+                    align_to=align_to,
+                    nsubbands=eff_nsub,
+                    exact_uvw=exact_uvw,
+                    mode=mode,
+                    epsilon=epsilon,
+                    sigma_min=sigma_min,
+                    sigma_max=sigma_max,
+                    center_x=center_x,
+                    center_y=center_y,
+                    allow_nshift=allow_nshift,
+                    apply_w_phase=apply_w_phase,
+                    flip_u=flip_u,
+                    flip_v=flip_v,
+                    flip_w=flip_w,
+                    divide_by_n=divide_by_n,
+                    normalise_mode=normalise_mode,
+                    oversample=oversample,
+                    supp=supp,
+                    min_valid_channels=min_valid_channels,
+                    min_uv_distance_m=min_uv_distance_m,
+                    uv_threshold=uv_threshold,
+                    row_chunk_size=row_chunk_size,
+                    sparse_grid_plan=sparse_grid_plan,
+                    active_only=active_only,
+                    device="cpu",
+                    use_numba=use_numba,
+                )
+                yield dm_idx_val, dm_val, res
+
+
 __all__ = [
     "DirectRasterResult",
+    "iter_ms_to_ragged_csr_subbanded",
     "stream_ms_to_ragged_csr",
 ]
