@@ -171,13 +171,19 @@ def build_cli(argv=None):
                         help='Trial DM step size (pc cm^-3). If None and dm-max > dm-min, computed using --dm-tol.')
     parser.add_argument('--dm-tol', type=float, default=1.0,
                         help='Smearing tolerance factor in samples for optimal DM trial grid generation (default: 1.0).')
+    parser.add_argument(
+        '--dedisp-mode',
+        choices=['subbanded', 'fullband'],
+        default='subbanded',
+        help="Dedispersion engine mode: 'subbanded' (two-tier subbanded) or 'fullband' (brute-force) (default: subbanded).",
+    )
     _add_bool_flag(
         parser, '--collapse-channels', '--no-collapse-channels', 'collapse_channels', False,
         help_true='Average/collapse channel dimension after dedispersion before imaging (default: False).',
         help_false='Retain channel dimension when imaging (default: True).',
     )
-    parser.add_argument('--nsubbands', type=int, default=1,
-                        help='Number of subbands to divide the bandwidth into before imaging (default: 1).')
+    parser.add_argument('--nsubbands', type=int, default=16,
+                        help='Number of subbands to divide the bandwidth into (default: 16).')
     parser.add_argument('--dm-list', type=float, nargs='+', default=None,
                         help='Explicit list of trial DMs (pc cm^-3), e.g. --dm-list 0.0 100.0 160.0 186.4 210.0')
     parser.add_argument('--scan-id', '--scan', dest='scan_id', default=None,
@@ -354,8 +360,9 @@ def make_config(args, paths) -> Config:
     current_dm = getattr(args, "dm", 0.0)
     if current_dm is None:
         current_dm = 0.0
+    dedisp_mode = getattr(args, "dedisp_mode", "subbanded")
     collapse_channels = getattr(args, "collapse_channels", False)
-    nsubbands = getattr(args, "nsubbands", 1)
+    nsubbands = getattr(args, "nsubbands", 16)
     nthreads = args.nthreads if args.nthreads > 0 else (args.slurm_cores_per_worker if getattr(args, "parallel_mode", "") == 'dask-slurm' else 0)
     return Config(
         msname=args.msname,
@@ -387,6 +394,7 @@ def make_config(args, paths) -> Config:
         use_local_threshold=getattr(args, "use_local_threshold", True),
         local_window_size=getattr(args, "local_box_size", 64),
         current_dm=current_dm,
+        dedisp_mode=dedisp_mode,
         collapse_channels=collapse_channels,
         nsubbands=nsubbands,
         exact_uvw=getattr(args, "exact_uvw", True),
@@ -473,9 +481,21 @@ def run_pipeline(args):
             dm_max=args.dm_max,
             dm_step=args.dm_step,
             tolerance_samples=args.dm_tol,
+            dedisp_mode=getattr(args, "dedisp_mode", "subbanded"),
+            n_subbands=getattr(args, "nsubbands", 16),
         )
         dm_trials = [float(d) for d in plan.trial_dms]
-        logger.info(f"Dedispersion Plan: {len(dm_trials)} trial DMs from {dm_trials[0]:.2f} to {dm_trials[-1]:.2f} pc cm^-3 (step ~ {plan.dm_step:.3f})")
+        logger.info(
+            "Dedispersion Plan (%s, n_subbands=%d): %d trial DMs from %.2f to %.2f pc cm^-3 "
+            "(step ~ %.3f, coarse trials: %d)",
+            plan.dedisp_mode,
+            plan.n_subbands,
+            len(dm_trials),
+            dm_trials[0],
+            dm_trials[-1],
+            plan.dm_step,
+            plan.n_coarse,
+        )
     else:
         dm_trials = [0.0]
 

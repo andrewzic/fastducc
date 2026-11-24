@@ -67,9 +67,15 @@ from fastducc.gpu_nufft import (
     write_ragged_store_to_disk,
 )
 from fastducc.gpu_raster import (
+    _normalise_mode,
+    _resolve_normalise_mode,
     compute_raster_grid_geometry,
+    dedisperse_active_cell_matrix_cpu,
+    dedisperse_active_cell_matrix_gpu,
     dedisperse_and_rasterise_chunk_cpu,
     dedisperse_and_rasterise_chunk_gpu,
+    dedisperse_and_rasterise_subband_cpu,
+    dedisperse_and_rasterise_subband_gpu,
     stage_ms_rows_cpu,
     stage_ms_rows_gpu,
 )
@@ -1102,12 +1108,16 @@ def _build_common_attrs(
     dm: float,
     mode: str,
     m_padded: int,
+    dedisp_mode: str = "fullband",
+    nsubbands: int = 1,
 ) -> Dict[str, Any]:
     time_info = meta["time_info"]
     return {
         "format": "ragged_csr",
         "engine": "direct_raster",
         "raster_mode": str(mode),
+        "dedisp_mode": str(dedisp_mode),
+        "nsubbands": int(nsubbands),
         "tsamp": float(time_info["dt_nominal"]),
         "t0": float(time_info["grid_times"][0]),
         "du": float(geom["du"]),
@@ -1157,6 +1167,10 @@ def _stream_gpu(
     pixsize_arcsec: float,
     delays_host: np.ndarray,
     max_delay: int,
+    dedisp_mode: str,
+    intra_delays_host: Optional[np.ndarray],
+    inter_delays_host: Optional[np.ndarray],
+    max_inter_delay: int,
     data_column: str,
     chan_sel: Optional[Tuple[int, Optional[int]]],
     corr_mode: str,
@@ -1224,6 +1238,8 @@ def _stream_gpu(
         dm=dm,
         mode=mode,
         m_padded=m_padded,
+        dedisp_mode=dedisp_mode,
+        nsubbands=nsubbands,
     )
 
     with cp.cuda.Device(int(device_id)):
@@ -1387,35 +1403,84 @@ def _stream_gpu(
             else:
                 w_vis, w_wgt, w_uvw = d_vis_stage, d_wgt_stage, d_uvw_stage
 
-            d_sparse_chunk = dedisperse_and_rasterise_chunk_gpu(
-                vis_3d=w_vis,
-                wgt_3d=w_wgt,
-                uvw_3d=w_uvw,
-                freqs_hz=chan_freq,
-                delays=delays_host,
-                nt_out=nt_emit,
-                dm=float(dm),
-                dt=dt_nominal,
-                align_to=align_to,
-                collapse_channels=bool(collapse_channels),
-                nsubbands=int(nsubbands),
-                exact_uvw=bool(exact_uvw),
-                npix_x=int(npix_x),
-                npix_y=int(npix_y),
-                pixsize_arcsec=float(pixsize_arcsec),
-                pix_rad=float(geom["pix_rad"]),
-                grid_nu=int(eff_grid_nu),
-                nv=int(eff_nv),
-                mode=mode,
-                min_valid_channels=int(min_valid_channels),
-                min_uv_distance_m=min_uv_distance_m,
-                uv_threshold=float(uv_threshold),
-                flat_indices=d_flat_indices,
-                m_active=m_padded,
-                return_sparse=True,
-                return_host=False,
-                **(wgridder_kwargs or {}),
-            )
+            if dedisp_mode == "subbanded":
+                mode_id = _normalise_mode(mode)
+                wg_kw = dict(wgridder_kwargs or {})
+                wg_kw.pop("do_wgridding", None)
+                use_snap_norm, _ = _resolve_normalise_mode(mode_id, wg_kw.get("normalise_mode"))
+                nt_tier1 = min(int(w_vis.shape[2]), nt_emit + max_inter_delay)
+                tier1_res = dedisperse_and_rasterise_subband_gpu(
+                    vis_3d=w_vis,
+                    wgt_3d=w_wgt,
+                    uvw_3d=w_uvw,
+                    freqs_hz=chan_freq,
+                    intra_delays=intra_delays_host,
+                    n_subbands=int(nsubbands),
+                    nt_out=nt_tier1,
+                    dm_coarse=float(dm),
+                    dt=dt_nominal,
+                    align_to=align_to,
+                    exact_uvw=bool(exact_uvw),
+                    npix_x=int(npix_x),
+                    npix_y=int(npix_y),
+                    pixsize_arcsec=float(pixsize_arcsec),
+                    pix_rad=float(geom["pix_rad"]),
+                    grid_nu=int(eff_grid_nu),
+                    nv=int(eff_nv),
+                    mode=mode,
+                    min_valid_channels=int(min_valid_channels),
+                    min_uv_distance_m=min_uv_distance_m,
+                    flat_indices=d_flat_indices,
+                    m_active=m_padded,
+                    return_weights=(not use_snap_norm),
+                    return_host=False,
+                    **wg_kw,
+                )
+                if use_snap_norm:
+                    d_active_dga, d_active_wgt = tier1_res, None
+                else:
+                    d_active_dga, d_active_wgt = tier1_res
+                d_sparse_chunk = dedisperse_active_cell_matrix_gpu(
+                    d_active_dga,
+                    inter_delays_host,
+                    nt_out=nt_emit,
+                    active_wgt=d_active_wgt,
+                    uv_threshold=float(uv_threshold),
+                    return_host=False,
+                )
+                del d_active_dga
+                if d_active_wgt is not None:
+                    del d_active_wgt
+            else:
+                d_sparse_chunk = dedisperse_and_rasterise_chunk_gpu(
+                    vis_3d=w_vis,
+                    wgt_3d=w_wgt,
+                    uvw_3d=w_uvw,
+                    freqs_hz=chan_freq,
+                    delays=delays_host,
+                    nt_out=nt_emit,
+                    dm=float(dm),
+                    dt=dt_nominal,
+                    align_to=align_to,
+                    collapse_channels=bool(collapse_channels),
+                    nsubbands=int(nsubbands),
+                    exact_uvw=bool(exact_uvw),
+                    npix_x=int(npix_x),
+                    npix_y=int(npix_y),
+                    pixsize_arcsec=float(pixsize_arcsec),
+                    pix_rad=float(geom["pix_rad"]),
+                    grid_nu=int(eff_grid_nu),
+                    nv=int(eff_nv),
+                    mode=mode,
+                    min_valid_channels=int(min_valid_channels),
+                    min_uv_distance_m=min_uv_distance_m,
+                    uv_threshold=float(uv_threshold),
+                    flat_indices=d_flat_indices,
+                    m_active=m_padded,
+                    return_sparse=True,
+                    return_host=False,
+                    **(wgridder_kwargs or {}),
+                )
             if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
                 d_sparse_chunk = _shift_time_series_gpu(d_sparse_chunk, shift_samps, method=shift_method, axis=-1)
 
@@ -1796,6 +1861,10 @@ def _stream_cpu(
     pixsize_arcsec: float,
     delays_host: np.ndarray,
     max_delay: int,
+    dedisp_mode: str,
+    intra_delays_host: Optional[np.ndarray],
+    inter_delays_host: Optional[np.ndarray],
+    max_inter_delay: int,
     data_column: str,
     chan_sel: Optional[Tuple[int, Optional[int]]],
     corr_mode: str,
@@ -1855,6 +1924,8 @@ def _stream_cpu(
         dm=dm,
         mode=mode,
         m_padded=m_padded,
+        dedisp_mode=dedisp_mode,
+        nsubbands=nsubbands,
     )
 
     chunks, max_chunk_rows, total_rows = _plan_streaming_chunks(
@@ -1930,35 +2001,81 @@ def _stream_cpu(
         else:
             w_vis, w_wgt, w_uvw = vis_in, wgt_in, uvw_in
 
-        dga_sub = dedisperse_and_rasterise_chunk_cpu(
-            vis_3d=w_vis,
-            wgt_3d=w_wgt,
-            uvw_3d=w_uvw,
-            freqs_hz=chan_freq,
-            delays=delays_host,
-            nt_out=nt_emit,
-            dm=float(dm),
-            dt=dt_nominal,
-            align_to=align_to,
-            collapse_channels=bool(collapse_channels),
-            nsubbands=int(nsubbands),
-            exact_uvw=bool(exact_uvw),
-            npix_x=int(npix_x),
-            npix_y=int(npix_y),
-            pixsize_arcsec=float(pixsize_arcsec),
-            pix_rad=float(geom["pix_rad"]),
-            grid_nu=int(eff_grid_nu),
-            nv=int(eff_nv),
-            mode=mode,
-            min_valid_channels=int(min_valid_channels),
-            min_uv_distance_m=min_uv_distance_m,
-            uv_threshold=float(uv_threshold),
-            flat_indices=flat_indices_host,
-            m_active=m_padded,
-            return_sparse=True,
-            use_numba=bool(use_numba),
-            **(wgridder_kwargs or {}),
-        )
+        if dedisp_mode == "subbanded":
+            mode_id = _normalise_mode(mode)
+            wg_kw = dict(wgridder_kwargs or {})
+            wg_kw.pop("do_wgridding", None)
+            use_snap_norm, _ = _resolve_normalise_mode(mode_id, wg_kw.get("normalise_mode"))
+            nt_tier1 = min(int(w_vis.shape[2]), nt_emit + max_inter_delay)
+            tier1_res = dedisperse_and_rasterise_subband_cpu(
+                vis_3d=w_vis,
+                wgt_3d=w_wgt,
+                uvw_3d=w_uvw,
+                freqs_hz=chan_freq,
+                intra_delays=intra_delays_host,
+                n_subbands=int(nsubbands),
+                nt_out=nt_tier1,
+                dm_coarse=float(dm),
+                dt=dt_nominal,
+                align_to=align_to,
+                exact_uvw=bool(exact_uvw),
+                npix_x=int(npix_x),
+                npix_y=int(npix_y),
+                pixsize_arcsec=float(pixsize_arcsec),
+                pix_rad=float(geom["pix_rad"]),
+                grid_nu=int(eff_grid_nu),
+                nv=int(eff_nv),
+                mode=mode,
+                min_valid_channels=int(min_valid_channels),
+                min_uv_distance_m=min_uv_distance_m,
+                flat_indices=flat_indices_host,
+                m_active=m_padded,
+                return_weights=(not use_snap_norm),
+                use_numba=bool(use_numba),
+                **wg_kw,
+            )
+            if use_snap_norm:
+                active_dga, active_wgt = tier1_res, None
+            else:
+                active_dga, active_wgt = tier1_res
+            dga_sub = dedisperse_active_cell_matrix_cpu(
+                active_dga,
+                inter_delays_host,
+                nt_out=nt_emit,
+                active_wgt=active_wgt,
+                uv_threshold=float(uv_threshold),
+                use_numba=bool(use_numba),
+            )
+        else:
+            dga_sub = dedisperse_and_rasterise_chunk_cpu(
+                vis_3d=w_vis,
+                wgt_3d=w_wgt,
+                uvw_3d=w_uvw,
+                freqs_hz=chan_freq,
+                delays=delays_host,
+                nt_out=nt_emit,
+                dm=float(dm),
+                dt=dt_nominal,
+                align_to=align_to,
+                collapse_channels=bool(collapse_channels),
+                nsubbands=int(nsubbands),
+                exact_uvw=bool(exact_uvw),
+                npix_x=int(npix_x),
+                npix_y=int(npix_y),
+                pixsize_arcsec=float(pixsize_arcsec),
+                pix_rad=float(geom["pix_rad"]),
+                grid_nu=int(eff_grid_nu),
+                nv=int(eff_nv),
+                mode=mode,
+                min_valid_channels=int(min_valid_channels),
+                min_uv_distance_m=min_uv_distance_m,
+                uv_threshold=float(uv_threshold),
+                flat_indices=flat_indices_host,
+                m_active=m_padded,
+                return_sparse=True,
+                use_numba=bool(use_numba),
+                **(wgridder_kwargs or {}),
+            )
         if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
             dga_sub = timeshift.shift_time_series(dga_sub, shift_samps, method=shift_method, axis=-1)
 
@@ -2179,6 +2296,7 @@ def stream_ms_to_ragged_csr(
     grid_nu: Optional[int] = None,
     nv: Optional[int] = None,
     dm: float = 0.0,
+    dedisp_mode: str = "fullband",
     align_to: str = "fmax",
     collapse_channels: bool = False,
     nsubbands: int = 1,
@@ -2314,21 +2432,60 @@ def stream_ms_to_ragged_csr(
         "supp": supp,
     }
 
+    eff_dedisp_mode = str(dedisp_mode).strip().lower()
+    if eff_dedisp_mode not in ("subbanded", "fullband"):
+        raise ValueError(
+            f"Unsupported dedisp_mode='{dedisp_mode}'; expected 'subbanded' or 'fullband'."
+        )
+
     chan_freq = meta["chan_freq"]
     dt_nominal = float(meta["time_info"]["dt_nominal"])
-    if float(dm) != 0.0 and len(chan_freq) > 0:
-        delays_host = dedisp.get_dm_delays(
-            chan_freq, float(dm), dt_nominal, align_to=align_to
-        ).astype(np.int32)
-        if np.any(delays_host < 0):
-            raise ValueError(
-                "Streaming lookahead dedispersion requires non-negative causal delays "
-                "(use align_to='fmax' with dm >= 0)."
-            )
-        max_delay = int(np.max(delays_host))
+    eff_nsubbands = int(nsubbands)
+    intra_delays_host: Optional[np.ndarray] = None
+    inter_delays_host: Optional[np.ndarray] = None
+    max_inter_delay = 0
+
+    if eff_dedisp_mode == "subbanded":
+        eff_nsubbands = max(1, min(eff_nsubbands, len(chan_freq))) if len(chan_freq) > 0 else 1
+        plan = dedisp.DedispersionPlan(
+            freqs_hz=chan_freq,
+            tsamp_s=dt_nominal,
+            dm_min=float(dm),
+            dm_max=float(dm),
+            dedisp_mode="subbanded",
+            n_subbands=eff_nsubbands,
+        )
+        if float(dm) != 0.0 and len(chan_freq) > 0:
+            intra_delays_host = plan.get_intra_delays(float(dm), align_to=align_to).astype(np.int32)
+            inter_delays_host = plan.get_inter_delays(float(dm), align_to=align_to).astype(np.int32)
+            if np.any(intra_delays_host < 0) or np.any(inter_delays_host < 0):
+                raise ValueError(
+                    "Streaming two-tier subbanded dedispersion requires non-negative causal delays "
+                    "(use align_to='fmax' with dm >= 0)."
+                )
+            max_inter_delay = int(np.max(inter_delays_host)) if inter_delays_host.size > 0 else 0
+            max_intra_delay = int(np.max(intra_delays_host)) if intra_delays_host.size > 0 else 0
+            max_delay = max_intra_delay + max_inter_delay
+        else:
+            intra_delays_host = np.zeros(len(chan_freq), dtype=np.int32)
+            inter_delays_host = np.zeros(eff_nsubbands, dtype=np.int32)
+            max_inter_delay = 0
+            max_delay = 0
+        delays_host = intra_delays_host
     else:
-        delays_host = np.zeros(len(chan_freq), dtype=np.int32)
-        max_delay = 0
+        if float(dm) != 0.0 and len(chan_freq) > 0:
+            delays_host = dedisp.get_dm_delays(
+                chan_freq, float(dm), dt_nominal, align_to=align_to
+            ).astype(np.int32)
+            if np.any(delays_host < 0):
+                raise ValueError(
+                    "Streaming lookahead dedispersion requires non-negative causal delays "
+                    "(use align_to='fmax' with dm >= 0)."
+                )
+            max_delay = int(np.max(delays_host))
+        else:
+            delays_host = np.zeros(len(chan_freq), dtype=np.int32)
+            max_delay = 0
 
     if eff_device == "cuda":
         return _stream_gpu(
@@ -2342,6 +2499,10 @@ def stream_ms_to_ragged_csr(
             pixsize_arcsec=eff_pix_arcsec,
             delays_host=delays_host,
             max_delay=max_delay,
+            dedisp_mode=eff_dedisp_mode,
+            intra_delays_host=intra_delays_host,
+            inter_delays_host=inter_delays_host,
+            max_inter_delay=max_inter_delay,
             data_column=str(data_column),
             chan_sel=chan_sel,
             corr_mode=str(corr_mode),
@@ -2352,7 +2513,7 @@ def stream_ms_to_ragged_csr(
             dm=float(dm),
             align_to=str(align_to),
             collapse_channels=bool(collapse_channels),
-            nsubbands=int(nsubbands),
+            nsubbands=eff_nsubbands,
             exact_uvw=bool(exact_uvw),
             mode=str(mode),
             wgridder_kwargs=wgridder_kwargs,
@@ -2384,6 +2545,10 @@ def stream_ms_to_ragged_csr(
         pixsize_arcsec=eff_pix_arcsec,
         delays_host=delays_host,
         max_delay=max_delay,
+        dedisp_mode=eff_dedisp_mode,
+        intra_delays_host=intra_delays_host,
+        inter_delays_host=inter_delays_host,
+        max_inter_delay=max_inter_delay,
         data_column=str(data_column),
         chan_sel=chan_sel,
         corr_mode=str(corr_mode),
@@ -2394,7 +2559,7 @@ def stream_ms_to_ragged_csr(
         dm=float(dm),
         align_to=str(align_to),
         collapse_channels=bool(collapse_channels),
-        nsubbands=int(nsubbands),
+        nsubbands=eff_nsubbands,
         exact_uvw=bool(exact_uvw),
         mode=str(mode),
         wgridder_kwargs=wgridder_kwargs,

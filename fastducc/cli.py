@@ -100,6 +100,18 @@ def build_cli_periodicity(argv: Sequence[str] | None = None) -> argparse.Namespa
     p.add_argument("--pixscale-arcsec", type=float, default=22.0)
     p.add_argument("--fmin", type=float, default=0.5, help="Minimum spin frequency to keep (Hz)")
     p.add_argument("--dm", type=float, default=0.0, help="Dispersion Measure (pc cm^-3)")
+    p.add_argument(
+        "--dedisp-mode",
+        choices=["subbanded", "fullband"],
+        default="subbanded",
+        help="Dedispersion engine mode: 'subbanded' (two-tier subbanded) or 'fullband' (brute-force) (default: subbanded)",
+    )
+    p.add_argument(
+        "--nsubbands",
+        type=int,
+        default=16,
+        help="Number of coarse frequency subbands for two-tier subbanded dedispersion (default: 16)",
+    )
     p.add_argument("--eps", type=float, default=1e-5, help="DUCC NUFFT tolerance")
     p.add_argument("--do-wstacking", action="store_true", default=True, help="Enable 3-D W-stacking to correct non-coplanar baseline phase errors (default: True)")
     p.add_argument("--no-wstacking", dest="do_wstacking", action="store_false", help="Disable W-stacking (pure coplanar 3-D NUFFT)")

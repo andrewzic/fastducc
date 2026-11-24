@@ -49,8 +49,9 @@ class Config:
     local_window_size: int = 64
     current_dm: float = 0.0
     dm_trials: Optional[List[float]] = None
+    dedisp_mode: str = "subbanded"
     collapse_channels: bool = False
-    nsubbands: int = 1
+    nsubbands: int = 16
     exact_uvw: bool = True
     scan_id: Optional[str] = None
     is_dm_search: bool = False
@@ -123,6 +124,7 @@ class CubeConfig:
     sigma_max: float = 2.6
     min_valid_channels: int = 24
     dm: float = 0.0
+    dedisp_mode: str = "subbanded"
     collapse_channels: bool = False
     nsubbands: int = 1
     exact_uvw: bool = True
