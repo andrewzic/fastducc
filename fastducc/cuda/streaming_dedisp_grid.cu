@@ -2005,6 +2005,10 @@ extern "C" __global__ void compute_snapshot_vis2grid_norm_kernel(
                 const int nsub_norm = (collapse_channels != 0 && nsub_eff <= 1) ? 1 : max(1, nsub_eff);
                 const double nbl_eff = fmax(1.0, static_cast<double>(nval) / static_cast<double>(nsub_norm));
                 denom *= nbl_eff;
+            } else if (divide_by_n == 3) {
+                const int nsub_norm = max(1, nsub_eff);
+                const double nbl_eff = fmax(1.0, static_cast<double>(nval) / static_cast<double>(nsub_norm));
+                denom *= nbl_eff * (static_cast<double>(nsub_norm) / static_cast<double>(max(1, nchan)));
             }
             snap_inv_w[t] = static_cast<float>(1.0 / denom);
         } else {
@@ -2238,4 +2242,500 @@ extern "C" __global__ void ducc_fht_to_halfplane_kernel(
         val = make_float2(rx, ry);
     }
     out_uv[dst_idx] = val;
+}
+
+
+// =============================================================================
+// Two-Tier Subbanded Dedispersion Kernels (Dense-in-Time, Sparse-in-(u, v))
+// =============================================================================
+
+namespace {
+
+__device__ __forceinline__ void accumulate_active_subband_cell(
+    const int s,
+    const int t,
+    const int nsub_eff,
+    const int nt_out,
+    const int u_half,
+    const long long u_cell,
+    const long long v_idx,
+    const float re,
+    const float im,
+    const float w,
+    const int* __restrict__ uv_to_m,
+    float2* __restrict__ active_vis,
+    float* __restrict__ active_wgt
+) {
+    if (w <= 0.0f || u_cell < 0 || u_cell >= static_cast<long long>(u_half)) {
+        return;
+    }
+    const size_t uv_offset =
+        static_cast<size_t>(v_idx) * static_cast<size_t>(u_half) + static_cast<size_t>(u_cell);
+    const int m_idx = uv_to_m[uv_offset];
+    if (m_idx < 0) {
+        return;
+    }
+    const size_t dst_idx =
+        (static_cast<size_t>(m_idx) * static_cast<size_t>(nsub_eff) + static_cast<size_t>(s))
+        * static_cast<size_t>(nt_out)
+        + static_cast<size_t>(t);
+    atomicAdd(&active_vis[dst_idx].x, re);
+    atomicAdd(&active_vis[dst_idx].y, im);
+    atomicAdd(&active_wgt[dst_idx], w);
+}
+
+__device__ __forceinline__ void splat_active_subband_wgridder_2d(
+    const int s,
+    const int t,
+    const int nsub_eff,
+    const int nt_out,
+    const int grid_nu,
+    const int nv,
+    const int u_half,
+    const int supp,
+    const int iu0,
+    const int iv0,
+    const float vr,
+    const float vi,
+    const float w_val,
+    const float* __restrict__ ku,
+    const float* __restrict__ kv,
+    const int* __restrict__ uv_to_m,
+    float2* __restrict__ active_vis,
+    float* __restrict__ active_wgt
+) {
+    for (int cu = 0; cu < supp; ++cu) {
+        int iu = iu0 + cu;
+        if (iu < 0) {
+            iu += grid_nu;
+        } else if (iu >= grid_nu) {
+            iu -= grid_nu;
+        }
+        const int xu = (iu == 0) ? 0 : (grid_nu - iu);
+        const bool do_pos = (iu < u_half);
+        const bool do_neg = (xu < u_half);
+        if (!do_pos && !do_neg) {
+            continue;
+        }
+
+        const float ku_val = 0.5f * ku[cu];
+        const float vr_u = vr * ku_val;
+        const float vi_u = vi * ku_val;
+        const float w_u = w_val * ku_val;
+
+        for (int cv = 0; cv < supp; ++cv) {
+            int iv = iv0 + cv;
+            if (iv < 0) {
+                iv += nv;
+            } else if (iv >= nv) {
+                iv -= nv;
+            }
+            const float kv_val = kv[cv];
+            const float kw = w_u * kv_val;
+            if (kw <= 0.0f) {
+                continue;
+            }
+            const float re_tap = vr_u * kv_val;
+            const float im_tap = vi_u * kv_val;
+
+            if (do_pos) {
+                accumulate_active_subband_cell(
+                    s, t, nsub_eff, nt_out, u_half,
+                    static_cast<long long>(iu), static_cast<long long>(iv),
+                    re_tap, im_tap, kw,
+                    uv_to_m, active_vis, active_wgt
+                );
+            }
+            if (do_neg) {
+                const int xv = (iv == 0) ? 0 : (nv - iv);
+                accumulate_active_subband_cell(
+                    s, t, nsub_eff, nt_out, u_half,
+                    static_cast<long long>(xu), static_cast<long long>(xv),
+                    re_tap, -im_tap, kw,
+                    uv_to_m, active_vis, active_wgt
+                );
+            }
+        }
+    }
+}
+
+}  // namespace
+
+
+/**
+ * Tier 1 Two-Tier Subbanded Dedispersion kernel:
+ * Applies non-negative causal intra-subband channel delays relative to each
+ * subband's upper edge frequency, accumulates channels into ``nsub_eff``
+ * subbands in shared memory, and rasterises directly into the compact
+ * Dense-in-Time, Sparse-in-(u, v) active cell tensor
+ * ``active_vis[M_active, nsub_eff, nt_out]`` and ``active_wgt[M_active, nsub_eff, nt_out]``.
+ *
+ * Supports ``mode == 0`` (nearest/pillbox), ``mode == 1`` (bilinear), and
+ * ``mode == 2`` (DUCC 2D piecewise Chebyshev polynomial wgridder).
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: snapshot time t (coalesced), y: baseline bl]
+ *   grid  = (ceil(nt_out / 32), min(65535, ceil(nbl / 8)), 1)
+ */
+extern "C" __global__ void dedisperse_and_rasterise_subband_active_kernel(
+    const float2* __restrict__ vis_3d,
+    const float* __restrict__ wgt_3d,
+    const double* __restrict__ uvw_3d,
+    const int* __restrict__ intra_delays,
+    const int* __restrict__ sub_offsets,
+    const double* __restrict__ sub_freqs_hz,
+    const int* __restrict__ sub_delays,
+    const int* __restrict__ raw_valid_chans,
+    const int* __restrict__ dedisp_valid_chans,
+    const int* __restrict__ uv_to_m,
+    const float* __restrict__ poly_coeffs,
+    float2* __restrict__ active_vis,
+    float* __restrict__ active_wgt,
+    int nbl,
+    int nchan,
+    int nsub_eff,
+    int nt_in,
+    int nt_out,
+    int grid_nu,
+    int nv,
+    int u_half,
+    double du,
+    double dv,
+    double pixsize_x,
+    double pixsize_y,
+    double min_uv_distance_m,
+    int min_valid_channels,
+    int exact_uvw,
+    int mode,
+    int supp,
+    int deg,
+    double lshift,
+    double mshift,
+    double nshift,
+    int do_shift,
+    int flip_u,
+    int flip_v,
+    int flip_w
+) {
+    __shared__ float2 s_slot_vis[8][32];
+    __shared__ float s_slot_wgt[8][32];
+
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nt_out) {
+        return;
+    }
+    if (!is_snapshot_valid(t, nchan, 0, min_valid_channels, raw_valid_chans, dedisp_valid_chans)) {
+        return;
+    }
+
+    const size_t bl_vis_stride = static_cast<size_t>(nchan) * static_cast<size_t>(nt_in);
+    const size_t bl_uvw_stride = 3ULL * static_cast<size_t>(nt_in);
+    const long long nv_ll = static_cast<long long>(nv);
+    const double su = (flip_u != 0) ? -1.0 : 1.0;
+    const double sv = (flip_v != 0) ? -1.0 : 1.0;
+    const double sw = (flip_w != 0) ? -1.0 : 1.0;
+
+    float ku[8];
+    float kv[8];
+
+    for (int bl = blockIdx.y * blockDim.y + threadIdx.y; bl < nbl; bl += gridDim.y * blockDim.y) {
+        const size_t base_vis = static_cast<size_t>(bl) * bl_vis_stride;
+        const size_t base_uvw = static_cast<size_t>(bl) * bl_uvw_stride;
+
+        for (int s = 0; s < nsub_eff; ++s) {
+            const int c0 = sub_offsets[s];
+            const int c1 = sub_offsets[s + 1];
+
+            double sum_re = 0.0;
+            double sum_im = 0.0;
+            double sum_w = 0.0;
+
+            for (int c = c0; c < c1; ++c) {
+                const int d = intra_delays[c];
+                const int t_src = t + d;
+                if (t_src < 0 || t_src >= nt_in) {
+                    continue;
+                }
+                const size_t vis_idx =
+                    base_vis + static_cast<size_t>(c) * static_cast<size_t>(nt_in) + static_cast<size_t>(t_src);
+                const float w = wgt_3d[vis_idx];
+                if (w <= 0.0f || !isfinite(w)) {
+                    continue;
+                }
+                const float2 v = vis_3d[vis_idx];
+                if (!isfinite(v.x) || !isfinite(v.y)) {
+                    continue;
+                }
+                if (min_uv_distance_m > 0.0) {
+                    const double u_src = uvw_3d[base_uvw + static_cast<size_t>(t_src)];
+                    const double v_src = uvw_3d[base_uvw + static_cast<size_t>(nt_in) + static_cast<size_t>(t_src)];
+                    if (!passes_uv_distance(u_src, v_src, min_uv_distance_m)) {
+                        continue;
+                    }
+                }
+                const double wd = static_cast<double>(w);
+                sum_re += static_cast<double>(v.x) * wd;
+                sum_im += static_cast<double>(v.y) * wd;
+                sum_w += wd;
+            }
+
+            s_slot_vis[threadIdx.y][threadIdx.x] =
+                make_float2(static_cast<float>(sum_re), static_cast<float>(sum_im));
+            s_slot_wgt[threadIdx.y][threadIdx.x] = static_cast<float>(sum_w);
+
+            const float out_w = s_slot_wgt[threadIdx.y][threadIdx.x];
+            if (out_w <= 0.0f) {
+                continue;
+            }
+            const float2 slot_v = s_slot_vis[threadIdx.y][threadIdx.x];
+            float vr = slot_v.x;
+            float vi = slot_v.y;
+
+            int t_uvw = t;
+            if (exact_uvw != 0) {
+                const int ts = t + sub_delays[s];
+                t_uvw = (ts < 0) ? 0 : ((ts >= nt_in) ? (nt_in - 1) : ts);
+            }
+            const double u_m = uvw_3d[base_uvw + static_cast<size_t>(t_uvw)];
+            const double v_m = uvw_3d[base_uvw + static_cast<size_t>(nt_in) + static_cast<size_t>(t_uvw)];
+            const double freq_over_c = sub_freqs_hz[s] / kSpeedOfLightMps;
+
+            if (mode == 2) {
+                const double w_m = uvw_3d[base_uvw + 2ULL * static_cast<size_t>(nt_in) + static_cast<size_t>(t_uvw)];
+                double u_lam = (u_m * su) * freq_over_c;
+                double v_lam = (v_m * sv) * freq_over_c;
+                double w_lam = (w_m * sw) * freq_over_c;
+                if (!isfinite(u_lam) || !isfinite(v_lam) || !isfinite(w_lam)) {
+                    continue;
+                }
+                ducc_fixw_and_phase(u_lam, v_lam, w_lam, vr, vi, lshift, mshift, nshift, do_shift);
+                float ufrac = 0.0f;
+                float vfrac = 0.0f;
+                int iu0 = 0;
+                int iv0 = 0;
+                ducc_getpix(u_lam, v_lam, pixsize_x, pixsize_y, grid_nu, nv, supp, ufrac, vfrac, iu0, iv0);
+                ducc_eval_poly_uv(ufrac, vfrac, supp, deg, poly_coeffs, ku, kv);
+                splat_active_subband_wgridder_2d(
+                    s, t, nsub_eff, nt_out, grid_nu, nv, u_half, supp, iu0, iv0,
+                    vr, vi, out_w, ku, kv, uv_to_m, active_vis, active_wgt
+                );
+            } else if (mode == 0) {
+                const double u_f = (u_m * freq_over_c) / du;
+                const double v_f = (v_m * freq_over_c) / dv;
+                if (!isfinite(u_f) || !isfinite(v_f) || fabs(u_f) > 1.0e15 || fabs(v_f) > 1.0e15) {
+                    continue;
+                }
+                long long u_cell = __double2ll_rn(u_f);
+                long long v_cell = __double2ll_rn(v_f);
+                if (u_cell < 0) {
+                    u_cell = -u_cell;
+                    v_cell = -v_cell;
+                    vi = -vi;
+                }
+                if (u_cell < 0 || u_cell >= static_cast<long long>(u_half)) {
+                    continue;
+                }
+                const long long v_idx = ((v_cell % nv_ll) + nv_ll) % nv_ll;
+                accumulate_active_subband_cell(
+                    s, t, nsub_eff, nt_out, u_half, u_cell, v_idx, vr, vi, out_w,
+                    uv_to_m, active_vis, active_wgt
+                );
+            } else {
+                double uf = (u_m * freq_over_c) / du;
+                double vf = (v_m * freq_over_c) / dv;
+                if (!isfinite(uf) || !isfinite(vf) || fabs(uf) > 1.0e15 || fabs(vf) > 1.0e15) {
+                    continue;
+                }
+                if (uf < 0.0) {
+                    uf = -uf;
+                    vf = -vf;
+                    vi = -vi;
+                }
+                const long long u0 = static_cast<long long>(floor(uf));
+                const long long v0 = static_cast<long long>(floor(vf));
+                if (u0 < 0 || u0 >= static_cast<long long>(u_half)) {
+                    continue;
+                }
+                const float au = static_cast<float>(uf - static_cast<double>(u0));
+                const float av = static_cast<float>(vf - static_cast<double>(v0));
+                const float c00 = (1.0f - au) * (1.0f - av);
+                const float c10 = au * (1.0f - av);
+                const float c01 = (1.0f - au) * av;
+                const float c11 = au * av;
+                const long long v0_wrap = ((v0 % nv_ll) + nv_ll) % nv_ll;
+                const long long v1_wrap = (v0_wrap + 1 < nv_ll) ? (v0_wrap + 1) : 0;
+
+                if (out_w * c00 > 0.0f) {
+                    accumulate_active_subband_cell(
+                        s, t, nsub_eff, nt_out, u_half, u0, v0_wrap,
+                        vr * c00, vi * c00, out_w * c00, uv_to_m, active_vis, active_wgt
+                    );
+                }
+                if (out_w * c10 > 0.0f && (u0 + 1) < static_cast<long long>(u_half)) {
+                    accumulate_active_subband_cell(
+                        s, t, nsub_eff, nt_out, u_half, u0 + 1, v0_wrap,
+                        vr * c10, vi * c10, out_w * c10, uv_to_m, active_vis, active_wgt
+                    );
+                }
+                if (out_w * c01 > 0.0f) {
+                    accumulate_active_subband_cell(
+                        s, t, nsub_eff, nt_out, u_half, u0, v1_wrap,
+                        vr * c01, vi * c01, out_w * c01, uv_to_m, active_vis, active_wgt
+                    );
+                }
+                if (out_w * c11 > 0.0f && (u0 + 1) < static_cast<long long>(u_half)) {
+                    accumulate_active_subband_cell(
+                        s, t, nsub_eff, nt_out, u_half, u0 + 1, v1_wrap,
+                        vr * c11, vi * c11, out_w * c11, uv_to_m, active_vis, active_wgt
+                    );
+                }
+            }
+        }
+    }
+}
+
+
+/**
+ * Normalise compact active subband tensor ``active_vis[M_active, nsub_eff, nt_out]``
+ * in-place by per-snapshot natural weight scale ``snap_inv_w[t]`` (when
+ * ``use_snapshot_norm != 0``) or by per-cell weights ``active_wgt`` (when
+ * ``use_snapshot_norm == 0``).
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: snapshot t (coalesced), y: row ms in [0, M_active * nsub_eff)]
+ *   grid  = (ceil(nt_out / 32), min(65535, ceil((M_active * nsub_eff) / 8)), 1)
+ */
+extern "C" __global__ void normalise_active_subband_kernel(
+    float2* __restrict__ active_vis,
+    const float* __restrict__ active_wgt,
+    const float* __restrict__ snap_inv_w,
+    const int* __restrict__ raw_valid_chans,
+    const int* __restrict__ dedisp_valid_chans,
+    int m_active,
+    int nsub_eff,
+    int nt_out,
+    int nchan,
+    int min_valid_channels,
+    int use_snapshot_norm
+) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nt_out) {
+        return;
+    }
+
+    const bool snap_ok = is_snapshot_valid(
+        t, nchan, 0, min_valid_channels, raw_valid_chans, dedisp_valid_chans
+    );
+    const float inv_w_snap = (snap_ok && use_snapshot_norm != 0 && snap_inv_w != nullptr)
+        ? snap_inv_w[t]
+        : 0.0f;
+    const size_t total_rows = static_cast<size_t>(m_active) * static_cast<size_t>(nsub_eff);
+
+    for (size_t row = static_cast<size_t>(blockIdx.y) * static_cast<size_t>(blockDim.y) + static_cast<size_t>(threadIdx.y);
+         row < total_rows;
+         row += static_cast<size_t>(gridDim.y) * static_cast<size_t>(blockDim.y)) {
+        const size_t idx = row * static_cast<size_t>(nt_out) + static_cast<size_t>(t);
+        float2 val = make_float2(0.0f, 0.0f);
+        if (snap_ok) {
+            const float w = active_wgt[idx];
+            if (w > 0.0f && isfinite(w)) {
+                const float scale = (use_snapshot_norm != 0) ? inv_w_snap : (1.0f / w);
+                if (scale > 0.0f && isfinite(scale)) {
+                    const float2 raw = active_vis[idx];
+                    const float rx = raw.x * scale;
+                    const float ry = raw.y * scale;
+                    if (isfinite(rx) && isfinite(ry)) {
+                        val = make_float2(rx, ry);
+                    }
+                }
+            }
+        }
+        active_vis[idx] = val;
+    }
+}
+
+
+/**
+ * Tier 2 Active UV-Cell Matrix Dedispersion kernel:
+ * Coalesced vectorised shift-and-sum across ``n_sub`` subbands along the
+ * contiguous time axis ``t`` for ``n_dm`` fine DM trials and ``m_active``
+ * sparse active UV cells.
+ *
+ * Input layout:
+ *   active_dga  : (m_active, n_sub, nt_in)  complex64 (float2)
+ *   active_wgt  : optional (m_active, n_sub, nt_in) float32 (nullptr for linear sum)
+ *   inter_delays: (n_dm, n_sub) int32 (non-negative causal delays)
+ * Output layout:
+ *   out_dedisp  : (n_dm, m_active, nt_out) complex64 (float2)
+ *
+ * Launch geometry:
+ *   block = (32, 8, 1)  [x: snapshot t (100% coalesced across warp), y: active cell m]
+ *   grid  = (ceil(nt_out / 32), min(65535, ceil(m_active / 8)), min(65535, n_dm))
+ */
+extern "C" __global__ void dedisperse_active_cell_matrix_kernel(
+    const float2* __restrict__ active_dga,
+    const float* __restrict__ active_wgt,
+    const int* __restrict__ inter_delays,
+    float2* __restrict__ out_dedisp,
+    int n_dm,
+    int m_active,
+    int n_sub,
+    int nt_in,
+    int nt_out,
+    float uv_threshold
+) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nt_out) {
+        return;
+    }
+
+    const float thr_sq = (uv_threshold > 0.0f) ? (uv_threshold * uv_threshold) : 0.0f;
+    const size_t sub_stride = static_cast<size_t>(nt_in);
+    const size_t cell_stride = static_cast<size_t>(n_sub) * sub_stride;
+    const size_t dm_out_stride = static_cast<size_t>(m_active) * static_cast<size_t>(nt_out);
+
+    for (int idm = blockIdx.z; idm < n_dm; idm += gridDim.z) {
+        const int* __restrict__ dm_delays = inter_delays + static_cast<size_t>(idm) * static_cast<size_t>(n_sub);
+        const size_t out_dm_base = static_cast<size_t>(idm) * dm_out_stride;
+
+        for (int m = blockIdx.y * blockDim.y + threadIdx.y; m < m_active; m += gridDim.y * blockDim.y) {
+            const size_t cell_base = static_cast<size_t>(m) * cell_stride;
+            float acc_re = 0.0f;
+            float acc_im = 0.0f;
+            float acc_w = 0.0f;
+
+            for (int s = 0; s < n_sub; ++s) {
+                const int d = dm_delays[s];
+                const int t_src = t + d;
+                if (t_src >= 0 && t_src < nt_in) {
+                    const size_t src_idx = cell_base + static_cast<size_t>(s) * sub_stride + static_cast<size_t>(t_src);
+                    const float2 v = active_dga[src_idx];
+                    acc_re += v.x;
+                    acc_im += v.y;
+                    if (active_wgt != nullptr) {
+                        acc_w += active_wgt[src_idx];
+                    }
+                }
+            }
+
+            float2 out_v = make_float2(0.0f, 0.0f);
+            if (active_wgt != nullptr) {
+                if (acc_w > 0.0f && isfinite(acc_w)) {
+                    const float inv_w = 1.0f / acc_w;
+                    const float rx = acc_re * inv_w;
+                    const float ry = acc_im * inv_w;
+                    if (isfinite(rx) && isfinite(ry) && (thr_sq <= 0.0f || (rx * rx + ry * ry) > thr_sq)) {
+                        out_v = make_float2(rx, ry);
+                    }
+                }
+            } else {
+                if (isfinite(acc_re) && isfinite(acc_im) && (thr_sq <= 0.0f || (acc_re * acc_re + acc_im * acc_im) > thr_sq)) {
+                    out_v = make_float2(acc_re, acc_im);
+                }
+            }
+
+            const size_t out_idx = out_dm_base + static_cast<size_t>(m) * static_cast<size_t>(nt_out) + static_cast<size_t>(t);
+            out_dedisp[out_idx] = out_v;
+        }
+    }
 }

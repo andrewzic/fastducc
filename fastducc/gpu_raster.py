@@ -4129,6 +4129,1541 @@ def dedisperse_rasterise_to_ragged(
     )
 
 
+# =============================================================================
+# Two-Tier Subbanded Dedispersion (Dense-in-Time, Sparse-in-(u, v))
+# =============================================================================
+
+if HAS_NUMBA:
+
+    @nb.njit(inline="always")
+    def _accum_active_subband_cell_numba(
+        s: int,
+        t: int,
+        nsub_eff: int,
+        nt_out: int,
+        u_half: int,
+        u_cell: int,
+        v_idx: int,
+        re: np.float32,
+        im: np.float32,
+        w: np.float32,
+        uv_to_m: np.ndarray,
+        out_re: np.ndarray,
+        out_im: np.ndarray,
+        out_w: np.ndarray,
+    ) -> None:
+        if w <= 0.0 or u_cell < 0 or u_cell >= u_half:
+            return
+        m_idx = int(uv_to_m[v_idx, u_cell])
+        if m_idx < 0:
+            return
+        dst_idx = (m_idx * nsub_eff + s) * nt_out + t
+        out_re[dst_idx] = np.float32(out_re[dst_idx] + re)
+        out_im[dst_idx] = np.float32(out_im[dst_idx] + im)
+        out_w[dst_idx] = np.float32(out_w[dst_idx] + w)
+
+    @nb.njit(parallel=True, fastmath=False)
+    def _rasterise_subband_active_numba_kernel(
+        vis_3d: np.ndarray,
+        wgt_3d: np.ndarray,
+        uvw_3d: np.ndarray,
+        intra_delays: np.ndarray,
+        sub_offsets: np.ndarray,
+        sub_freqs_hz: np.ndarray,
+        sub_delays: np.ndarray,
+        uv_to_m: np.ndarray,
+        m_active: int,
+        nt_out: int,
+        grid_nu: int,
+        nv: int,
+        u_half: int,
+        du: float,
+        dv: float,
+        pixsize_x: float,
+        pixsize_y: float,
+        min_uv_distance_m: float,
+        min_valid_channels: int,
+        exact_uvw: bool,
+        mode_id: int,
+        supp: int,
+        deg: int,
+        poly_coeffs: np.ndarray,
+        lshift: float,
+        mshift: float,
+        nshift: float,
+        do_shift: bool,
+        flip_u: bool,
+        flip_v: bool,
+        flip_w: bool,
+        use_snapshot_norm: bool,
+        norm_div_mode: int,
+        apply_normalisation: bool,
+        out_re: np.ndarray,
+        out_im: np.ndarray,
+        out_w: np.ndarray,
+    ) -> None:
+        nbl, nchan, nt_in = vis_3d.shape
+        nsub_eff = len(sub_freqs_hz)
+        req_chans = min(min_valid_channels, nchan) if min_valid_channels > 0 else 1
+        su = -1.0 if flip_u else 1.0
+        sv = -1.0 if flip_v else 1.0
+        sw = -1.0 if flip_w else 1.0
+
+        for t_u in nb.prange(nt_out):
+            t = np.int64(t_u)
+            ku_buf = np.empty(8, dtype=np.float32)
+            kv_buf = np.empty(8, dtype=np.float32)
+
+            dedisp_cnt = 0
+            for c in range(nchan):
+                d = int(intra_delays[c])
+                t_src = t + d
+                if t_src < 0 or t_src >= nt_in:
+                    continue
+                for bl in range(nbl):
+                    w = wgt_3d[bl, c, t_src]
+                    if w > 0.0 and math.isfinite(w):
+                        vr = vis_3d[bl, c, t_src].real
+                        vi = vis_3d[bl, c, t_src].imag
+                        if math.isfinite(vr) and math.isfinite(vi):
+                            if min_uv_distance_m <= 0.0:
+                                dedisp_cnt += 1
+                                break
+                            um = uvw_3d[bl, 0, t_src]
+                            vm = uvw_3d[bl, 1, t_src]
+                            if math.isfinite(um) and math.isfinite(vm) and math.hypot(um, vm) >= min_uv_distance_m:
+                                dedisp_cnt += 1
+                                break
+
+            if nchan <= 0 or dedisp_cnt < req_chans:
+                continue
+
+            snap_wmax = np.float32(0.0)
+            snap_nvalid = 0
+
+            for bl in range(nbl):
+                for s in range(nsub_eff):
+                    c0 = int(sub_offsets[s])
+                    c1 = int(sub_offsets[s + 1])
+                    sum_re = 0.0
+                    sum_im = 0.0
+                    sum_w = 0.0
+
+                    for c in range(c0, c1):
+                        d = int(intra_delays[c])
+                        t_src = t + d
+                        if t_src < 0 or t_src >= nt_in:
+                            continue
+                        w = wgt_3d[bl, c, t_src]
+                        if w <= 0.0 or not math.isfinite(w):
+                            continue
+                        vr = vis_3d[bl, c, t_src].real
+                        vi = vis_3d[bl, c, t_src].imag
+                        if not (math.isfinite(vr) and math.isfinite(vi)):
+                            continue
+                        if min_uv_distance_m > 0.0:
+                            u_s = uvw_3d[bl, 0, t_src]
+                            v_s = uvw_3d[bl, 1, t_src]
+                            if not (math.isfinite(u_s) and math.isfinite(v_s) and math.hypot(u_s, v_s) >= min_uv_distance_m):
+                                continue
+                        wd = float(w)
+                        sum_re += float(vr) * wd
+                        sum_im += float(vi) * wd
+                        sum_w += wd
+
+                    if sum_w <= 0.0:
+                        continue
+
+                    wf = np.float32(sum_w)
+                    snap_nvalid += 1
+                    if wf > snap_wmax:
+                        snap_wmax = wf
+
+                    t_uvw = t
+                    if exact_uvw:
+                        ts = t + int(sub_delays[s])
+                        if ts < 0:
+                            t_uvw = 0
+                        elif ts >= nt_in:
+                            t_uvw = nt_in - 1
+                        else:
+                            t_uvw = ts
+
+                    u_m = uvw_3d[bl, 0, t_uvw]
+                    v_m = uvw_3d[bl, 1, t_uvw]
+                    freq_over_c = sub_freqs_hz[s] / C_LIGHT
+                    vr_f = np.float32(sum_re)
+                    vi_f = np.float32(sum_im)
+
+                    if mode_id == 2:
+                        w_m = uvw_3d[bl, 2, t_uvw]
+                        u_lam = (u_m * su) * freq_over_c
+                        v_lam = (v_m * sv) * freq_over_c
+                        w_lam = (w_m * sw) * freq_over_c
+                        if not (math.isfinite(u_lam) and math.isfinite(v_lam) and math.isfinite(w_lam)):
+                            continue
+                        imflip = np.float32(1.0)
+                        if w_lam < 0.0:
+                            u_lam = -u_lam
+                            v_lam = -v_lam
+                            w_lam = -w_lam
+                            imflip = np.float32(-1.0)
+                        if do_shift:
+                            tmp = float(imflip) * (u_lam * lshift + v_lam * mshift + w_lam * nshift)
+                            ang = np.float32(2.0 * math.pi) * np.float32(tmp - math.floor(tmp))
+                            cs = np.float32(math.cos(float(ang)))
+                            sn = np.float32(math.sin(float(ang)))
+                            nvr = np.float32(vr_f * cs - vi_f * sn)
+                            nvi = np.float32(vr_f * sn + vi_f * cs)
+                            vr_f = nvr
+                            vi_f = nvi
+                        vi_f = np.float32(vi_f * imflip)
+
+                        ushift = float(supp) * (-0.5) + 1.0 + float(grid_nu)
+                        vshift = float(supp) * (-0.5) + 1.0 + float(nv)
+                        maxiu0 = (grid_nu + supp) - ((supp + 1) // 2)
+                        maxiv0 = (nv + supp) - ((supp + 1) // 2)
+
+                        u_p = u_lam * pixsize_x
+                        u_p = (u_p - math.floor(u_p)) * float(grid_nu)
+                        iu0 = int(u_p + ushift) - grid_nu
+                        if iu0 > maxiu0:
+                            iu0 = maxiu0
+                        ufrac = np.float32(u_p - float(iu0))
+
+                        v_p = v_lam * pixsize_y
+                        v_p = (v_p - math.floor(v_p)) * float(nv)
+                        iv0 = int(v_p + vshift) - nv
+                        if iv0 > maxiv0:
+                            iv0 = maxiv0
+                        vfrac = np.float32(v_p - float(iv0))
+
+                        x0 = np.float32(-2.0) * ufrac + np.float32(supp - 1)
+                        y0 = np.float32(-2.0) * vfrac + np.float32(supp - 1)
+                        x2 = np.float32(x0 * x0)
+                        y2 = np.float32(y0 * y0)
+                        lim = (supp + 1) >> 1
+                        for i_p in range(lim):
+                            tx = poly_coeffs[i_p, 0]
+                            tx2 = poly_coeffs[i_p, 1]
+                            ty = poly_coeffs[i_p, 0]
+                            ty2 = poly_coeffs[i_p, 1]
+                            for j_p in range(2, deg, 2):
+                                c_even = poly_coeffs[i_p, j_p]
+                                c_odd = poly_coeffs[i_p, j_p + 1]
+                                tx = np.float32(tx * x2 + c_even)
+                                ty = np.float32(ty * y2 + c_even)
+                                tx2 = np.float32(tx2 * x2 + c_odd)
+                                ty2 = np.float32(ty2 * y2 + c_odd)
+                            px = np.float32(tx * x0)
+                            py = np.float32(ty * y0)
+                            ku_buf[i_p] = np.float32(tx2 + px)
+                            kv_buf[i_p] = np.float32(ty2 + py)
+                            ku_buf[supp - 1 - i_p] = np.float32(tx2 - px)
+                            kv_buf[supp - 1 - i_p] = np.float32(ty2 - py)
+                        for cu in range(supp):
+                            iu = iu0 + cu
+                            if iu < 0:
+                                iu += grid_nu
+                            elif iu >= grid_nu:
+                                iu -= grid_nu
+                            xu = 0 if iu == 0 else (grid_nu - iu)
+                            do_pos = iu < u_half
+                            do_neg = xu < u_half
+                            if not (do_pos or do_neg):
+                                continue
+                            ku_val = np.float32(0.5) * ku_buf[cu]
+                            vr_u = np.float32(vr_f * ku_val)
+                            vi_u = np.float32(vi_f * ku_val)
+                            w_u = np.float32(wf * ku_val)
+                            for cv in range(supp):
+                                iv = iv0 + cv
+                                if iv < 0:
+                                    iv += nv
+                                elif iv >= nv:
+                                    iv -= nv
+                                kv_val = kv_buf[cv]
+                                kw = np.float32(w_u * kv_val)
+                                if kw <= 0.0:
+                                    continue
+                                re_tap = np.float32(vr_u * kv_val)
+                                im_tap = np.float32(vi_u * kv_val)
+                                if do_pos:
+                                    _accum_active_subband_cell_numba(
+                                        s, t, nsub_eff, nt_out, u_half, iu, iv,
+                                        re_tap, im_tap, kw, uv_to_m, out_re, out_im, out_w,
+                                    )
+                                if do_neg:
+                                    xv = 0 if iv == 0 else (nv - iv)
+                                    _accum_active_subband_cell_numba(
+                                        s, t, nsub_eff, nt_out, u_half, xu, xv,
+                                        re_tap, np.float32(-im_tap), kw, uv_to_m, out_re, out_im, out_w,
+                                    )
+                    elif mode_id == 0:
+                        u_f = (u_m * freq_over_c) / du
+                        v_f = (v_m * freq_over_c) / dv
+                        if not (math.isfinite(u_f) and math.isfinite(v_f)) or abs(u_f) > 1.0e15 or abs(v_f) > 1.0e15:
+                            continue
+                        u_cell = int(round(u_f))
+                        v_cell = int(round(v_f))
+                        if u_cell < 0:
+                            u_cell = -u_cell
+                            v_cell = -v_cell
+                            vi_f = np.float32(-vi_f)
+                        if u_cell < 0 or u_cell >= u_half:
+                            continue
+                        v_idx = v_cell % nv
+                        if v_idx < 0:
+                            v_idx += nv
+                        _accum_active_subband_cell_numba(
+                            s, t, nsub_eff, nt_out, u_half, u_cell, v_idx,
+                            vr_f, vi_f, wf, uv_to_m, out_re, out_im, out_w,
+                        )
+                    else:
+                        uf = (u_m * freq_over_c) / du
+                        vf = (v_m * freq_over_c) / dv
+                        if not (math.isfinite(uf) and math.isfinite(vf)) or abs(uf) > 1.0e15 or abs(vf) > 1.0e15:
+                            continue
+                        if uf < 0.0:
+                            uf = -uf
+                            vf = -vf
+                            vi_f = np.float32(-vi_f)
+                        u0 = int(math.floor(uf))
+                        v0 = int(math.floor(vf))
+                        if u0 < 0 or u0 >= u_half:
+                            continue
+                        au = np.float32(uf - float(u0))
+                        av = np.float32(vf - float(v0))
+                        c00 = np.float32((np.float32(1.0) - au) * (np.float32(1.0) - av))
+                        c10 = np.float32(au * (np.float32(1.0) - av))
+                        c01 = np.float32((np.float32(1.0) - au) * av)
+                        c11 = np.float32(au * av)
+                        v0_wrap = v0 % nv
+                        if v0_wrap < 0:
+                            v0_wrap += nv
+                        v1_wrap = v0_wrap + 1 if (v0_wrap + 1 < nv) else 0
+                        if wf * c00 > 0.0:
+                            _accum_active_subband_cell_numba(
+                                s, t, nsub_eff, nt_out, u_half, u0, v0_wrap,
+                                np.float32(vr_f * c00), np.float32(vi_f * c00), np.float32(wf * c00),
+                                uv_to_m, out_re, out_im, out_w,
+                            )
+                        if wf * c10 > 0.0 and (u0 + 1) < u_half:
+                            _accum_active_subband_cell_numba(
+                                s, t, nsub_eff, nt_out, u_half, u0 + 1, v0_wrap,
+                                np.float32(vr_f * c10), np.float32(vi_f * c10), np.float32(wf * c10),
+                                uv_to_m, out_re, out_im, out_w,
+                            )
+                        if wf * c01 > 0.0:
+                            _accum_active_subband_cell_numba(
+                                s, t, nsub_eff, nt_out, u_half, u0, v1_wrap,
+                                np.float32(vr_f * c01), np.float32(vi_f * c01), np.float32(wf * c01),
+                                uv_to_m, out_re, out_im, out_w,
+                            )
+                        if wf * c11 > 0.0 and (u0 + 1) < u_half:
+                            _accum_active_subband_cell_numba(
+                                s, t, nsub_eff, nt_out, u_half, u0 + 1, v1_wrap,
+                                np.float32(vr_f * c11), np.float32(vi_f * c11), np.float32(wf * c11),
+                                uv_to_m, out_re, out_im, out_w,
+                            )
+
+            if apply_normalisation:
+                snap_inv = np.float32(0.0)
+                if use_snapshot_norm and snap_wmax > 0.0 and snap_nvalid > 0:
+                    denom = float(snap_wmax)
+                    if norm_div_mode == 1:
+                        denom *= float(snap_nvalid)
+                    elif norm_div_mode == 2:
+                        nbl_eff = max(1.0, float(snap_nvalid) / float(max(1, nsub_eff)))
+                        denom *= nbl_eff * (float(max(1, nsub_eff)) / float(max(1, nchan)))
+                    snap_inv = np.float32(1.0 / denom)
+
+                total_rows = m_active * nsub_eff
+                for row in range(total_rows):
+                    idx = row * nt_out + t
+                    w_val = out_w[idx]
+                    if w_val > 0.0 and math.isfinite(w_val):
+                        scale = snap_inv if use_snapshot_norm else np.float32(1.0 / w_val)
+                        if scale > 0.0 and math.isfinite(scale):
+                            rx = np.float32(out_re[idx] * scale)
+                            ry = np.float32(out_im[idx] * scale)
+                            if math.isfinite(rx) and math.isfinite(ry):
+                                out_re[idx] = rx
+                                out_im[idx] = ry
+                                continue
+                    out_re[idx] = np.float32(0.0)
+                    out_im[idx] = np.float32(0.0)
+
+    @nb.njit(parallel=True, fastmath=False)
+    def _dedisperse_active_cell_matrix_numba(
+        active_dga: np.ndarray,
+        active_wgt: np.ndarray,
+        has_wgt: bool,
+        inter_delays: np.ndarray,
+        nt_out: int,
+        uv_threshold: float,
+        out_dedisp: np.ndarray,
+    ) -> None:
+        n_dm, n_sub = inter_delays.shape
+        m_active, _, nt_in = active_dga.shape
+        thr_sq = np.float32(uv_threshold * uv_threshold) if uv_threshold > 0.0 else np.float32(0.0)
+
+        for idm in nb.prange(n_dm):
+            for m in range(m_active):
+                for t in range(nt_out):
+                    acc_re = np.float32(0.0)
+                    acc_im = np.float32(0.0)
+                    acc_w = np.float32(0.0)
+                    for s in range(n_sub):
+                        d = int(inter_delays[idm, s])
+                        t_src = t + d
+                        if 0 <= t_src < nt_in:
+                            v = active_dga[m, s, t_src]
+                            acc_re = np.float32(acc_re + v.real)
+                            acc_im = np.float32(acc_im + v.imag)
+                            if has_wgt:
+                                acc_w = np.float32(acc_w + active_wgt[m, s, t_src])
+                    if has_wgt:
+                        if acc_w > 0.0 and math.isfinite(acc_w):
+                            inv_w = np.float32(1.0 / acc_w)
+                            rx = np.float32(acc_re * inv_w)
+                            ry = np.float32(acc_im * inv_w)
+                            if math.isfinite(rx) and math.isfinite(ry) and (
+                                thr_sq <= 0.0 or (rx * rx + ry * ry) > thr_sq
+                            ):
+                                out_dedisp[idm, m, t] = np.complex64(complex(rx, ry))
+                            else:
+                                out_dedisp[idm, m, t] = np.complex64(0.0 + 0.0j)
+                        else:
+                            out_dedisp[idm, m, t] = np.complex64(0.0 + 0.0j)
+                    else:
+                        if math.isfinite(acc_re) and math.isfinite(acc_im) and (
+                            thr_sq <= 0.0 or (acc_re * acc_re + acc_im * acc_im) > thr_sq
+                        ):
+                            out_dedisp[idm, m, t] = np.complex64(complex(acc_re, acc_im))
+                        else:
+                            out_dedisp[idm, m, t] = np.complex64(0.0 + 0.0j)
+
+
+def _dedisperse_and_rasterise_subband_numpy(
+    vis_3d: np.ndarray,
+    wgt_3d: np.ndarray,
+    uvw_3d: np.ndarray,
+    intra_delays: np.ndarray,
+    sub_offsets: np.ndarray,
+    sub_freqs_hz: np.ndarray,
+    sub_delays: np.ndarray,
+    uv_to_m: np.ndarray,
+    m_active: int,
+    nt_out: int,
+    grid_nu: int,
+    nv: int,
+    u_half: int,
+    du: float,
+    dv: float,
+    pixsize_x: float,
+    pixsize_y: float,
+    min_uv_distance_m: float,
+    min_valid_channels: int,
+    exact_uvw: bool,
+    mode_id: int,
+    supp: int,
+    deg: int,
+    poly_coeffs: np.ndarray,
+    lshift: float,
+    mshift: float,
+    nshift: float,
+    do_shift: bool,
+    flip_u: bool,
+    flip_v: bool,
+    flip_w: bool,
+    use_snapshot_norm: bool,
+    norm_div_mode: int,
+    apply_normalisation: bool,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pure NumPy fallback for Tier 1 active-cell subband rasterisation."""
+    nbl, nchan, nt_in = vis_3d.shape
+    nsub_eff = len(sub_freqs_hz)
+    req_chans = min(min_valid_channels, nchan) if min_valid_channels > 0 else 1
+    out_vis = np.zeros((m_active, nsub_eff, nt_out), dtype=np.complex64)
+    out_wgt = np.zeros((m_active, nsub_eff, nt_out), dtype=np.float32)
+
+    valid_mask = (
+        (wgt_3d > 0.0)
+        & np.isfinite(wgt_3d)
+        & np.isfinite(vis_3d.real)
+        & np.isfinite(vis_3d.imag)
+    )
+    if min_uv_distance_m > 0.0:
+        uv_dist = np.hypot(uvw_3d[:, 0, :], uvw_3d[:, 1, :])
+        valid_mask &= (
+            np.isfinite(uvw_3d[:, 0, :])
+            & np.isfinite(uvw_3d[:, 1, :])
+            & (uv_dist >= min_uv_distance_m)
+        )[:, None, :]
+
+    su = -1.0 if flip_u else 1.0
+    sv = -1.0 if flip_v else 1.0
+    sw = -1.0 if flip_w else 1.0
+    lim = (supp + 1) // 2
+
+    def _eval_poly_np(ufrac: float, vfrac: float) -> Tuple[np.ndarray, np.ndarray]:
+        x0 = np.float32(-2.0 * ufrac + float(supp - 1))
+        y0 = np.float32(-2.0 * vfrac + float(supp - 1))
+        x2 = np.float32(x0 * x0)
+        y2 = np.float32(y0 * y0)
+        ku = np.empty(supp, dtype=np.float32)
+        kv = np.empty(supp, dtype=np.float32)
+        for i in range(lim):
+            tx = poly_coeffs[i, 0]
+            tx2 = poly_coeffs[i, 1]
+            ty = poly_coeffs[i, 0]
+            ty2 = poly_coeffs[i, 1]
+            for j in range(2, deg, 2):
+                ce = poly_coeffs[i, j]
+                co = poly_coeffs[i, j + 1]
+                tx = np.float32(tx * x2 + ce)
+                ty = np.float32(ty * y2 + ce)
+                tx2 = np.float32(tx2 * x2 + co)
+                ty2 = np.float32(ty2 * y2 + co)
+            px = np.float32(tx * x0)
+            py = np.float32(ty * y0)
+            ku[i] = np.float32(tx2 + px)
+            kv[i] = np.float32(ty2 + py)
+            ku[supp - 1 - i] = np.float32(tx2 - px)
+            kv[supp - 1 - i] = np.float32(ty2 - py)
+        return ku, kv
+
+    for t in range(nt_out):
+        dedisp_cnt = 0
+        for c in range(nchan):
+            t_src = t + int(intra_delays[c])
+            if 0 <= t_src < nt_in and np.any(valid_mask[:, c, t_src]):
+                dedisp_cnt += 1
+        if nchan <= 0 or dedisp_cnt < req_chans:
+            continue
+
+        snap_wmax = 0.0
+        snap_nvalid = 0
+
+        for s in range(nsub_eff):
+            c0 = int(sub_offsets[s])
+            c1 = int(sub_offsets[s + 1])
+            sum_re = np.zeros(nbl, dtype=np.float64)
+            sum_im = np.zeros(nbl, dtype=np.float64)
+            sum_w = np.zeros(nbl, dtype=np.float64)
+            for c in range(c0, c1):
+                t_src = t + int(intra_delays[c])
+                if 0 <= t_src < nt_in:
+                    m_ok = valid_mask[:, c, t_src]
+                    if np.any(m_ok):
+                        wd = wgt_3d[m_ok, c, t_src].astype(np.float64)
+                        vc = vis_3d[m_ok, c, t_src]
+                        sum_re[m_ok] += vc.real.astype(np.float64) * wd
+                        sum_im[m_ok] += vc.imag.astype(np.float64) * wd
+                        sum_w[m_ok] += wd
+
+            t_uvw = min(max(0, t + int(sub_delays[s])), nt_in - 1) if exact_uvw else t
+            freq_over_c = float(sub_freqs_hz[s]) / C_LIGHT
+
+            for bl in range(nbl):
+                if sum_w[bl] <= 0.0:
+                    continue
+                wf = np.float32(sum_w[bl])
+                snap_nvalid += 1
+                if float(wf) > snap_wmax:
+                    snap_wmax = float(wf)
+                vr_f = np.float32(sum_re[bl])
+                vi_f = np.float32(sum_im[bl])
+                u_m = float(uvw_3d[bl, 0, t_uvw])
+                v_m = float(uvw_3d[bl, 1, t_uvw])
+
+                if mode_id == 2:
+                    w_m = float(uvw_3d[bl, 2, t_uvw])
+                    u_lam = (u_m * su) * freq_over_c
+                    v_lam = (v_m * sv) * freq_over_c
+                    w_lam = (w_m * sw) * freq_over_c
+                    if not (math.isfinite(u_lam) and math.isfinite(v_lam) and math.isfinite(w_lam)):
+                        continue
+                    imflip = np.float32(1.0)
+                    if w_lam < 0.0:
+                        u_lam, v_lam, w_lam = -u_lam, -v_lam, -w_lam
+                        imflip = np.float32(-1.0)
+                    if do_shift:
+                        tmp = float(imflip) * (u_lam * lshift + v_lam * mshift + w_lam * nshift)
+                        ang = float(np.float32(2.0 * math.pi) * np.float32(tmp - math.floor(tmp)))
+                        cs = np.float32(math.cos(ang))
+                        sn = np.float32(math.sin(ang))
+                        vr_f, vi_f = np.float32(vr_f * cs - vi_f * sn), np.float32(vr_f * sn + vi_f * cs)
+                    vi_f = np.float32(vi_f * imflip)
+
+                    ushift = float(supp) * (-0.5) + 1.0 + float(grid_nu)
+                    vshift = float(supp) * (-0.5) + 1.0 + float(nv)
+                    maxiu0 = (grid_nu + supp) - ((supp + 1) // 2)
+                    maxiv0 = (nv + supp) - ((supp + 1) // 2)
+                    u_tmp = u_lam * pixsize_x
+                    u_tmp = (u_tmp - math.floor(u_tmp)) * float(grid_nu)
+                    iu0 = min(int(u_tmp + ushift) - grid_nu, maxiu0)
+                    ufrac = float(np.float32(u_tmp - float(iu0)))
+                    v_tmp = v_lam * pixsize_y
+                    v_tmp = (v_tmp - math.floor(v_tmp)) * float(nv)
+                    iv0 = min(int(v_tmp + vshift) - nv, maxiv0)
+                    vfrac = float(np.float32(v_tmp - float(iv0)))
+                    ku, kv = _eval_poly_np(ufrac, vfrac)
+
+                    for cu in range(supp):
+                        iu = (iu0 + cu) % grid_nu
+                        xu = 0 if iu == 0 else (grid_nu - iu)
+                        do_pos = iu < u_half
+                        do_neg = xu < u_half
+                        if not (do_pos or do_neg):
+                            continue
+                        ku_val = np.float32(0.5) * ku[cu]
+                        vr_u = np.float32(vr_f * ku_val)
+                        vi_u = np.float32(vi_f * ku_val)
+                        w_u = np.float32(wf * ku_val)
+                        for cv in range(supp):
+                            iv = (iv0 + cv) % nv
+                            kv_val = kv[cv]
+                            kw = np.float32(w_u * kv_val)
+                            if kw <= 0.0:
+                                continue
+                            re_tap = np.float32(vr_u * kv_val)
+                            im_tap = np.float32(vi_u * kv_val)
+                            if do_pos:
+                                m_idx = int(uv_to_m[iv, iu])
+                                if m_idx >= 0:
+                                    out_vis[m_idx, s, t] += np.complex64(complex(re_tap, im_tap))
+                                    out_wgt[m_idx, s, t] += kw
+                            if do_neg:
+                                xv = 0 if iv == 0 else (nv - iv)
+                                m_idx = int(uv_to_m[xv, xu])
+                                if m_idx >= 0:
+                                    out_vis[m_idx, s, t] += np.complex64(complex(re_tap, -im_tap))
+                                    out_wgt[m_idx, s, t] += kw
+                elif mode_id == 0:
+                    u_f = (u_m * freq_over_c) / du
+                    v_f = (v_m * freq_over_c) / dv
+                    if not (math.isfinite(u_f) and math.isfinite(v_f)) or abs(u_f) > 1.0e15 or abs(v_f) > 1.0e15:
+                        continue
+                    u_cell = int(round(u_f))
+                    v_cell = int(round(v_f))
+                    if u_cell < 0:
+                        u_cell, v_cell, vi_f = -u_cell, -v_cell, np.float32(-vi_f)
+                    if 0 <= u_cell < u_half:
+                        v_idx = v_cell % nv
+                        m_idx = int(uv_to_m[v_idx, u_cell])
+                        if m_idx >= 0:
+                            out_vis[m_idx, s, t] += np.complex64(complex(vr_f, vi_f))
+                            out_wgt[m_idx, s, t] += wf
+                else:
+                    uf = (u_m * freq_over_c) / du
+                    vf = (v_m * freq_over_c) / dv
+                    if not (math.isfinite(uf) and math.isfinite(vf)) or abs(uf) > 1.0e15 or abs(vf) > 1.0e15:
+                        continue
+                    if uf < 0.0:
+                        uf, vf, vi_f = -uf, -vf, np.float32(-vi_f)
+                    u0 = int(math.floor(uf))
+                    v0 = int(math.floor(vf))
+                    if 0 <= u0 < u_half:
+                        au = np.float32(uf - float(u0))
+                        av = np.float32(vf - float(v0))
+                        v0_w = v0 % nv
+                        v1_w = (v0_w + 1) % nv
+                        corners = (
+                            (u0, v0_w, np.float32((1.0 - au) * (1.0 - av))),
+                            (u0 + 1, v0_w, np.float32(au * (1.0 - av))),
+                            (u0, v1_w, np.float32((1.0 - au) * av)),
+                            (u0 + 1, v1_w, np.float32(au * av)),
+                        )
+                        for uc, vc, wt in corners:
+                            if uc < u_half and float(wf * wt) > 0.0:
+                                m_idx = int(uv_to_m[vc, uc])
+                                if m_idx >= 0:
+                                    out_vis[m_idx, s, t] += np.complex64(complex(vr_f * wt, vi_f * wt))
+                                    out_wgt[m_idx, s, t] += np.float32(wf * wt)
+
+        if apply_normalisation:
+            if use_snapshot_norm:
+                if snap_wmax > 0.0 and snap_nvalid > 0:
+                    denom = float(snap_wmax)
+                    if norm_div_mode == 1:
+                        denom *= float(snap_nvalid)
+                    elif norm_div_mode == 2:
+                        nbl_eff = max(1.0, float(snap_nvalid) / float(max(1, nsub_eff)))
+                        denom *= nbl_eff * (float(max(1, nsub_eff)) / float(max(1, nchan)))
+                    inv_w = np.float32(1.0 / denom)
+                    valid_c = out_wgt[:, :, t] > 0.0
+                    out_vis[:, :, t] = np.where(valid_c, out_vis[:, :, t] * inv_w, np.complex64(0.0 + 0.0j))
+                else:
+                    out_vis[:, :, t] = np.complex64(0.0 + 0.0j)
+            else:
+                w_slice = out_wgt[:, :, t]
+                valid_c = (w_slice > 0.0) & np.isfinite(w_slice)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    out_vis[:, :, t] = np.where(
+                        valid_c,
+                        out_vis[:, :, t] / np.where(valid_c, w_slice, np.float32(1.0)),
+                        np.complex64(0.0 + 0.0j),
+                    )
+
+    return out_vis, out_wgt
+
+
+def _resolve_subband_tier1_params(
+    freqs_hz: Any,
+    intra_delays: Optional[Any],
+    n_subbands: int,
+    dm_coarse: float,
+    dt: Optional[float],
+    align_to: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Resolve subband slices, subband mean frequencies, and causal intra-subband delays."""
+    from fastducc.dedisp import DedispersionPlan
+
+    freqs_host = np.ascontiguousarray(_to_host_f64(freqs_hz), dtype=np.float64)
+    if freqs_host.ndim != 1:
+        raise ValueError(f"freqs_hz must be 1D; got shape {freqs_host.shape}.")
+    nchan = int(freqs_host.shape[0])
+    sub_offsets, nsub_eff = compute_subband_slices(
+        nchan=nchan, collapse_channels=True, nsubbands=max(1, int(n_subbands))
+    )
+
+    if intra_delays is None:
+        if float(dm_coarse) != 0.0:
+            if dt is None or float(dt) <= 0.0:
+                raise ValueError("dt > 0 must be provided when dm_coarse != 0.0 and intra_delays is None.")
+            plan = DedispersionPlan(
+                freqs_hz=freqs_host,
+                tsamp_s=float(dt),
+                dm_min=float(dm_coarse),
+                dm_max=float(dm_coarse),
+                dedisp_mode="subbanded",
+                n_subbands=nsub_eff,
+            )
+            delays_host = plan.get_intra_delays(float(dm_coarse), align_to=align_to).astype(np.int32)
+        else:
+            delays_host = np.zeros(nchan, dtype=np.int32)
+    else:
+        delays_host = np.ascontiguousarray(_to_host_i32(intra_delays), dtype=np.int32)
+        if delays_host.ndim != 1 or int(delays_host.shape[0]) != nchan:
+            raise ValueError(
+                f"intra_delays length ({delays_host.shape}) must match freqs_hz length ({nchan})."
+            )
+
+    sub_freqs_host = np.empty(nsub_eff, dtype=np.float64)
+    sub_delays_host = np.empty(nsub_eff, dtype=np.int32)
+    for s in range(nsub_eff):
+        c0 = int(sub_offsets[s])
+        c1 = int(sub_offsets[s + 1])
+        sub_freqs_host[s] = float(np.mean(freqs_host[c0:c1]))
+        sub_delays_host[s] = (
+            delays_host[c0] if (c1 - c0 == 1) else np.int32(np.rint(np.mean(delays_host[c0:c1])))
+        )
+    return freqs_host, delays_host, sub_offsets, sub_freqs_host, sub_delays_host, nsub_eff
+
+
+def dedisperse_and_rasterise_subband_cpu(
+    vis_3d: np.ndarray,
+    wgt_3d: np.ndarray,
+    uvw_3d: np.ndarray,
+    freqs_hz: np.ndarray,
+    intra_delays: Optional[np.ndarray] = None,
+    *,
+    n_subbands: int = 16,
+    nt_out: Optional[int] = None,
+    dm_coarse: float = 0.0,
+    dt: Optional[float] = None,
+    align_to: str = "fmax",
+    exact_uvw: bool = True,
+    npix_x: int = 384,
+    npix_y: int = 384,
+    pixsize_arcsec: Optional[float] = None,
+    pix_rad: Optional[float] = None,
+    grid_nu: Optional[int] = None,
+    nv: Optional[int] = None,
+    mode: str = "wgridder",
+    epsilon: float = 1e-5,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    allow_nshift: bool = True,
+    apply_w_phase: bool = True,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    flip_w: bool = False,
+    divide_by_n: bool = True,
+    normalise_mode: Optional[str] = None,
+    oversample: Optional[bool] = None,
+    supp: Optional[int] = None,
+    min_valid_channels: int = 24,
+    min_uv_distance_m: Optional[float] = None,
+    uv_to_m: Optional[np.ndarray] = None,
+    flat_indices: Optional[np.ndarray] = None,
+    m_active: Optional[int] = None,
+    return_weights: bool = False,
+    use_numba: bool = True,
+) -> Any:
+    """
+    CPU fallback (Numba parallel + pure NumPy) for Tier 1 two-tier subbanded
+    dedispersion and active UV-cell rasterisation into
+    ``active_dga[M_active, n_subbands, nt_out]``.
+
+    Matches :func:`dedisperse_and_rasterise_subband_gpu` to within ``< 1e-6``
+    relative L2 error.
+    """
+    vis_arr = np.ascontiguousarray(vis_3d, dtype=np.complex64)
+    wgt_arr = np.ascontiguousarray(wgt_3d, dtype=np.float32)
+    uvw_arr = np.ascontiguousarray(uvw_3d, dtype=np.float64)
+    if vis_arr.ndim != 3:
+        raise ValueError(f"vis_3d must be 3D (nbl, nchan, nt_in); got shape {vis_arr.shape}.")
+    nbl, nchan, nt_in = vis_arr.shape
+    if wgt_arr.shape != vis_arr.shape:
+        raise ValueError(f"wgt_3d shape {wgt_arr.shape} must match vis_3d {vis_arr.shape}.")
+    if uvw_arr.shape != (nbl, 3, nt_in):
+        raise ValueError(f"uvw_3d shape {uvw_arr.shape} must match ({nbl}, 3, {nt_in}).")
+
+    eff_nt_out = nt_in if nt_out is None else int(nt_out)
+    if eff_nt_out < 0 or eff_nt_out > nt_in:
+        raise ValueError(f"nt_out ({eff_nt_out}) must satisfy 0 <= nt_out <= nt_in ({nt_in}).")
+
+    mode_id = _normalise_mode(mode)
+    geom = compute_raster_grid_geometry(
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pix_rad=pix_rad,
+        pixsize_arcsec=pixsize_arcsec,
+        grid_nu=grid_nu,
+        nv=nv,
+        mode=mode,
+        epsilon=epsilon,
+        do_wgridding=False,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+        oversample=oversample,
+    )
+    eff_grid_nu = int(geom["grid_nu"])
+    eff_nv = int(geom["nv"])
+    u_half = int(geom["u_half"])
+    eff_pix_rad = float(geom["pix_rad"])
+    du = float(geom["du"])
+    dv = float(geom["dv"])
+
+    _, delays_host, sub_offsets, sub_freqs_host, sub_delays_host, nsub_eff = _resolve_subband_tier1_params(
+        freqs_hz=freqs_hz,
+        intra_delays=intra_delays,
+        n_subbands=n_subbands,
+        dm_coarse=dm_coarse,
+        dt=dt,
+        align_to=align_to,
+    )
+    uv_to_m_arr, m_val = _resolve_uv_to_m_and_m_active(
+        uv_to_m=uv_to_m,
+        flat_indices=flat_indices,
+        nv=eff_nv,
+        u_half=u_half,
+        m_active=m_active,
+        return_sparse=True,
+        target_device="cpu",
+    )
+
+    out_shape = (m_val, nsub_eff, eff_nt_out)
+    if eff_nt_out == 0 or nbl == 0 or nchan == 0 or m_val == 0 or nsub_eff == 0:
+        z_vis = np.zeros(out_shape, dtype=np.complex64)
+        if return_weights:
+            return z_vis, np.zeros(out_shape, dtype=np.float32)
+        return z_vis
+
+    min_uv = 0.0 if min_uv_distance_m is None else float(min_uv_distance_m)
+    use_snapshot_norm, norm_div_mode = _resolve_normalise_mode(mode_id, normalise_mode)
+    eff_norm_div_mode = int(norm_div_mode) if bool(divide_by_n) else 0
+    apply_norm = (not return_weights) or use_snapshot_norm
+
+    if mode_id == 2:
+        kpar = select_ducc_kernel_params(
+            epsilon=float(epsilon),
+            do_wgridding=False,
+            sigma_min=float(sigma_min),
+            sigma_max=float(sigma_max),
+            supp=supp,
+        )
+        eff_supp = int(kpar["W"])
+        eff_deg = int(kpar["deg"])
+        poly_coeffs = build_ducc_polynomial_coeffs(eff_supp, float(kpar["beta"]), float(kpar["e0"]))
+        wpar = compute_ducc_w_params(
+            npix_x=int(npix_x),
+            npix_y=int(npix_y),
+            pixsize_x=eff_pix_rad,
+            pixsize_y=eff_pix_rad,
+            center_x=float(center_x),
+            center_y=float(center_y),
+            allow_nshift=bool(allow_nshift),
+            apply_w_phase=bool(apply_w_phase),
+            do_wgridding=False,
+        )
+        lshift = float(wpar["lshift"])
+        mshift = float(wpar["mshift"])
+        nshift = float(wpar["nshift"])
+        do_shift = bool(wpar["do_shift"])
+    else:
+        eff_supp = 4
+        eff_deg = 7
+        poly_coeffs = np.zeros((2, 8), dtype=np.float32)
+        lshift = mshift = nshift = 0.0
+        do_shift = False
+
+    if use_numba and HAS_NUMBA:
+        n_total = m_val * nsub_eff * eff_nt_out
+        out_re_flat = np.zeros(n_total, dtype=np.float32)
+        out_im_flat = np.zeros(n_total, dtype=np.float32)
+        out_w_flat = np.zeros(n_total, dtype=np.float32)
+        _rasterise_subband_active_numba_kernel(
+            vis_arr,
+            wgt_arr,
+            uvw_arr,
+            delays_host,
+            sub_offsets,
+            sub_freqs_host,
+            sub_delays_host,
+            uv_to_m_arr,
+            m_val,
+            eff_nt_out,
+            eff_grid_nu,
+            eff_nv,
+            u_half,
+            du,
+            dv,
+            eff_pix_rad,
+            eff_pix_rad,
+            min_uv,
+            int(min_valid_channels),
+            bool(exact_uvw),
+            mode_id,
+            eff_supp,
+            eff_deg,
+            poly_coeffs,
+            lshift,
+            mshift,
+            nshift,
+            do_shift,
+            bool(flip_u),
+            bool(flip_v),
+            bool(flip_w),
+            use_snapshot_norm,
+            eff_norm_div_mode,
+            apply_norm,
+            out_re_flat,
+            out_im_flat,
+            out_w_flat,
+        )
+        active_vis = np.empty(out_shape, dtype=np.complex64)
+        active_vis.real[:] = out_re_flat.reshape(out_shape)
+        active_vis.imag[:] = out_im_flat.reshape(out_shape)
+        if return_weights:
+            return active_vis, out_w_flat.reshape(out_shape)
+        return active_vis
+
+    active_vis, active_wgt = _dedisperse_and_rasterise_subband_numpy(
+        vis_3d=vis_arr,
+        wgt_3d=wgt_arr,
+        uvw_3d=uvw_arr,
+        intra_delays=delays_host,
+        sub_offsets=sub_offsets,
+        sub_freqs_hz=sub_freqs_host,
+        sub_delays=sub_delays_host,
+        uv_to_m=uv_to_m_arr,
+        m_active=m_val,
+        nt_out=eff_nt_out,
+        grid_nu=eff_grid_nu,
+        nv=eff_nv,
+        u_half=u_half,
+        du=du,
+        dv=dv,
+        pixsize_x=eff_pix_rad,
+        pixsize_y=eff_pix_rad,
+        min_uv_distance_m=min_uv,
+        min_valid_channels=int(min_valid_channels),
+        exact_uvw=bool(exact_uvw),
+        mode_id=mode_id,
+        supp=eff_supp,
+        deg=eff_deg,
+        poly_coeffs=poly_coeffs,
+        lshift=lshift,
+        mshift=mshift,
+        nshift=nshift,
+        do_shift=do_shift,
+        flip_u=bool(flip_u),
+        flip_v=bool(flip_v),
+        flip_w=bool(flip_w),
+        use_snapshot_norm=use_snapshot_norm,
+        norm_div_mode=eff_norm_div_mode,
+        apply_normalisation=apply_norm,
+    )
+    if return_weights:
+        return active_vis, active_wgt
+    return active_vis
+
+
+def dedisperse_and_rasterise_subband_gpu(
+    vis_3d: Any,
+    wgt_3d: Any,
+    uvw_3d: Any,
+    freqs_hz: Any,
+    intra_delays: Optional[Any] = None,
+    *,
+    n_subbands: int = 16,
+    nt_out: Optional[int] = None,
+    dm_coarse: float = 0.0,
+    dt: Optional[float] = None,
+    align_to: str = "fmax",
+    exact_uvw: bool = True,
+    npix_x: int = 384,
+    npix_y: int = 384,
+    pixsize_arcsec: Optional[float] = None,
+    pix_rad: Optional[float] = None,
+    grid_nu: Optional[int] = None,
+    nv: Optional[int] = None,
+    mode: str = "wgridder",
+    epsilon: float = 1e-5,
+    sigma_min: float = 1.1,
+    sigma_max: float = 2.6,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    allow_nshift: bool = True,
+    apply_w_phase: bool = True,
+    flip_u: bool = False,
+    flip_v: bool = False,
+    flip_w: bool = False,
+    divide_by_n: bool = True,
+    normalise_mode: Optional[str] = None,
+    oversample: Optional[bool] = None,
+    supp: Optional[int] = None,
+    min_valid_channels: int = 24,
+    min_uv_distance_m: Optional[float] = None,
+    uv_to_m: Optional[Any] = None,
+    flat_indices: Optional[Any] = None,
+    m_active: Optional[int] = None,
+    return_weights: bool = False,
+    return_host: bool = True,
+) -> Any:
+    """
+    CUDA-accelerated Tier 1 two-tier subbanded dedispersion and direct
+    active UV-cell rasterisation into ``d_active_dga[M_active, n_subbands, nt_out]``.
+    """
+    _require_cuda()
+    d_vis = cp.ascontiguousarray(cp.asarray(vis_3d), dtype=cp.complex64)
+    d_wgt = cp.ascontiguousarray(cp.asarray(wgt_3d), dtype=cp.float32)
+    d_uvw = cp.ascontiguousarray(cp.asarray(uvw_3d), dtype=cp.float64)
+
+    if d_vis.ndim != 3:
+        raise ValueError(f"vis_3d must be 3D (nbl, nchan, nt_in); got shape {d_vis.shape}.")
+    nbl, nchan, nt_in = (int(d_vis.shape[0]), int(d_vis.shape[1]), int(d_vis.shape[2]))
+    if d_wgt.shape != d_vis.shape:
+        raise ValueError(f"wgt_3d shape {d_wgt.shape} must match vis_3d {d_vis.shape}.")
+    if d_uvw.shape != (nbl, 3, nt_in):
+        raise ValueError(f"uvw_3d shape {d_uvw.shape} must match ({nbl}, 3, {nt_in}).")
+
+    eff_nt_out = nt_in if nt_out is None else int(nt_out)
+    if eff_nt_out < 0 or eff_nt_out > nt_in:
+        raise ValueError(f"nt_out ({eff_nt_out}) must satisfy 0 <= nt_out <= nt_in ({nt_in}).")
+
+    mode_id = _normalise_mode(mode)
+    geom = compute_raster_grid_geometry(
+        npix_x=npix_x,
+        npix_y=npix_y,
+        pix_rad=pix_rad,
+        pixsize_arcsec=pixsize_arcsec,
+        grid_nu=grid_nu,
+        nv=nv,
+        mode=mode,
+        epsilon=epsilon,
+        do_wgridding=False,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+        oversample=oversample,
+    )
+    eff_grid_nu = int(geom["grid_nu"])
+    eff_nv = int(geom["nv"])
+    u_half = int(geom["u_half"])
+    eff_pix_rad = float(geom["pix_rad"])
+    du = float(geom["du"])
+    dv = float(geom["dv"])
+
+    _, delays_host, sub_offsets_host, sub_freqs_host, sub_delays_host, nsub_eff = _resolve_subband_tier1_params(
+        freqs_hz=freqs_hz,
+        intra_delays=intra_delays,
+        n_subbands=n_subbands,
+        dm_coarse=dm_coarse,
+        dt=dt,
+        align_to=align_to,
+    )
+    d_uv_to_m, m_val = _resolve_uv_to_m_and_m_active(
+        uv_to_m=uv_to_m,
+        flat_indices=flat_indices,
+        nv=eff_nv,
+        u_half=u_half,
+        m_active=m_active,
+        return_sparse=True,
+        target_device="cuda",
+    )
+
+    out_shape = (m_val, nsub_eff, eff_nt_out)
+    if eff_nt_out == 0 or nbl == 0 or nchan == 0 or m_val == 0 or nsub_eff == 0:
+        if return_host:
+            zv = np.zeros(out_shape, dtype=np.complex64)
+            return (zv, np.zeros(out_shape, dtype=np.float32)) if return_weights else zv
+        zv_d = cp.zeros(out_shape, dtype=cp.complex64)
+        return (zv_d, cp.zeros(out_shape, dtype=cp.float32)) if return_weights else zv_d
+
+    min_uv = 0.0 if min_uv_distance_m is None else float(min_uv_distance_m)
+    use_snapshot_norm, norm_div_mode = _resolve_normalise_mode(mode_id, normalise_mode)
+    eff_norm_div_mode = int(norm_div_mode) if bool(divide_by_n) else 0
+    apply_norm = (not return_weights) or use_snapshot_norm
+
+    d_delays = cp.asarray(delays_host, dtype=cp.int32)
+    d_sub_offsets = cp.asarray(sub_offsets_host, dtype=cp.int32)
+    d_sub_freqs = cp.asarray(sub_freqs_host, dtype=cp.float64)
+    d_sub_delays = cp.asarray(sub_delays_host, dtype=cp.int32)
+    d_raw_valid = cp.zeros(eff_nt_out, dtype=cp.int32)
+    d_dedisp_valid = cp.zeros(eff_nt_out, dtype=cp.int32)
+
+    mod = _get_module()
+    valid_kernel = mod.get_function("compute_valid_channels_kernel")
+    gy_valid = min(_MAX_GRID_Y, _ceil_div(nchan, 8))
+    valid_kernel(
+        (eff_nt_out, gy_valid, 1),
+        (32, 8, 1),
+        (
+            d_vis,
+            d_wgt,
+            d_uvw,
+            d_delays,
+            d_raw_valid,
+            d_dedisp_valid,
+            np.int32(nbl),
+            np.int32(nchan),
+            np.int32(nt_in),
+            np.int32(eff_nt_out),
+            np.float64(min_uv),
+        ),
+    )
+
+    if mode_id == 2:
+        kpar = select_ducc_kernel_params(
+            epsilon=float(epsilon),
+            do_wgridding=False,
+            sigma_min=float(sigma_min),
+            sigma_max=float(sigma_max),
+            supp=supp,
+        )
+        eff_supp = int(kpar["W"])
+        eff_deg = int(kpar["deg"])
+        d_poly_coeffs = cp.asarray(
+            build_ducc_polynomial_coeffs(eff_supp, float(kpar["beta"]), float(kpar["e0"])),
+            dtype=cp.float32,
+        )
+        wpar = compute_ducc_w_params(
+            npix_x=int(npix_x),
+            npix_y=int(npix_y),
+            pixsize_x=eff_pix_rad,
+            pixsize_y=eff_pix_rad,
+            center_x=float(center_x),
+            center_y=float(center_y),
+            allow_nshift=bool(allow_nshift),
+            apply_w_phase=bool(apply_w_phase),
+            do_wgridding=False,
+        )
+        lshift = float(wpar["lshift"])
+        mshift = float(wpar["mshift"])
+        nshift = float(wpar["nshift"])
+        do_shift = bool(wpar["do_shift"])
+    else:
+        eff_supp = 4
+        eff_deg = 7
+        d_poly_coeffs = cp.zeros((2, 8), dtype=cp.float32)
+        lshift = mshift = nshift = 0.0
+        do_shift = False
+
+    d_active_vis = cp.zeros(out_shape, dtype=cp.complex64)
+    d_active_wgt = cp.zeros(out_shape, dtype=cp.float32)
+
+    gx_raster = _ceil_div(eff_nt_out, 32)
+    gy_raster = min(_MAX_GRID_Y, _ceil_div(nbl, 8))
+    tier1_kernel = mod.get_function("dedisperse_and_rasterise_subband_active_kernel")
+    tier1_kernel(
+        (gx_raster, gy_raster, 1),
+        (32, 8, 1),
+        (
+            d_vis,
+            d_wgt,
+            d_uvw,
+            d_delays,
+            d_sub_offsets,
+            d_sub_freqs,
+            d_sub_delays,
+            d_raw_valid,
+            d_dedisp_valid,
+            d_uv_to_m,
+            d_poly_coeffs,
+            d_active_vis,
+            d_active_wgt,
+            np.int32(nbl),
+            np.int32(nchan),
+            np.int32(nsub_eff),
+            np.int32(nt_in),
+            np.int32(eff_nt_out),
+            np.int32(eff_grid_nu),
+            np.int32(eff_nv),
+            np.int32(u_half),
+            np.float64(du),
+            np.float64(dv),
+            np.float64(eff_pix_rad),
+            np.float64(eff_pix_rad),
+            np.float64(min_uv),
+            np.int32(min_valid_channels),
+            np.int32(1 if exact_uvw else 0),
+            np.int32(mode_id),
+            np.int32(eff_supp),
+            np.int32(eff_deg),
+            np.float64(lshift),
+            np.float64(mshift),
+            np.float64(nshift),
+            np.int32(1 if do_shift else 0),
+            np.int32(1 if flip_u else 0),
+            np.int32(1 if flip_v else 0),
+            np.int32(1 if flip_w else 0),
+        ),
+    )
+
+    if apply_norm:
+        d_snap_inv_ptr: Any = 0
+        if use_snapshot_norm:
+            d_snap_inv = cp.zeros(eff_nt_out, dtype=cp.float32)
+            snap_norm_kernel = mod.get_function("compute_snapshot_vis2grid_norm_kernel")
+            snap_norm_kernel(
+                (eff_nt_out, 1, 1),
+                (32, 8, 1),
+                (
+                    d_vis,
+                    d_wgt,
+                    d_uvw,
+                    d_delays,
+                    d_sub_offsets,
+                    d_raw_valid,
+                    d_dedisp_valid,
+                    d_snap_inv,
+                    np.int32(nbl),
+                    np.int32(nchan),
+                    np.int32(nsub_eff),
+                    np.int32(nt_in),
+                    np.int32(eff_nt_out),
+                    np.float64(min_uv),
+                    np.int32(min_valid_channels),
+                    np.int32(0),
+                    np.int32(3 if eff_norm_div_mode == 2 else eff_norm_div_mode),
+                ),
+            )
+            d_snap_inv_ptr = d_snap_inv
+
+        norm_kernel = mod.get_function("normalise_active_subband_kernel")
+        gy_norm = min(_MAX_GRID_Y, _ceil_div(m_val * nsub_eff, 8))
+        norm_kernel(
+            (gx_raster, gy_norm, 1),
+            (32, 8, 1),
+            (
+                d_active_vis,
+                d_active_wgt,
+                d_snap_inv_ptr,
+                d_raw_valid,
+                d_dedisp_valid,
+                np.int32(m_val),
+                np.int32(nsub_eff),
+                np.int32(eff_nt_out),
+                np.int32(nchan),
+                np.int32(min_valid_channels),
+                np.int32(1 if use_snapshot_norm else 0),
+            ),
+        )
+
+    if return_weights:
+        if return_host:
+            return cp.asnumpy(d_active_vis), cp.asnumpy(d_active_wgt)
+        return d_active_vis, d_active_wgt
+
+    del d_active_wgt
+    if return_host:
+        return cp.asnumpy(d_active_vis)
+    return d_active_vis
+
+
+def dedisperse_and_rasterise_subband(
+    vis_3d: Any,
+    wgt_3d: Any,
+    uvw_3d: Any,
+    freqs_hz: Any,
+    intra_delays: Optional[Any] = None,
+    *,
+    device: str = "auto",
+    return_host: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Unified dispatcher for Tier 1 active-cell subband rasterisation (CUDA or CPU)."""
+    eff_dev = resolve_device(device)
+    if eff_dev == "cuda":
+        kwargs.pop("use_numba", None)
+        return dedisperse_and_rasterise_subband_gpu(
+            vis_3d,
+            wgt_3d,
+            uvw_3d,
+            freqs_hz,
+            intra_delays=intra_delays,
+            return_host=return_host,
+            **kwargs,
+        )
+    return dedisperse_and_rasterise_subband_cpu(
+        vis_3d,
+        wgt_3d,
+        uvw_3d,
+        freqs_hz,
+        intra_delays=intra_delays,
+        **kwargs,
+    )
+
+
+def dedisperse_active_cell_matrix_cpu(
+    active_dga: np.ndarray,
+    inter_delays: np.ndarray,
+    *,
+    nt_out: Optional[int] = None,
+    active_wgt: Optional[np.ndarray] = None,
+    uv_threshold: float = 0.0,
+    use_numba: bool = True,
+) -> np.ndarray:
+    """
+    CPU implementation (Numba ``prange`` + NumPy fallback) of Tier 2 active
+    UV-cell dedispersion across subbands.
+
+    Parameters
+    ----------
+    active_dga : np.ndarray (complex64), shape ``(M_active, N_sub, N_time_in)``
+        Dense-in-time, sparse-in-(u, v) active cell subband tensor.
+    inter_delays : np.ndarray (int32/int64), shape ``(N_DM, N_sub)`` or ``(N_sub,)``
+        Non-negative causal inter-subband delays in samples.
+    nt_out : int, optional
+        Number of output time samples (defaults to ``N_time_in``).
+    active_wgt : np.ndarray (float32), optional
+        Optional per-cell weights matching ``active_dga.shape`` for exact
+        per-cell weight normalisation across subbands.
+    uv_threshold : float, default 0.0
+        Amplitude cutoff ``|V| > uv_threshold`` below which cells are zeroed.
+    use_numba : bool, default True
+        Execute via Numba parallel ``prange`` when available.
+
+    Returns
+    -------
+    out_dedisp : np.ndarray (complex64)
+        Shape ``(N_DM, M_active, nt_out)`` for 2D ``inter_delays``, or
+        ``(M_active, nt_out)`` for 1D ``inter_delays``.
+    """
+    dga_arr = np.ascontiguousarray(active_dga, dtype=np.complex64)
+    if dga_arr.ndim != 3:
+        raise ValueError(f"active_dga must be 3D (M_active, N_sub, N_time); got shape {dga_arr.shape}.")
+    m_active, n_sub, nt_in = dga_arr.shape
+
+    eff_nt_out = nt_in if nt_out is None else int(nt_out)
+    if eff_nt_out < 0 or eff_nt_out > nt_in:
+        raise ValueError(f"nt_out ({eff_nt_out}) must satisfy 0 <= nt_out <= nt_in ({nt_in}).")
+
+    delays_raw = np.asarray(inter_delays, dtype=np.int32)
+    squeeze_dm = delays_raw.ndim == 1
+    if squeeze_dm:
+        delays_2d = np.ascontiguousarray(delays_raw[None, :], dtype=np.int32)
+    elif delays_raw.ndim == 2:
+        delays_2d = np.ascontiguousarray(delays_raw, dtype=np.int32)
+    else:
+        raise ValueError(f"inter_delays must be 1D (N_sub,) or 2D (N_DM, N_sub); got shape {delays_raw.shape}.")
+
+    if int(delays_2d.shape[1]) != n_sub:
+        raise ValueError(f"inter_delays subband count ({delays_2d.shape[1]}) must match active_dga ({n_sub}).")
+    if np.any(delays_2d < 0):
+        raise ValueError("inter_delays must be non-negative causal delays (>= 0).")
+
+    n_dm = int(delays_2d.shape[0])
+    out = np.zeros((n_dm, m_active, eff_nt_out), dtype=np.complex64)
+    if n_dm == 0 or m_active == 0 or eff_nt_out == 0 or n_sub == 0:
+        return out[0] if squeeze_dm else out
+
+    has_wgt = active_wgt is not None
+    if has_wgt:
+        wgt_arr = np.ascontiguousarray(active_wgt, dtype=np.float32)
+        if wgt_arr.shape != dga_arr.shape:
+            raise ValueError(f"active_wgt shape {wgt_arr.shape} must match active_dga {dga_arr.shape}.")
+    else:
+        wgt_arr = np.empty((1, 1, 1), dtype=np.float32)
+
+    thr = float(uv_threshold)
+
+    if use_numba and HAS_NUMBA:
+        _dedisperse_active_cell_matrix_numba(
+            dga_arr,
+            wgt_arr,
+            has_wgt,
+            delays_2d,
+            eff_nt_out,
+            thr,
+            out,
+        )
+        return out[0] if squeeze_dm else out
+
+    # Pure NumPy fallback
+    thr_sq = np.float32(thr * thr) if thr > 0.0 else np.float32(0.0)
+    for idm in range(n_dm):
+        acc = np.zeros((m_active, eff_nt_out), dtype=np.complex64)
+        acc_w = np.zeros((m_active, eff_nt_out), dtype=np.float32) if has_wgt else None
+        for s in range(n_sub):
+            d = int(delays_2d[idm, s])
+            valid_len = min(eff_nt_out, nt_in - d)
+            if valid_len > 0:
+                acc[:, :valid_len] += dga_arr[:, s, d : d + valid_len]
+                if has_wgt and acc_w is not None:
+                    acc_w[:, :valid_len] += wgt_arr[:, s, d : d + valid_len]
+        if has_wgt and acc_w is not None:
+            valid_w = (acc_w > 0.0) & np.isfinite(acc_w)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                acc = np.where(
+                    valid_w,
+                    acc / np.where(valid_w, acc_w, np.float32(1.0)),
+                    np.complex64(0.0 + 0.0j),
+                )
+        if thr_sq > 0.0:
+            mag_sq = acc.real * acc.real + acc.imag * acc.imag
+            acc = np.where(mag_sq > thr_sq, acc, np.complex64(0.0 + 0.0j))
+        out[idm] = acc
+
+    return out[0] if squeeze_dm else out
+
+
+def dedisperse_active_cell_matrix_gpu(
+    active_dga: Any,
+    inter_delays: Any,
+    *,
+    nt_out: Optional[int] = None,
+    active_wgt: Optional[Any] = None,
+    uv_threshold: float = 0.0,
+    return_host: bool = True,
+) -> Any:
+    """
+    CUDA-accelerated Tier 2 active UV-cell matrix dedispersion across subbands.
+
+    Executes 100% coalesced vectorised shift-and-sum along the contiguous time
+    axis ``t`` in ``d_active_dga[M_active, N_sub, N_time]``.
+    """
+    _require_cuda()
+    d_dga = cp.ascontiguousarray(cp.asarray(active_dga), dtype=cp.complex64)
+    if d_dga.ndim != 3:
+        raise ValueError(f"active_dga must be 3D (M_active, N_sub, N_time); got shape {d_dga.shape}.")
+    m_active, n_sub, nt_in = (int(d_dga.shape[0]), int(d_dga.shape[1]), int(d_dga.shape[2]))
+
+    eff_nt_out = nt_in if nt_out is None else int(nt_out)
+    if eff_nt_out < 0 or eff_nt_out > nt_in:
+        raise ValueError(f"nt_out ({eff_nt_out}) must satisfy 0 <= nt_out <= nt_in ({nt_in}).")
+
+    delays_host = np.asarray(
+        cp.asnumpy(inter_delays) if isinstance(inter_delays, cp.ndarray) else inter_delays,
+        dtype=np.int32,
+    )
+    squeeze_dm = delays_host.ndim == 1
+    if squeeze_dm:
+        delays_2d_host = np.ascontiguousarray(delays_host[None, :], dtype=np.int32)
+    elif delays_host.ndim == 2:
+        delays_2d_host = np.ascontiguousarray(delays_host, dtype=np.int32)
+    else:
+        raise ValueError(f"inter_delays must be 1D (N_sub,) or 2D (N_DM, N_sub); got shape {delays_host.shape}.")
+
+    if int(delays_2d_host.shape[1]) != n_sub:
+        raise ValueError(f"inter_delays subband count ({delays_2d_host.shape[1]}) must match active_dga ({n_sub}).")
+    if np.any(delays_2d_host < 0):
+        raise ValueError("inter_delays must be non-negative causal delays (>= 0).")
+
+    n_dm = int(delays_2d_host.shape[0])
+    out_shape = (m_active, eff_nt_out) if squeeze_dm else (n_dm, m_active, eff_nt_out)
+    if n_dm == 0 or m_active == 0 or eff_nt_out == 0 or n_sub == 0:
+        if return_host:
+            return np.zeros(out_shape, dtype=np.complex64)
+        return cp.zeros(out_shape, dtype=cp.complex64)
+
+    if active_wgt is not None:
+        d_wgt = cp.ascontiguousarray(cp.asarray(active_wgt), dtype=cp.float32)
+        if tuple(d_wgt.shape) != (m_active, n_sub, nt_in):
+            raise ValueError(f"active_wgt shape {d_wgt.shape} must match active_dga {(m_active, n_sub, nt_in)}.")
+        d_wgt_ptr: Any = d_wgt
+    else:
+        d_wgt_ptr = 0
+
+    d_delays = cp.asarray(delays_2d_host, dtype=cp.int32)
+    d_out = cp.empty((n_dm, m_active, eff_nt_out), dtype=cp.complex64)
+
+    mod = _get_module()
+    t2_kernel = mod.get_function("dedisperse_active_cell_matrix_kernel")
+    gx = _ceil_div(eff_nt_out, 32)
+    gy = min(_MAX_GRID_Y, _ceil_div(m_active, 8))
+    gz = min(_MAX_GRID_Y, n_dm)
+    t2_kernel(
+        (gx, gy, gz),
+        (32, 8, 1),
+        (
+            d_dga,
+            d_wgt_ptr,
+            d_delays,
+            d_out,
+            np.int32(n_dm),
+            np.int32(m_active),
+            np.int32(n_sub),
+            np.int32(nt_in),
+            np.int32(eff_nt_out),
+            np.float32(uv_threshold),
+        ),
+    )
+
+    res = d_out[0] if squeeze_dm else d_out
+    if return_host:
+        return cp.asnumpy(res)
+    return res
+
+
+def dedisperse_active_cell_matrix(
+    active_dga: Any,
+    inter_delays: Any,
+    *,
+    device: str = "auto",
+    nt_out: Optional[int] = None,
+    active_wgt: Optional[Any] = None,
+    uv_threshold: float = 0.0,
+    return_host: bool = True,
+    use_numba: bool = True,
+) -> Any:
+    """Unified dispatcher for Tier 2 active UV-cell matrix dedispersion (CUDA or CPU)."""
+    eff_dev = resolve_device(device)
+    if eff_dev == "cuda":
+        return dedisperse_active_cell_matrix_gpu(
+            active_dga,
+            inter_delays,
+            nt_out=nt_out,
+            active_wgt=active_wgt,
+            uv_threshold=uv_threshold,
+            return_host=return_host,
+        )
+    return dedisperse_active_cell_matrix_cpu(
+        active_dga,
+        inter_delays,
+        nt_out=nt_out,
+        active_wgt=active_wgt,
+        uv_threshold=uv_threshold,
+        use_numba=use_numba,
+    )
+
+
 __all__ = [
     "HAS_NUMBA",
     "is_cuda_available",
@@ -4148,6 +5683,12 @@ __all__ = [
     "dedisperse_and_rasterise_chunk_cpu",
     "dedisperse_and_rasterise_chunk_gpu",
     "dedisperse_and_rasterise_chunk",
+    "dedisperse_and_rasterise_subband_cpu",
+    "dedisperse_and_rasterise_subband_gpu",
+    "dedisperse_and_rasterise_subband",
+    "dedisperse_active_cell_matrix_cpu",
+    "dedisperse_active_cell_matrix_gpu",
+    "dedisperse_active_cell_matrix",
     "dedisperse_and_rasterise_rows",
     "dedisperse_rasterise_to_ragged",
 ]
