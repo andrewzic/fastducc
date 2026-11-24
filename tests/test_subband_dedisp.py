@@ -400,6 +400,7 @@ def test_scientific_fidelity_subbanded_vs_fullband(source_l_deg: float, source_m
         pixsize_arcsec=pixsize_arcsec,
         mode="wgridder",
         do_wgridding=False,
+        normalise_mode="vis2grid",
         min_valid_channels=8,
     )
     dirty_full = _invert_halfplane_to_dirty(uv_full, grid_nu=grid_nu, npix_x=npix, npix_y=npix)
@@ -423,6 +424,7 @@ def test_scientific_fidelity_subbanded_vs_fullband(source_l_deg: float, source_m
         npix_y=npix,
         pixsize_arcsec=pixsize_arcsec,
         mode="wgridder",
+        normalise_mode="vis2grid",
         min_valid_channels=8,
         uv_to_m=uv_to_m,
         m_active=len(flat_indices),

@@ -4475,7 +4475,7 @@ if HAS_NUMBA:
                         denom *= float(snap_nvalid)
                     elif norm_div_mode == 2:
                         nbl_eff = max(1.0, float(snap_nvalid) / float(max(1, nsub_eff)))
-                        denom *= nbl_eff * (float(max(1, nsub_eff)) / float(max(1, nchan)))
+                        denom *= nbl_eff
                     snap_inv = np.float32(1.0 / denom)
 
                 total_rows = m_active * nsub_eff
@@ -4791,7 +4791,7 @@ def _dedisperse_and_rasterise_subband_numpy(
                         denom *= float(snap_nvalid)
                     elif norm_div_mode == 2:
                         nbl_eff = max(1.0, float(snap_nvalid) / float(max(1, nsub_eff)))
-                        denom *= nbl_eff * (float(max(1, nsub_eff)) / float(max(1, nchan)))
+                        denom *= nbl_eff
                     inv_w = np.float32(1.0 / denom)
                     valid_c = out_wgt[:, :, t] > 0.0
                     out_vis[:, :, t] = np.where(valid_c, out_vis[:, :, t] * inv_w, np.complex64(0.0 + 0.0j))
@@ -5361,7 +5361,7 @@ def dedisperse_and_rasterise_subband_gpu(
                     np.float64(min_uv),
                     np.int32(min_valid_channels),
                     np.int32(0),
-                    np.int32(3 if eff_norm_div_mode == 2 else eff_norm_div_mode),
+                    np.int32(eff_norm_div_mode),
                 ),
             )
             d_snap_inv_ptr = d_snap_inv

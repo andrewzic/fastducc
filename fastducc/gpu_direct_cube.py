@@ -3203,6 +3203,7 @@ def iter_ms_to_ragged_csr_subbanded(
                         dedisp_mode="subbanded",
                         nsubbands=eff_nsub,
                     )
+                    cp.get_default_memory_pool().free_all_blocks()
                     dev_chunks_j = [
                         (cp.asarray(ci), cp.asarray(cc), cp.asarray(vd), cp.asarray(vt))
                         for ci, cc, vd, vt in host_chunks_per_dm[j_dm]
