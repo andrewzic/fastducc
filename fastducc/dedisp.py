@@ -77,8 +77,8 @@ def get_dm_samps(freqs_hz: np.ndarray, dm_pccc: float, tsamp_s: float) -> int:
 
 class DedispersionPlan:
     """
-    Computes an optimal DM trial grid and per-channel delay profiles
-    based on observation frequency and time resolution.
+    Computes an optimal DM trial grid and per-channel / two-tier subbanded
+    delay profiles based on observation frequency and time resolution.
     """
     K_DM = K_DM
 
@@ -90,6 +90,8 @@ class DedispersionPlan:
         dm_max: float = 1000.0,
         dm_step: Optional[float] = None,
         tolerance_samples: float = 1.0,
+        dedisp_mode: str = "subbanded",
+        n_subbands: int = 16,
     ):
         """
         Parameters
@@ -106,13 +108,29 @@ class DedispersionPlan:
             Explicit DM trial step size. If None, derived from tolerance_samples.
         tolerance_samples : float
             Maximum acceptable delay error across full band in sample units (default: 1.0).
+        dedisp_mode : {'subbanded', 'fullband'}
+            Dedispersion engine mode (default: 'subbanded').
+        n_subbands : int
+            Number of coarse frequency subbands for two-tier subbanded dedispersion
+            (default: 16).
         """
+        mode_norm = str(dedisp_mode).strip().lower()
+        if mode_norm not in ("subbanded", "fullband"):
+            raise ValueError(
+                f"Unsupported dedisp_mode='{dedisp_mode}'; expected 'subbanded' or 'fullband'."
+            )
+        if int(n_subbands) < 1:
+            raise ValueError(f"n_subbands must be >= 1; got {n_subbands}.")
+
         self.freqs_hz = np.asarray(freqs_hz, dtype=np.float64)
         self.freqs_ghz = self.freqs_hz * 1e-9
         self.tsamp_s = float(tsamp_s)
+        self.tolerance_samples = float(tolerance_samples)
         self.fmin_ghz = float(np.min(self.freqs_ghz))
         self.fmax_ghz = float(np.max(self.freqs_ghz))
         self.nchan = len(freqs_hz)
+        self.dedisp_mode = mode_norm
+        self.n_subbands = max(1, min(int(n_subbands), self.nchan)) if self.nchan > 0 else 0
 
         # Band dispersion factor: (1/fmin^2 - 1/fmax^2)
         self.band_disp_factor = (1.0 / self.fmin_ghz**2 - 1.0 / self.fmax_ghz**2)
@@ -120,13 +138,13 @@ class DedispersionPlan:
         # Delay (in samples) across the band per 1 pc/cm^3 of DM
         self.samples_per_dm = (self.K_DM * self.band_disp_factor) / self.tsamp_s
 
-        # Optimal DM step size
+        # Optimal fine DM step size
         if dm_step is not None and dm_step > 0:
             self.dm_step = float(dm_step)
         else:
             self.dm_step = float(tolerance_samples / max(1e-12, self.samples_per_dm))
 
-        # Trial DMs array
+        # Fine trial DMs array
         if dm_max <= dm_min:
             self.trial_dms = np.array([float(dm_min)], dtype=np.float64)
         else:
@@ -136,21 +154,126 @@ class DedispersionPlan:
         # Maximum delay sweep across the entire plan in samples
         self.max_delay_samps = int(np.ceil(self.K_DM * max(dm_max, dm_min) * self.band_disp_factor / self.tsamp_s))
 
+        # Subband partitioning matching np.array_split(np.arange(nchan), n_subbands)
+        if self.n_subbands > 0:
+            q, r = divmod(self.nchan, self.n_subbands)
+            sizes = np.empty(self.n_subbands, dtype=np.int32)
+            sizes[:r] = q + 1
+            sizes[r:] = q
+            self.subband_offsets = np.zeros(self.n_subbands + 1, dtype=np.int32)
+            self.subband_offsets[1:] = np.cumsum(sizes, dtype=np.int32)
+            self.subband_freqs_hz = np.array(
+                [float(np.mean(self.freqs_hz[self.subband_offsets[s]:self.subband_offsets[s + 1]]))
+                 for s in range(self.n_subbands)],
+                dtype=np.float64,
+            )
+            self.subband_max_freqs_hz = np.array(
+                [float(np.max(self.freqs_hz[self.subband_offsets[s]:self.subband_offsets[s + 1]]))
+                 for s in range(self.n_subbands)],
+                dtype=np.float64,
+            )
+        else:
+            self.subband_offsets = np.zeros(1, dtype=np.int32)
+            self.subband_freqs_hz = np.empty(0, dtype=np.float64)
+            self.subband_max_freqs_hz = np.empty(0, dtype=np.float64)
+
+        # Coarse DM step guaranteeing intra-subband dispersive smearing <= tolerance_samples
+        bw_ghz = self.fmax_ghz - self.fmin_ghz
+        sub_bw_ghz = (bw_ghz / float(self.n_subbands)) if (self.n_subbands > 0 and bw_ghz > 0.0) else 0.0
+        if sub_bw_ghz > 0.0:
+            raw_coarse_step = (
+                self.tolerance_samples * self.tsamp_s * (self.fmin_ghz ** 3)
+            ) / (2.0 * self.K_DM * sub_bw_ghz)
+            self.coarse_dm_step = float(max(raw_coarse_step, self.dm_step))
+        else:
+            self.coarse_dm_step = float(self.dm_step)
+
+        # Coarse DM trial grid and mapping between fine and coarse trials
+        if self.dedisp_mode == "fullband" or self.ndm <= 1 or dm_max <= dm_min:
+            self.coarse_dms = self.trial_dms.copy()
+        else:
+            dm_lo = float(self.trial_dms[0])
+            dm_hi = float(self.trial_dms[-1])
+            dm_span = dm_hi - dm_lo
+            n_coarse = max(1, int(np.ceil(dm_span / self.coarse_dm_step)))
+            if n_coarse >= self.ndm:
+                self.coarse_dms = self.trial_dms.copy()
+            else:
+                interval = dm_span / float(n_coarse)
+                self.coarse_dms = dm_lo + (np.arange(n_coarse, dtype=np.float64) + 0.5) * interval
+        self.n_coarse = int(self.coarse_dms.size)
+
+        # Assign each fine DM trial to its nearest coarse DM trial
+        self.fine_to_coarse_idx = np.array(
+            [int(np.argmin(np.abs(self.coarse_dms - dm_f))) for dm_f in self.trial_dms],
+            dtype=np.int32,
+        )
+        self.coarse_to_fine_indices: List[np.ndarray] = [
+            np.flatnonzero(self.fine_to_coarse_idx == ic).astype(np.int32)
+            for ic in range(self.n_coarse)
+        ]
+
+        # Precompute causal (align_to="fmax") intra-subband and inter-subband delay tables
+        self.intra_delays = np.zeros((self.n_coarse, self.nchan), dtype=np.int32)
+        for ic, dm_c in enumerate(self.coarse_dms):
+            self.intra_delays[ic] = self.get_intra_delays(float(dm_c), align_to="fmax")
+
+        self.inter_delays = np.zeros((self.ndm, self.n_subbands), dtype=np.int32)
+        for ifine, dm_f in enumerate(self.trial_dms):
+            self.inter_delays[ifine] = self.get_inter_delays(float(dm_f), align_to="fmax")
+
+        self.max_intra_delay_samps = int(np.max(self.intra_delays)) if self.intra_delays.size > 0 else 0
+        self.max_inter_delay_samps = int(np.max(self.inter_delays)) if self.inter_delays.size > 0 else 0
+
     def get_channel_delays(self, dm_pccc: float, align_to: str = "fmax") -> np.ndarray:
         """
         Computes integer sample delays per channel for a given DM.
         """
         return get_dm_delays(self.freqs_hz, dm_pccc, self.tsamp_s, align_to=align_to)
 
+    def get_intra_delays(self, dm_coarse: float, align_to: str = "fmax") -> np.ndarray:
+        """
+        Compute causal intra-subband channel delays (samples) relative to each
+        subband's upper edge frequency ``nu_{s, max}`` (when ``align_to='fmax'``).
+        """
+        delays = np.zeros(self.nchan, dtype=np.int32)
+        for s in range(self.n_subbands):
+            c0 = int(self.subband_offsets[s])
+            c1 = int(self.subband_offsets[s + 1])
+            if c1 > c0:
+                delays[c0:c1] = get_dm_delays(
+                    self.freqs_hz[c0:c1], float(dm_coarse), self.tsamp_s, align_to=align_to
+                ).astype(np.int32)
+        return delays
+
+    def get_inter_delays(self, dm_fine: float, align_to: str = "fmax") -> np.ndarray:
+        """
+        Compute causal inter-subband delays (samples) for each subband's upper
+        edge frequency ``nu_{s, max}`` relative to the band reference frequency
+        ``nu_ref`` (``nu_max`` when ``align_to='fmax'``).
+        """
+        if self.n_subbands == 0:
+            return np.empty(0, dtype=np.int32)
+        return get_dm_delays(
+            self.subband_max_freqs_hz, float(dm_fine), self.tsamp_s, align_to=align_to
+        ).astype(np.int32)
+
     def summary(self) -> str:
-        return (
+        base = (
             f"DedispersionPlan Summary:\n"
+            f"  Mode: {self.dedisp_mode}\n"
             f"  Frequencies: {self.fmin_ghz*1e3:.2f} - {self.fmax_ghz*1e3:.2f} MHz ({self.nchan} channels)\n"
             f"  Time Resolution: {self.tsamp_s*1e3:.3f} ms\n"
             f"  DM Range: {self.trial_dms[0]:.2f} - {self.trial_dms[-1]:.2f} pc/cm^3\n"
             f"  DM Step (delta_DM): {self.dm_step:.3f} pc/cm^3 (Total trials: {self.ndm})\n"
             f"  Max Delay Sweep: {self.max_delay_samps} samples ({self.max_delay_samps * self.tsamp_s:.3f} s)"
         )
+        if self.dedisp_mode == "subbanded":
+            base += (
+                f"\n  Subbands: {self.n_subbands} | Coarse DM Step: {self.coarse_dm_step:.3f} pc/cm^3 "
+                f"(Coarse trials: {self.n_coarse})"
+            )
+        return base
 
 
 class BruteForceDedisperser:
