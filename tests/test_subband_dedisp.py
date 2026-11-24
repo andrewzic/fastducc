@@ -305,6 +305,29 @@ def test_tier1_and_tier2_cuda_vs_cpu_parity(mode: str):
     t2_gpu = dedisperse_active_cell_matrix_gpu(t1_gpu, plan.inter_delays, nt_out=20, uv_threshold=1e-4, return_host=True)
     assert _rel_l2_error(t2_gpu, t2_cpu) < 1e-6
 
+    # Also verify weight-normalised Tier 2 CUDA vs CPU parity
+    t1_cpu_v, t1_cpu_w = dedisperse_and_rasterise_subband_cpu(
+        vis_3d, wgt_3d, uvw_3d, freqs_hz, intra_delays=intra, n_subbands=8,
+        nt_out=32, npix_x=64, npix_y=64, pixsize_arcsec=60.0, mode=mode,
+        min_valid_channels=4, uv_to_m=uv_to_m, m_active=len(flat_indices),
+        return_weights=True,
+    )
+    t1_gpu_v, t1_gpu_w = dedisperse_and_rasterise_subband_gpu(
+        vis_3d, wgt_3d, uvw_3d, freqs_hz, intra_delays=intra, n_subbands=8,
+        nt_out=32, npix_x=64, npix_y=64, pixsize_arcsec=60.0, mode=mode,
+        min_valid_channels=4, uv_to_m=uv_to_m, m_active=len(flat_indices),
+        return_weights=True, return_host=True,
+    )
+    assert _rel_l2_error(t1_gpu_v, t1_cpu_v) < 1e-6
+    assert _rel_l2_error(t1_gpu_w, t1_cpu_w) < 1e-6
+    t2_w_cpu = dedisperse_active_cell_matrix_cpu(
+        t1_cpu_v, plan.inter_delays, nt_out=20, active_wgt=t1_cpu_w, uv_threshold=1e-4
+    )
+    t2_w_gpu = dedisperse_active_cell_matrix_gpu(
+        t1_gpu_v, plan.inter_delays, nt_out=20, active_wgt=t1_gpu_w, uv_threshold=1e-4, return_host=True
+    )
+    assert _rel_l2_error(t2_w_gpu, t2_w_cpu) < 1e-6
+
 
 # =============================================================================
 # 3. Scientific Fidelity: Subbanded vs Fullband on Synthetic Point Sources
@@ -550,3 +573,28 @@ def test_stream_ms_to_ragged_csr_subbanded_mode(tmp_path):
     assert res_full.attrs["dedisp_mode"] == "fullband"
     assert res_sub.nnz_total > 0
     assert res_sub.m_total > 0
+
+    if is_cuda_available():
+        from fastducc.gpu_nufft import gpu_store_to_host_ragged
+
+        res_sub_gpu = stream_ms_to_ragged_csr(
+            ms_path,
+            npix_x=64,
+            npix_y=64,
+            pixsize_arcsec=60.0,
+            dm=80.0,
+            dedisp_mode="subbanded",
+            nsubbands=8,
+            mode="wgridder",
+            do_wgridding=False,
+            min_valid_channels=4,
+            uv_threshold=1e-6,
+            device="cuda",
+        )
+        assert res_sub_gpu.attrs["dedisp_mode"] == "subbanded"
+        assert res_sub_gpu.m_total == res_sub.m_total
+        assert res_sub_gpu.nnz_total == res_sub.nnz_total
+        host_from_gpu = gpu_store_to_host_ragged(res_sub_gpu.gpu_store)
+        assert np.array_equal(host_from_gpu.cell_uv, res_sub.store.cell_uv)
+        assert np.array_equal(host_from_gpu.cell_offsets, res_sub.store.cell_offsets)
+        assert _rel_l2_error(host_from_gpu.vis_data, res_sub.store.vis_data) < 1e-5
