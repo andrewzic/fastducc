@@ -2642,6 +2642,7 @@ def iter_ms_to_ragged_csr_subbanded(
     return_csr_matrix: bool = False,
     use_numba: bool = True,
     scratch_dir: Optional[str] = None,
+    max_fine_per_pass: Optional[int] = None,
 ) -> Iterator[Tuple[int, float, DirectRasterResult]]:
     """
     Two-Tier Subbanded multi-DM streaming generator.
@@ -2744,19 +2745,33 @@ def iter_ms_to_ragged_csr_subbanded(
         n_subbands=eff_nsub,
     )
 
-    # Group supplied fine DM trials onto the plan's coarse DM centres
-    coarse_groups: Dict[int, List[int]] = {}
+    # Group supplied fine DM trials onto the plan's coarse DM centres, splitting
+    # large coarse bins into memory-safe sub-passes for long whole-observation runs.
+    coarse_groups_raw: Dict[int, List[int]] = {}
     for pos_i, dm_f in enumerate(dm_list):
         ic = int(np.argmin(np.abs(plan.coarse_dms - dm_f)))
-        coarse_groups.setdefault(ic, []).append(pos_i)
+        coarse_groups_raw.setdefault(ic, []).append(pos_i)
+
+    eff_max_fine = max_fine_per_pass
+    if eff_max_fine is None:
+        # Cap concurrent fine DMs per pass on long (>20k plane) observations so
+        # in-memory CSR fragments stay comfortably within host RAM with zero disk I/O.
+        eff_max_fine = 2 if total_planes > 20_000 else max(1, len(dm_list))
+    eff_max_fine = max(1, int(eff_max_fine))
+
+    coarse_passes: List[Tuple[int, List[int]]] = []
+    for ic, positions in sorted(coarse_groups_raw.items()):
+        for s_i in range(0, len(positions), eff_max_fine):
+            coarse_passes.append((ic, positions[s_i : s_i + eff_max_fine]))
 
     logger.info(
         "[Subbanded Multi-DM] Partitioned %d fine DM trials into %d coarse MS passes "
-        "(n_subbands=%d, coarse_dm_step=%.2f pc cm^-3, prescan=%.2fs).",
+        "(n_subbands=%d, coarse_dm_step=%.2f pc cm^-3, max_fine_per_pass=%d, prescan=%.2fs).",
         len(dm_list),
-        len(coarse_groups),
+        len(coarse_passes),
         eff_nsub,
         plan.coarse_dm_step,
+        eff_max_fine,
         t_prescan,
     )
 
@@ -2772,7 +2787,7 @@ def iter_ms_to_ragged_csr_subbanded(
     has_any_wgt_spec = any(e.has_weight_spectrum for e in meta["entries"])
     has_any_flag_row = any(e.has_flag_row for e in meta["entries"])
 
-    for coarse_pass_i, (ic, fine_positions) in enumerate(sorted(coarse_groups.items())):
+    for coarse_pass_i, (ic, fine_positions) in enumerate(coarse_passes):
         t_pass0 = time.time()
         dm_coarse = float(plan.coarse_dms[ic])
         fine_dms_bin = [dm_list[p] for p in fine_positions]
@@ -2798,7 +2813,7 @@ def iter_ms_to_ragged_csr_subbanded(
             "[Subbanded Pass %d/%d] Coarse DM=%.2f pc cm^-3 covering %d fine trial(s): %s "
             "(max_intra=%d, max_inter=%d samps)",
             coarse_pass_i + 1,
-            len(coarse_groups),
+            len(coarse_passes),
             dm_coarse,
             n_fine_bin,
             [round(d, 2) for d in fine_dms_bin],
@@ -2807,18 +2822,11 @@ def iter_ms_to_ragged_csr_subbanded(
         )
 
         if eff_device == "cuda":
-            import tempfile
-            import uuid
-            from fastducc.ragged import read_ragged_fragment, write_ragged_fragment
             from fastducc.ragged_gpu import consolidate_device_chunks_to_gpu_store
 
-            base_scratch = scratch_dir or os.environ.get("JOBFS") or tempfile.gettempdir()
-            pass_frag_dir = os.path.join(
-                base_scratch, f"subband_pass{coarse_pass_i}_{os.getpid()}_{uuid.uuid4().hex[:6]}"
-            )
-            os.makedirs(pass_frag_dir, exist_ok=True)
-            frag_paths_per_dm: List[List[str]] = [[] for _ in range(n_fine_bin)]
-            frag_seq = [0]
+            host_chunks_per_dm: List[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = [
+                [] for _ in range(n_fine_bin)
+            ]
 
             with cp.cuda.Device(int(device_id)):
                 free_vram, _ = cp.cuda.Device(int(device_id)).mem_info
@@ -2989,8 +2997,6 @@ def iter_ms_to_ragged_csr_subbanded(
                         ) * dt_nominal
                         d_t_chunk = cp.asarray(t_chunk_host, dtype=cp.float64)
 
-                        cur_seq = frag_seq[0]
-                        frag_seq[0] += 1
                         for j_dm in range(n_fine_bin):
                             d_slice = d_dedisp_batch[j_dm]
                             if regularize_time and abs(shift_samps) > 1e-7 and shift_domain == "gridded":
@@ -3002,20 +3008,7 @@ def iter_ms_to_ragged_csr_subbanded(
                                 return_host=True,
                             )
                             if int(v_data.size) > 0:
-                                fpath = os.path.join(pass_frag_dir, f"dm{j_dm:03d}_chunk{cur_seq:05d}.csr.bin")
-                                write_ragged_fragment(
-                                    filepath=fpath,
-                                    chunk_idx=cur_seq,
-                                    cell_indices=c_idx,
-                                    cell_counts=c_cnt,
-                                    vis_data=v_data,
-                                    vis_times=v_times,
-                                    t_start=float(t_chunk_host[0]) if t_chunk_host.size > 0 else 0.0,
-                                    dt=dt_nominal,
-                                    threshold=float(uv_threshold),
-                                )
-                                frag_paths_per_dm[j_dm].append(fpath)
-                            del c_idx, c_cnt, v_data, v_times
+                                host_chunks_per_dm[j_dm].append((c_idx, c_cnt, v_data, v_times))
 
                         del d_dedisp_batch, d_t_chunk
                         if w_vis is not d_vis_stage:
@@ -3210,23 +3203,11 @@ def iter_ms_to_ragged_csr_subbanded(
                         dedisp_mode="subbanded",
                         nsubbands=eff_nsub,
                     )
-                    dev_chunks_j = []
-                    for fpath in frag_paths_per_dm[j_dm]:
-                        frag = read_ragged_fragment(fpath)
-                        dev_chunks_j.append(
-                            (
-                                cp.asarray(frag["cell_indices"], dtype=cp.uint32),
-                                cp.asarray(frag["cell_counts"], dtype=cp.uint16),
-                                cp.asarray(frag["vis_data"], dtype=cp.complex64),
-                                cp.asarray(frag["vis_times"], dtype=cp.float64),
-                            )
-                        )
-                        del frag
-                        try:
-                            os.remove(fpath)
-                        except OSError:
-                            pass
-                    frag_paths_per_dm[j_dm].clear()
+                    dev_chunks_j = [
+                        (cp.asarray(ci), cp.asarray(cc), cp.asarray(vd), cp.asarray(vt))
+                        for ci, cc, vd, vt in host_chunks_per_dm[j_dm]
+                    ]
+                    host_chunks_per_dm[j_dm].clear()
 
                     gpu_dict = consolidate_device_chunks_to_gpu_store(
                         device_chunks=dev_chunks_j,
@@ -3272,7 +3253,6 @@ def iter_ms_to_ragged_csr_subbanded(
                     )
                 del d_sparse_uv
                 cp.get_default_memory_pool().free_all_blocks()
-            shutil.rmtree(pass_frag_dir, ignore_errors=True)
         else:
             # CPU fallback: stream each fine DM via stream_ms_to_ragged_csr(dedisp_mode="subbanded")
             for dm_idx_val, dm_val in zip(fine_ids_bin, fine_dms_bin):
