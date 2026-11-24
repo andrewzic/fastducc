@@ -110,7 +110,13 @@ def build_cli_periodicity(argv: Sequence[str] | None = None) -> argparse.Namespa
         "--nsubbands",
         type=int,
         default=16,
-        help="Number of coarse frequency subbands for two-tier subbanded dedispersion (default: 16)",
+        help="Number of coarse frequency subbands for two-tier subbanded dedispersion (--dedisp-mode subbanded, default: 16)",
+    )
+    p.add_argument(
+        "--grid-freq-bins",
+        type=int,
+        default=0,
+        help="Optional pre-gridding frequency channel averaging bins in fullband mode (0 = disabled, grid all native channels; default: 0)",
     )
     p.add_argument("--eps", type=float, default=1e-5, help="DUCC NUFFT tolerance")
     p.add_argument("--do-wstacking", action="store_true", default=True, help="Enable 3-D W-stacking to correct non-coplanar baseline phase errors (default: True)")

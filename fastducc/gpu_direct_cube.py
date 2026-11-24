@@ -2300,6 +2300,7 @@ def stream_ms_to_ragged_csr(
     align_to: str = "fmax",
     collapse_channels: bool = False,
     nsubbands: int = 1,
+    grid_freq_bins: Optional[int] = None,
     exact_uvw: bool = True,
     mode: str = "wgridder",
     epsilon: float = 1e-5,
@@ -2319,7 +2320,7 @@ def stream_ms_to_ragged_csr(
     supp: Optional[int] = None,
     min_valid_channels: int = 24,
     min_uv_distance_m: Optional[float] = None,
-    uv_threshold: float = 1e-4,
+    uv_threshold: float = 6e-6,
     row_chunk_size: int = 300_000,
     sparse_grid_plan: Optional[Dict[str, Any]] = None,
     active_only: bool = True,
@@ -2440,7 +2441,10 @@ def stream_ms_to_ragged_csr(
 
     chan_freq = meta["chan_freq"]
     dt_nominal = float(meta["time_info"]["dt_nominal"])
-    eff_nsubbands = int(nsubbands)
+    if eff_dedisp_mode == "fullband" and grid_freq_bins is not None and int(grid_freq_bins) > 1:
+        eff_nsubbands = int(grid_freq_bins)
+    else:
+        eff_nsubbands = int(nsubbands)
     intra_delays_host: Optional[np.ndarray] = None
     inter_delays_host: Optional[np.ndarray] = None
     max_inter_delay = 0
@@ -2633,7 +2637,7 @@ def iter_ms_to_ragged_csr_subbanded(
     supp: Optional[int] = None,
     min_valid_channels: int = 24,
     min_uv_distance_m: Optional[float] = None,
-    uv_threshold: float = 1e-4,
+    uv_threshold: float = 6e-6,
     row_chunk_size: int = 300_000,
     sparse_grid_plan: Optional[Dict[str, Any]] = None,
     active_only: bool = True,

@@ -600,3 +600,82 @@ def test_stream_ms_to_ragged_csr_subbanded_mode(tmp_path):
         assert np.array_equal(host_from_gpu.cell_uv, res_sub.store.cell_uv)
         assert np.array_equal(host_from_gpu.cell_offsets, res_sub.store.cell_offsets)
         assert _rel_l2_error(host_from_gpu.vis_data, res_sub.store.vis_data) < 1e-5
+
+
+def test_wgridder_default_vis2grid_normalisation_and_scale_invariance():
+    """
+    Verify that wgridder defaults to DUCC vis2grid/vis2dirty normalisation
+    (norm_div_mode=1) and that gridded peak dirty flux is invariant across
+    native channels (nsubbands=1), binned frequency channels, and full collapse.
+    """
+    from fastducc.gpu_raster import _resolve_normalise_mode
+
+    assert _resolve_normalise_mode(2, None) == (True, 1)
+    assert _resolve_normalise_mode(2, "auto") == (True, 1)
+    assert _resolve_normalise_mode(2, "vis2grid") == (True, 1)
+    assert _resolve_normalise_mode(2, "vis2dirty") == (True, 1)
+    assert _resolve_normalise_mode(2, "baseline") == (True, 2)
+
+    vis_3d, wgt_3d, uvw_3d, freqs_hz = _synthesise_dispersed_pulse(
+        n_ant=8,
+        n_chan=32,
+        n_time=32,
+        t_samp_s=0.01,
+        pulse_dm=0.0,
+        pulse_t0_s=0.10,
+        pulse_width_s=0.02,
+        pulse_flux_jy=5.0,
+        source_l_deg=0.0,
+        source_m_deg=0.0,
+        seed=7,
+    )
+    geom = compute_raster_grid_geometry(npix_x=64, npix_y=64, pixsize_arcsec=60.0, mode="wgridder")
+    grid_nu = int(geom["grid_nu"])
+
+    g_native = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d, wgt_3d, uvw_3d, freqs_hz,
+        dm=0.0, dt=0.01, collapse_channels=False, nsubbands=1,
+        npix_x=64, npix_y=64, pixsize_arcsec=60.0,
+        mode="wgridder", do_wgridding=False, min_valid_channels=1, uv_threshold=0.0,
+    )
+    g_bins4 = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d, wgt_3d, uvw_3d, freqs_hz,
+        dm=0.0, dt=0.01, collapse_channels=False, nsubbands=4,
+        npix_x=64, npix_y=64, pixsize_arcsec=60.0,
+        mode="wgridder", do_wgridding=False, min_valid_channels=1, uv_threshold=0.0,
+    )
+    g_coll = dedisperse_and_rasterise_chunk_cpu(
+        vis_3d, wgt_3d, uvw_3d, freqs_hz,
+        dm=0.0, dt=0.01, collapse_channels=True, nsubbands=1,
+        npix_x=64, npix_y=64, pixsize_arcsec=60.0,
+        mode="wgridder", do_wgridding=False, min_valid_channels=1, uv_threshold=0.0,
+    )
+
+    p_native = float(np.max(_invert_halfplane_to_dirty(g_native, grid_nu, 64, 64)))
+    p_bins4 = float(np.max(_invert_halfplane_to_dirty(g_bins4, grid_nu, 64, 64)))
+    p_coll = float(np.max(_invert_halfplane_to_dirty(g_coll, grid_nu, 64, 64)))
+
+    assert abs(p_bins4 - p_native) / p_native < 1e-2
+    assert abs(p_coll - p_native) / p_native < 1e-2
+
+
+def test_cli_grid_freq_bins_decoupled_from_nsubbands():
+    """
+    Verify --grid-freq-bins defaults to 0 (true native-channel fullband gridding)
+    and is distinct from two-tier --nsubbands.
+    """
+    args_search = build_cli_search(["--msname", "dummy.ms", "--dedisp-mode", "fullband"])
+    assert args_search.dedisp_mode == "fullband"
+    assert args_search.grid_freq_bins == 0
+    assert args_search.nsubbands == 16
+
+    args_search_binned = build_cli_search(
+        ["--msname", "dummy.ms", "--dedisp-mode", "fullband", "--grid-freq-bins", "32"]
+    )
+    assert args_search_binned.grid_freq_bins == 32
+
+    args_per = cli.build_cli_periodicity(["--msname", "dummy.ms", "--dedisp-mode", "fullband"])
+    assert args_per.dedisp_mode == "fullband"
+    assert args_per.grid_freq_bins == 0
+    assert args_per.nsubbands == 16
+

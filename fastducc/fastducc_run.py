@@ -183,7 +183,9 @@ def build_cli(argv=None):
         help_false='Retain channel dimension when imaging (default: True).',
     )
     parser.add_argument('--nsubbands', type=int, default=16,
-                        help='Number of subbands to divide the bandwidth into (default: 16).')
+                        help='Number of coarse frequency subbands for two-tier subbanded dedispersion (--dedisp-mode subbanded, default: 16).')
+    parser.add_argument('--grid-freq-bins', type=int, default=0,
+                        help='Optional pre-gridding frequency channel averaging bins in fullband mode (0 = disabled, grid all native channels; default: 0).')
     parser.add_argument('--dm-list', type=float, nargs='+', default=None,
                         help='Explicit list of trial DMs (pc cm^-3), e.g. --dm-list 0.0 100.0 160.0 186.4 210.0')
     parser.add_argument('--scan-id', '--scan', dest='scan_id', default=None,
@@ -362,7 +364,11 @@ def make_config(args, paths) -> Config:
         current_dm = 0.0
     dedisp_mode = getattr(args, "dedisp_mode", "subbanded")
     collapse_channels = getattr(args, "collapse_channels", False)
-    nsubbands = getattr(args, "nsubbands", 16)
+    if str(dedisp_mode).strip().lower() == "fullband":
+        grid_freq_bins = int(getattr(args, "grid_freq_bins", 0) or 0)
+        nsubbands = grid_freq_bins if grid_freq_bins > 1 else 1
+    else:
+        nsubbands = int(getattr(args, "nsubbands", 16))
     nthreads = args.nthreads if args.nthreads > 0 else (args.slurm_cores_per_worker if getattr(args, "parallel_mode", "") == 'dask-slurm' else 0)
     return Config(
         msname=args.msname,

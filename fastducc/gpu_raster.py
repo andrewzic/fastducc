@@ -3007,29 +3007,30 @@ def _resolve_normalise_mode(mode_id: int, normalise_mode: Optional[str]) -> Tupl
     Resolve weight normalisation mode into ``(use_snapshot_norm, norm_div_mode)``.
     - For ``nearest`` (``mode_id=0``) and ``bilinear`` (``mode_id=1``), ``"auto"`` uses
       per-cell weight normalisation (``use_snapshot_norm=False``).
-    - For ``wgridder`` (``mode_id=2``), ``"auto"`` uses per-baseline snapshot natural
-      weighting (``use_snapshot_norm=True, norm_div_mode=2``, ``denom = wgt_max * nsub_eff``)
-      which preserves the exact DUCC polynomial kernel shape $k_u(\delta u) k_v(\delta v)$
-      and natural baseline weighting while keeping per-baseline UV cell amplitudes at
-      $\mathcal{O}(|V|)$ so ``uv_threshold`` prunes only the outer kernel wings.
-    - Pass ``normalise_mode="vis2grid"`` (or ``"snapshot"``) for DUCC ``vis2grid`` per-snapshot
-      natural weighting across all ``(baseline, subband)`` pairs (``denom = wgt_max * n_valid``).
+    - For ``wgridder`` (``mode_id=2``), ``"auto"`` uses DUCC ``vis2grid`` / ``vis2dirty``
+      per-snapshot natural weighting across all ``(baseline, channel/bin)`` pairs
+      (``use_snapshot_norm=True, norm_div_mode=1``, ``denom = wgt_max * n_valid``).
+      This preserves the exact DUCC polynomial kernel shape $k_u(\delta u) k_v(\delta v)$,
+      matches ``ducc0.wgridder.vis2grid(..., divide_by_n=True)``, and keeps gridded UV
+      amplitudes invariant to frequency binning (``nsub_eff``).
+    - Pass ``normalise_mode="baseline"`` for legacy per-baseline normalisation
+      (``denom = wgt_max * nbl_eff``).
     """
     if normalise_mode is None or str(normalise_mode).strip().lower() == "auto":
         if mode_id == 2:
-            return True, 2
+            return True, 1
         return False, 0
     nm = str(normalise_mode).strip().lower()
     if nm in ("cell", "uniform"):
         return False, 0
     if nm in ("baseline", "subband"):
         return True, 2
-    if nm in ("vis2grid", "snapshot", "natural"):
+    if nm in ("vis2grid", "vis2dirty", "snapshot", "natural"):
         return True, 1
     if nm in ("wmax", "unnormalised", "none"):
         return True, 0
     raise ValueError(
-        f"Unsupported normalise_mode='{normalise_mode}'; expected 'auto', 'baseline', 'cell', 'vis2grid', or 'wmax'."
+        f"Unsupported normalise_mode='{normalise_mode}'; expected 'auto', 'vis2grid', 'vis2dirty', 'baseline', 'cell', or 'wmax'."
     )
 
 
