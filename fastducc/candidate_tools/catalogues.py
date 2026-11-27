@@ -146,21 +146,51 @@ def _nearest_within_radius(target: SkyCoord, cat: SkyCoord, radius: u.Quantity) 
     return -1, None
 
 
+_PSRCAT_HARMONIC_RATIOS = (1.0, 0.5, 1.0 / 3.0, 0.25, 0.2, 2.0, 3.0, 4.0, 5.0)
+
+
+def _is_harmonic_period_match(
+    cand_period_s: float,
+    cat_period_s: float,
+    period_tol_frac: float = 0.02,
+) -> bool:
+    """Return True if cand_period_s matches cat_period_s at fundamental or harmonic ratio."""
+    import math
+
+    if not (math.isfinite(cand_period_s) and cand_period_s > 0.0 and math.isfinite(cat_period_s) and cat_period_s > 0.0):
+        return False
+    ratio = cand_period_s / cat_period_s
+    for target in _PSRCAT_HARMONIC_RATIOS:
+        if abs(ratio - target) / target <= period_tol_frac:
+            return True
+    return False
+
+
 def annotate_observation_with_catalogues(
     out_tab: Table,
     *,
     psrcat_csv_path: Optional[str] = None,
     racs_vot_path: Optional[str] = None,
     match_radius_arcsec: float = 40.0,
+    psrcat_match_radius_arcsec: Optional[float] = None,
+    psrcat_period_tol_frac: float = 0.02,
     simbad_enable: bool = True,
 ) -> Table:
     """
-    Enrich an observation-level candidate table with three new columns:
+    Enrich an observation-level candidate table with catalogue cross-matches:
       - 'source_name'           (str)    : matched name or 'unknown'
       - 'source_offset_arcsec'  (float)  : match separation in arcsec (NaN if unknown)
       - 'source_catalog'        (str)    : 'PSRCAT' | 'RACS' | 'SIMBAD' | ''
     Priority: PSRCAT -> RACS -> SIMBAD (if still unmatched).
+
+    RACS and SIMBAD use the tight ``match_radius_arcsec`` (default 40").
+    PSRCAT uses ``psrcat_match_radius_arcsec`` (falling back to ``match_radius_arcsec``
+    if omitted); when candidate periods are present in ``out_tab`` (``period_s`` or
+    ``f_hz``), PSRCAT matches beyond ``match_radius_arcsec`` require a fundamental or
+    harmonic period match within ``psrcat_period_tol_frac`` (default 2%).
     """
+    import numpy as np
+
     if not (("ra_deg" in out_tab.colnames) and ("dec_deg" in out_tab.colnames)):
         raise ValueError("Expected 'ra_deg' and 'dec_deg' columns in observation table")
 
@@ -180,19 +210,49 @@ def annotate_observation_with_catalogues(
     racs_flx_mjy = [float("nan")] * len(out_tab)
 
     cand_coord = SkyCoord(out_tab["ra_deg"], out_tab["dec_deg"], unit="deg", frame="icrs")
-    radius = match_radius_arcsec * u.arcsec
+    radius = float(match_radius_arcsec) * u.arcsec
+    eff_psrcat_radius_arcsec = (
+        float(psrcat_match_radius_arcsec)
+        if (psrcat_match_radius_arcsec is not None and float(psrcat_match_radius_arcsec) > 0.0)
+        else float(match_radius_arcsec)
+    )
+    psrcat_radius = eff_psrcat_radius_arcsec * u.arcsec
 
-    # 1) PSRCAT (optional)
+    # Extract candidate periods if available for harmonic PSRCAT matching
+    cand_periods = np.full(len(out_tab), np.nan, dtype=np.float64)
+    p_col = next((c for c in ("period_s", "p_refined", "period", "p0") if c in out_tab.colnames), None)
+    f_col = next((c for c in ("f_hz", "f0", "freq_hz") if c in out_tab.colnames), None)
+    if p_col is not None:
+        for i in range(len(out_tab)):
+            try:
+                val = float(out_tab[p_col][i])
+                if np.isfinite(val) and val > 0.0:
+                    cand_periods[i] = val
+            except (TypeError, ValueError):
+                pass
+    elif f_col is not None:
+        for i in range(len(out_tab)):
+            try:
+                val = float(out_tab[f_col][i])
+                if np.isfinite(val) and val > 0.0:
+                    cand_periods[i] = 1.0 / val
+            except (TypeError, ValueError):
+                pass
+
+    # 1) PSRCAT (optional): search all pulsars within psrcat_radius for harmonic/positional matching
     psrcat_tbl = None
-    idx_psr = None
-    sep_psr = None
+    psr_candidates_per_row: dict[int, list[tuple[float, int]]] = {}
     if psrcat_csv_path:
         psrcat_tbl = _load_psrcat_csv(psrcat_csv_path)
         psrcat_coord = SkyCoord(psrcat_tbl["ra_deg"], psrcat_tbl["dec_deg"], unit="deg", frame="icrs")
         if len(psrcat_coord) > 0 and len(cand_coord) > 0:
-            idx_psr, sep_psr, _ = cand_coord.match_to_catalog_sky(psrcat_coord)
+            idx_c, idx_p, sep_2d, _ = psrcat_coord.search_around_sky(cand_coord, psrcat_radius)
+            for ci, pi, sep_val in zip(idx_c, idx_p, sep_2d.to(u.arcsec).value):
+                psr_candidates_per_row.setdefault(int(ci), []).append((float(sep_val), int(pi)))
+            for ci in psr_candidates_per_row:
+                psr_candidates_per_row[ci].sort(key=lambda item: item[0])
 
-    # 2) RACS (optional)
+    # 2) RACS (optional): always uses tight match_radius_arcsec
     racs_tbl = None
     idx_racs = None
     sep_racs = None
@@ -206,22 +266,47 @@ def annotate_observation_with_catalogues(
     for i in range(len(out_tab)):
         tcoord = cand_coord[i]
 
-        # Check PSRCAT match
-        if idx_psr is not None and sep_psr[i] <= radius:
-            j = int(idx_psr[i])
-            m_name = str(psrcat_tbl["src_name"][j])
-            m_sep = float(sep_psr[i].to(u.arcsec).value)
-            is_psrcat[i] = True
-            psr_name[i] = m_name
-            psr_sep[i] = m_sep
-            if "p0" in psrcat_tbl.colnames:
-                psr_p0[i] = float(psrcat_tbl["p0"][j])
-            if "dm" in psrcat_tbl.colnames:
-                psr_dm[i] = float(psrcat_tbl["dm"][j])
+        # Check PSRCAT match (prefer nearest harmonic period match within psrcat_radius;
+        # fall back to positional-only match strictly within match_radius_arcsec when no period is available)
+        if psrcat_tbl is not None and i in psr_candidates_per_row:
+            cand_p = float(cand_periods[i])
+            has_cand_p = np.isfinite(cand_p) and cand_p > 0.0
+            chosen_match: Optional[tuple[float, int]] = None
 
-            source_name[i] = m_name
-            source_offset[i] = m_sep
-            source_cat[i] = "PSRCAT"
+            if has_cand_p:
+                for sep_a, j in psr_candidates_per_row[i]:
+                    cat_p0 = float(psrcat_tbl["p0"][j]) if "p0" in psrcat_tbl.colnames else float("nan")
+                    if _is_harmonic_period_match(cand_p, cat_p0, period_tol_frac=psrcat_period_tol_frac):
+                        chosen_match = (sep_a, j)
+                        break
+                if chosen_match is None:
+                    # Positional fallback inside tight radius only if PSRCAT lacks P0
+                    for sep_a, j in psr_candidates_per_row[i]:
+                        if sep_a <= float(match_radius_arcsec):
+                            cat_p0 = float(psrcat_tbl["p0"][j]) if "p0" in psrcat_tbl.colnames else float("nan")
+                            if not np.isfinite(cat_p0):
+                                chosen_match = (sep_a, j)
+                                break
+            else:
+                for sep_a, j in psr_candidates_per_row[i]:
+                    if sep_a <= float(match_radius_arcsec):
+                        chosen_match = (sep_a, j)
+                        break
+
+            if chosen_match is not None:
+                m_sep, j = chosen_match
+                m_name = str(psrcat_tbl["src_name"][j])
+                is_psrcat[i] = True
+                psr_name[i] = m_name
+                psr_sep[i] = m_sep
+                if "p0" in psrcat_tbl.colnames:
+                    psr_p0[i] = float(psrcat_tbl["p0"][j])
+                if "dm" in psrcat_tbl.colnames:
+                    psr_dm[i] = float(psrcat_tbl["dm"][j])
+
+                source_name[i] = m_name
+                source_offset[i] = m_sep
+                source_cat[i] = "PSRCAT"
 
         # Check RACS match
         if idx_racs is not None and sep_racs[i] <= radius:
