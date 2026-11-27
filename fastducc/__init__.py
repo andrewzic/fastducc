@@ -37,6 +37,7 @@ __all__ = [
     "ms_utils",
     "wcs",
     "candidates",
+    "candidate_store",
     "fd_types",
     "timeshift",
     "baseline_ffa",

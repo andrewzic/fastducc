@@ -1004,6 +1004,41 @@ def aggregate_observation_from_super_summaries(
 
     field = field_for_name or "field"
     sbid = sbid_for_name or os.path.basename(os.path.abspath(obs_root))
+
+    # Consolidate per-(method, beam, DM) HDF5 trial containers into one exemplar HDF5 for this method
+    try:
+        from fastducc.candidate_store import (
+            build_consolidated_h5_path,
+            consolidate_candidate_h5,
+            discover_trial_h5_files,
+        )
+
+        h5_search_dirs = [out_dir, os.path.join(obs_root, "candidates")]
+        for sub_cand in sorted(glob.glob(os.path.join(obs_root, "*", "candidates"))):
+            if os.path.isdir(sub_cand) and sub_cand not in h5_search_dirs:
+                h5_search_dirs.append(sub_cand)
+        trial_h5s = discover_trial_h5_files(h5_search_dirs, method=kind)
+        if trial_h5s and len(out_tab) > 0:
+            cons_h5_path = build_consolidated_h5_path(out_dir, method=kind, sbid=sbid, field=field)
+            _, matched_pairs = consolidate_candidate_h5(
+                trial_h5s,
+                out_tab,
+                cons_h5_path,
+                method=kind,
+                sbid=sbid,
+                field=field,
+            )
+            if matched_pairs:
+                products_h5_col = [""] * len(out_tab)
+                h5_index_col = [-1] * len(out_tab)
+                for ex_i, new_i in matched_pairs:
+                    products_h5_col[ex_i] = str(cons_h5_path)
+                    h5_index_col[ex_i] = int(new_i)
+                out_tab["products_h5"] = products_h5_col
+                out_tab["h5_index"] = h5_index_col
+    except Exception as e:
+        logger.warning(f"[ObsSuper] Consolidated HDF5 build failed: {e}")
+
     csv_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.csv")
     vot_out = os.path.join(out_dir, f"{field}.{sbid}_obs_{kind}_super_summary.vot")
     out_tab.write(csv_out, format="csv", overwrite=True)

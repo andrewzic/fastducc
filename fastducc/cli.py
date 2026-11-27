@@ -260,6 +260,8 @@ Available Subcommands:
   aggregate_obs         Aggregate cross-beam super summaries across an SBID observation
   periodicity           3D DUCC NUFFT periodicity search on MS visibilities
   extract_ds (extract-ds) High-performance in-memory phased visibility dynamic spectrum extraction
+  merge_h5 (merge-h5)   Merge or consolidate per-(method, beam, DM) candidate HDF5 containers
+  plot_h5 (plot-h5)     Render FastDUCC candidate summary PDFs from a candidate HDF5 container
 
 Quick Examples:
   fastducc --msname /path/to/MS --chunk-size 512
@@ -449,6 +451,104 @@ def run_extract_ds(argv: Sequence[str]) -> int:
     return 0
 
 
+def build_cli_merge_h5(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """CLI parser for 'fastducc merge_h5'."""
+    p = argparse.ArgumentParser(
+        prog="fastducc merge_h5",
+        description="Merge or consolidate per-(method, beam, DM) candidate HDF5 containers",
+    )
+    p.add_argument("--inputs", nargs="+", default=None, help="Explicit input candidate HDF5 file paths")
+    p.add_argument("--search-dir", nargs="+", default=None, help="Directories to discover per-(method, beam, DM) HDF5 files")
+    p.add_argument("--method", choices=["boxcar", "variance", "ffa", "nufft"], default=None, help="Filter/label search method")
+    p.add_argument("--exemplars", default=None, help="Optional exemplar catalogue (CSV or VOTable) to consolidate only exemplar candidates")
+    p.add_argument("--out", "-o", required=True, help="Output merged or consolidated HDF5 file path")
+    p.add_argument("--sbid", default="", help="Observation SBID metadata")
+    p.add_argument("--field", default="", help="Observation field metadata")
+    p.add_argument("--remove-inputs", action="store_true", help="Remove input HDF5 files after successful merge (ignored in consolidate mode)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
+    return p.parse_args(argv)
+
+
+def build_cli_plot_h5(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """CLI parser for 'fastducc plot_h5'."""
+    p = argparse.ArgumentParser(
+        prog="fastducc plot_h5",
+        description="Render FastDUCC candidate summary PDFs directly from a candidate HDF5 container",
+    )
+    p.add_argument("--h5", required=True, help="Path to candidate HDF5 container")
+    p.add_argument("--outdir", "-o", required=True, help="Output directory for rendered summary PDFs")
+    p.add_argument("--srcname", nargs="+", default=None, help="Specific candidate srcname(s) to plot")
+    p.add_argument("--top", type=int, default=20, help="Number of top-S/N candidates to plot when --srcname is omitted (default: 20)")
+    p.add_argument("--continuum-dir", default=None, help="Directory containing continuum reference FITS images")
+    p.add_argument("--dpi", type=int, default=200, help="Output figure DPI (default: 200)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
+    return p.parse_args(argv)
+
+
+def run_merge_h5(argv: Sequence[str]) -> int:
+    """Execute HDF5 candidate merge or exemplar consolidation."""
+    from astropy.table import Table
+    from fastducc.candidate_store import (
+        consolidate_candidate_h5,
+        discover_trial_h5_files,
+        merge_candidate_h5,
+    )
+
+    args = build_cli_merge_h5(list(argv))
+    in_paths = list(args.inputs or [])
+    if args.search_dir:
+        in_paths.extend(str(p) for p in discover_trial_h5_files(args.search_dir, method=args.method))
+    if not in_paths:
+        logger.error("No input candidate HDF5 files found.")
+        return 1
+
+    if args.exemplars:
+        fmt = "votable" if str(args.exemplars).endswith((".vot", ".xml")) else "ascii.csv"
+        tab = Table.read(args.exemplars, format=fmt)
+        out_p, matched = consolidate_candidate_h5(
+            in_paths,
+            tab,
+            args.out,
+            method=args.method,
+            sbid=args.sbid,
+            field=args.field,
+        )
+        logger.info("Wrote consolidated exemplar HDF5 (%d/%d matched) -> %s", len(matched), len(tab), out_p)
+    else:
+        out_p = merge_candidate_h5(
+            in_paths,
+            args.out,
+            method=args.method,
+            sbid=args.sbid,
+            field=args.field,
+            remove_inputs=args.remove_inputs,
+        )
+        logger.info("Wrote merged candidate HDF5 -> %s", out_p)
+    return 0
+
+
+def run_plot_h5(argv: Sequence[str]) -> int:
+    """Render candidate summary plots directly from a candidate HDF5 container."""
+    from pathlib import Path
+    from fastducc.candidate_store import CandidateStore
+
+    args = build_cli_plot_h5(list(argv))
+    out_dir = Path(args.outdir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with CandidateStore(args.h5) as store:
+        if args.srcname:
+            recs = [store[s] for s in args.srcname if s in store]
+        else:
+            recs = store.top(args.top)
+        for rank, rec in enumerate(recs, start=1):
+            stem = f"{rec.srcname or f'cand{rec.cand_idx:04d}'}_{rec.beam or 'beamXX'}_dm{rec.dm:.2f}_{rec.method}_rank{rank:04d}"
+            out_pdf = out_dir / f"{stem}_summary.pdf"
+            rec.plot_summary(out_pdf, continuum_dir=args.continuum_dir, dpi=args.dpi)
+        logger.info("Rendered %d summary plot(s) from %s -> %s", len(recs), args.h5, out_dir)
+    return 0
+
+
 # Subcommand dispatch table
 _SUBCOMMAND_DISPATCH = {
     "search": run_search,
@@ -463,6 +563,10 @@ _SUBCOMMAND_DISPATCH = {
     "extract_ds": run_extract_ds,
     "extract-ds": run_extract_ds,
     "dynspec": run_extract_ds,
+    "merge_h5": run_merge_h5,
+    "merge-h5": run_merge_h5,
+    "plot_h5": run_plot_h5,
+    "plot-h5": run_plot_h5,
 }
 
 

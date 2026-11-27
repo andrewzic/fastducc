@@ -42,6 +42,7 @@ from fastducc.candidate_tools.plotting import (
     save_candidate_snippet_products,
     save_periodicity_candidate_summary,
     update_candidate_summary_with_dynspec,
+    render_candidate_summary_from_record,
 )
 from fastducc.candidate_tools.catalogs import (
     _load_psrcat_csv,
@@ -67,8 +68,41 @@ from fastducc.candidate_tools.aggregation import (
 from fastducc.candidate_tools.organization import (
     organize_candidate_outputs,
 )
+from fastducc.candidate_store import (
+    CandidateHDF5Writer,
+    CandidateHDF5Reader,
+    CandidateStore,
+    CandidateRecord,
+    Lightcurve,
+    Spectrum,
+    DynamicSpectrum,
+    open_candidates,
+    build_trial_h5_path,
+    build_consolidated_h5_path,
+    discover_trial_h5_files,
+    merge_candidate_h5,
+    consolidate_candidate_h5,
+    is_valid_candidates_h5,
+    materialize_candidate_products_from_h5,
+)
 
 __all__ = [
+    # Monolithic HDF5 candidate store & API
+    "CandidateHDF5Writer",
+    "CandidateHDF5Reader",
+    "CandidateStore",
+    "CandidateRecord",
+    "Lightcurve",
+    "Spectrum",
+    "DynamicSpectrum",
+    "open_candidates",
+    "build_trial_h5_path",
+    "build_consolidated_h5_path",
+    "discover_trial_h5_files",
+    "merge_candidate_h5",
+    "consolidate_candidate_h5",
+    "is_valid_candidates_h5",
+    "materialize_candidate_products_from_h5",
     # Table serialization & conversions
     "candidates_to_astropy_table",
     "candidates_to_astropy_table_periodicity",
@@ -85,6 +119,7 @@ __all__ = [
     "save_periodicity_candidate_summary",
     "save_candidate_snippet_products",
     "update_candidate_summary_with_dynspec",
+    "render_candidate_summary_from_record",
     # Catalog annotation & crossmatch
     "annotate_observation_with_catalogs",
     # Region files (DS9 & Karma)

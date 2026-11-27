@@ -9,8 +9,17 @@ from astropy.io import fits
 from fastducc import wcs as ducc_wcs
 from fastducc.fd_types import Config
 from fastducc import filters, kernels, candidates, detection, imaging, catalogues, dynspec
+from fastducc.candidate_store import (
+    CandidateHDF5Writer,
+    Lightcurve,
+    build_trial_h5_path,
+    is_valid_candidates_h5,
+    merge_candidate_h5,
+    normalise_beam,
+)
 from astropy.coordinates import SkyCoord
 import astropy.units as u
+import glob
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +307,8 @@ def finalise_welford_parallel(
                                              )
             for i, cand in enumerate(annotated_var):
                 srcname = cand["srcname"]
+                if getattr(cfg, "product_format", "hdf5") == "hdf5":
+                    continue
                 if cfg.save_full_var_lightcurves and all_cube is not None:
                     rms_full = candidates.compute_candidate_local_rms(
                         all_cube, cand, window_size=cfg.local_window_size,
@@ -334,25 +345,183 @@ def finalise_welford_parallel(
                         ra_sign=-1, dec_sign=-1, cmap="viridis", gif_fps=1, dpi=180
                     )
 
+            if getattr(cfg, "product_format", "hdf5") == "hdf5":
+                _write_obs_variance_h5(
+                    cfg=cfg,
+                    annotated_var=annotated_var,
+                    std_map_full=std_map_full,
+                    all_times=all_times,
+                    all_cube=all_cube,
+                    dm_val=dm_val,
+                    h5_path=f"{var_root}_obs_candidates.h5",
+                )
+
             if all_cube is not None:
                 del all_cube
                 all_cube = None
 
-    # Ensure all obs-level variance candidates have cutouts, fullframes, plots, and lightcurves
-    try:
-        candidates.generate_obs_variance_candidate_products(
-            ms_base=cfg.ms_base,
-            candidates_dir=cfg.candidates_dir,
-            continuum_dir=cfg.continuum_dir,
-            spatial_size=50,
-            dm=dm_val,
-            scan_id=cfg.scan_id,
-            std_fits_path=full_std_fits,
-        )
-    except Exception as e:
-        logger.warning(f"[FinaliseWelford] Note: Obs variance products generation: {e}")
+    # Ensure all obs-level variance candidates have cutouts, fullframes, plots, and lightcurves (legacy mode only)
+    if getattr(cfg, "product_format", "hdf5") != "hdf5":
+        try:
+            candidates.generate_obs_variance_candidate_products(
+                ms_base=cfg.ms_base,
+                candidates_dir=cfg.candidates_dir,
+                continuum_dir=cfg.continuum_dir,
+                spatial_size=50,
+                dm=dm_val,
+                scan_id=cfg.scan_id,
+                std_fits_path=full_std_fits,
+            )
+        except Exception as e:
+            logger.warning(f"[FinaliseWelford] Note: Obs variance products generation: {e}")
 
     return std_map_full
+
+
+def _extract_2d_cutout(frame: np.ndarray, x: int, y: int, spatial_size: int = 50) -> np.ndarray:
+    """Extract a NaN-padded 2D cutout of shape ``(spatial_size, spatial_size)`` centred on ``(x, y)``."""
+    ny, nx = frame.shape
+    half = spatial_size // 2
+    y0_des, y1_des = y - half, y - half + spatial_size
+    x0_des, x1_des = x - half, x - half + spatial_size
+    y0_c, y1_c = max(0, y0_des), min(ny, y1_des)
+    x0_c, x1_c = max(0, x0_des), min(nx, x1_des)
+    cut = frame[y0_c:y1_c, x0_c:x1_c]
+    return np.pad(
+        cut,
+        ((y0_c - y0_des, y1_des - y1_c), (x0_c - x0_des, x1_des - x1_c)),
+        mode="constant",
+        constant_values=np.nan,
+    ).astype(np.float32, copy=False)
+
+
+def _build_cfg_wcs_full(cfg: Config):
+    return ducc_wcs._build_fullframe_wcs(
+        npix_x=cfg.npix_x,
+        npix_y=cfg.npix_y,
+        ra0_rad=cfg.ra0_rad,
+        dec0_rad=cfg.dec0_rad,
+        pixscale_rad=cfg.pix_rad,
+        ra_sign=-1,
+        dec_sign=-1,
+        radesys="ICRS",
+        equinox=None,
+    )
+
+
+def _write_obs_variance_h5(
+    *,
+    cfg: Config,
+    annotated_var: list[dict],
+    std_map_full: np.ndarray,
+    all_times: np.ndarray,
+    all_cube: np.ndarray | None,
+    dm_val: float,
+    h5_path: str,
+    spatial_size: int = 50,
+) -> None:
+    """Write observation-level variance candidates and full std-map into an HDF5 container."""
+    if not annotated_var:
+        return
+    meta_fn = candidates.parse_candidate_filename(cfg.ms_base)
+    beam_str = normalise_beam(meta_fn.get("beam", ""))
+    sbid_str = str(meta_fn.get("sbid", ""))
+    field_str = str(meta_fn.get("field", ""))
+    wcs_full = _build_cfg_wcs_full(cfg)
+
+    cand_metas = []
+    cand_arrays = []
+    for cand in annotated_var:
+        y = int(cand["y"])
+        x = int(cand["x"])
+        c_meta = dict(cand)
+        c_meta.setdefault("beam", beam_str)
+        c_meta.setdefault("sbid", sbid_str)
+        c_meta.setdefault("field", field_str)
+        c_meta["dm"] = float(dm_val)
+        c_meta["method"] = "variance"
+        c_meta["var_highpass_cutoff_sec"] = float(cfg.var_highpass_cutoff_sec)
+
+        arr: dict = {"cut_on": _extract_2d_cutout(std_map_full, x, y, spatial_size)}
+        if all_cube is not None and len(all_times) == all_cube.shape[0]:
+            rms_full = candidates.compute_candidate_local_rms(
+                all_cube, cand, window_size=cfg.local_window_size, clip_sigma=cfg.rms_clip_sigma
+            )
+            arr["lightcurve"] = Lightcurve(
+                time=np.asarray(all_times, dtype=np.float64),
+                flux=np.asarray(all_cube[:, y, x], dtype=np.float32),
+                flux_err=np.asarray(rms_full, dtype=np.float32),
+                width_samples=1,
+            )
+        cand_metas.append(c_meta)
+        cand_arrays.append(arr)
+
+    with CandidateHDF5Writer(
+        h5_path,
+        method="variance",
+        cutout_size=spatial_size,
+        npix_x=cfg.npix_x,
+        npix_y=cfg.npix_y,
+        wcs_full=wcs_full,
+        ms_base=cfg.ms_base,
+        sbid=sbid_str,
+        field=field_str,
+        beam=beam_str,
+        dm=dm_val,
+        has_off_cutout=False,
+    ) as writer:
+        h5_idxs = writer.append_batch(cand_metas, cand_arrays)
+        writer.finalize(std_map=std_map_full)
+    for cand, hi in zip(annotated_var, h5_idxs):
+        cand["products_h5"] = str(h5_path)
+        cand["h5_index"] = int(hi)
+
+
+def merge_chunk_candidate_h5s(cfg: Config, dm: float | None = None) -> dict[str, str]:
+    """Merge per-chunk transient HDF5 containers into one canonical HDF5 per (method, beam, DM)."""
+    dm_val = float(dm) if dm is not None else float(cfg.current_dm)
+    scan_tag = f"_scan_{cfg.scan_id}" if cfg.scan_id else ""
+    is_search = cfg.is_dm_search or (dm_val != 0.0)
+    dm_tag = f"_dm{dm_val:06.2f}" if is_search else ""
+
+    meta_fn = candidates.parse_candidate_filename(cfg.ms_base)
+    beam_str = normalise_beam(meta_fn.get("beam", ""))
+    sbid_str = str(meta_fn.get("sbid", ""))
+    field_str = str(meta_fn.get("field", ""))
+
+    merged_paths: dict[str, str] = {}
+    for method, pat_tok in (("boxcar", "_boxcar_candidates.h5"), ("variance", "_var*_candidates.h5")):
+        if is_search:
+            pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{scan_tag}*{dm_tag}*{pat_tok}")
+        else:
+            pattern = os.path.join(cfg.candidates_dir, f"{cfg.ms_base}*{scan_tag}*{pat_tok}")
+        chunk_h5s = sorted(glob.glob(pattern))
+        if not is_search:
+            chunk_h5s = [p for p in chunk_h5s if "_dm" not in os.path.basename(p)]
+        chunk_h5s = [p for p in chunk_h5s if is_valid_candidates_h5(p)]
+        if not chunk_h5s:
+            continue
+
+        dest = build_trial_h5_path(
+            cfg.candidates_dir,
+            method=method,
+            beam=beam_str,
+            dm=dm_val,
+            prefix=cfg.ms_base,
+            scan_id=cfg.scan_id,
+        )
+        merge_candidate_h5(
+            chunk_h5s,
+            dest,
+            method=method,
+            sbid=sbid_str,
+            field=field_str,
+            beam=beam_str,
+            dm=dm_val,
+            remove_inputs=True,
+        )
+        merged_paths[method] = str(dest)
+    return merged_paths
 
 
 def consolidate_catalogues(cfg: Config):
@@ -468,12 +637,84 @@ def _export_variance_chunk_products(
     wgt_3d: np.ndarray | None = None,
     uvw_3d: np.ndarray | None = None,
 ):
-    """Generate lightcurves, summary plots, and snippets for chunk variance candidates."""
+    """Generate lightcurves, cutouts, and optional snippets/plots for chunk variance candidates."""
+    if not annotated_var:
+        return
     chunk_dynspecs = (
         _extract_chunk_dynspecs_for_candidates(cfg, times, chan_freq, vis_3d, wgt_3d, uvw_3d, annotated_var)
         if cfg.save_var_lightcurves
         else {}
     )
+
+    if getattr(cfg, "product_format", "hdf5") == "hdf5":
+        meta_fn = candidates.parse_candidate_filename(cfg.ms_base)
+        beam_str = normalise_beam(meta_fn.get("beam", ""))
+        sbid_str = str(meta_fn.get("sbid", ""))
+        field_str = str(meta_fn.get("field", ""))
+        wcs_full = _build_cfg_wcs_full(cfg)
+        dm_val = float(annotated_var[0].get("dm", cfg.current_dm))
+
+        c_metas = []
+        c_arrays = []
+        valid_cands = []
+        for cand in annotated_var:
+            if not (times[0] <= cand["time_center"] <= times[-1]):
+                logger.warning(
+                    f"Candidate {cand.get('srcname', '')} has time_center={cand['time_center']} "
+                    f"outside of chunk times [{times[0]}, {times[-1]}], skipping products."
+                )
+                continue
+            y = int(cand["y"])
+            x = int(cand["x"])
+            srcname = cand["srcname"]
+            c_meta = dict(cand)
+            c_meta.setdefault("beam", beam_str)
+            c_meta.setdefault("sbid", sbid_str)
+            c_meta.setdefault("field", field_str)
+            c_meta["method"] = "variance"
+            c_meta["var_highpass_cutoff_sec"] = float(cfg.var_highpass_cutoff_sec)
+
+            arr: dict = {"cut_on": _extract_2d_cutout(std_map_partial, x, y, spatial_size=50)}
+            if cfg.save_var_lightcurves:
+                rms_full = candidates.compute_candidate_local_rms(
+                    cube, cand, window_size=cfg.local_window_size, clip_sigma=cfg.rms_clip_sigma
+                )
+                arr["lightcurve"] = Lightcurve(
+                    time=np.asarray(times, dtype=np.float64),
+                    flux=np.asarray(cube[:, y, x], dtype=np.float32),
+                    flux_err=np.asarray(rms_full, dtype=np.float32),
+                    width_samples=1,
+                )
+            if srcname in chunk_dynspecs:
+                arr["dynspec"] = chunk_dynspecs[srcname]
+            if cfg.save_var_snippets:
+                arr["snippet"] = candidates.make_stdmap_snippet(std_map_partial, cand, spatial_size=50)
+            c_metas.append(c_meta)
+            c_arrays.append(arr)
+            valid_cands.append(cand)
+
+        if c_metas:
+            h5_path = f"{var_root}_candidates.h5"
+            with CandidateHDF5Writer(
+                h5_path,
+                method="variance",
+                cutout_size=50,
+                npix_x=cfg.npix_x,
+                npix_y=cfg.npix_y,
+                wcs_full=wcs_full,
+                ms_base=cfg.ms_base,
+                sbid=sbid_str,
+                field=field_str,
+                beam=beam_str,
+                dm=dm_val,
+                has_off_cutout=False,
+            ) as writer:
+                h5_idxs = writer.append_batch(c_metas, c_arrays)
+            for cand, hi in zip(valid_cands, h5_idxs):
+                cand["products_h5"] = h5_path
+                cand["h5_index"] = int(hi)
+        return
+
     for i, cand in enumerate(annotated_var):
         srcname = cand["srcname"]
         if cfg.save_var_lightcurves:
@@ -529,12 +770,104 @@ def _export_boxcar_chunk_products(
     wgt_3d: np.ndarray | None = None,
     uvw_3d: np.ndarray | None = None,
 ):
-    """Generate lightcurves, summary plots, and snippets for chunk boxcar candidates."""
+    """Generate lightcurves, cutouts, and optional snippets/plots for chunk boxcar candidates."""
+    if not annotated:
+        return
     chunk_dynspecs = (
         _extract_chunk_dynspecs_for_candidates(cfg, times, chan_freq, vis_3d, wgt_3d, uvw_3d, annotated)
         if cfg.save_box_lightcurves
         else {}
     )
+
+    if getattr(cfg, "product_format", "hdf5") == "hdf5":
+        meta_fn = candidates.parse_candidate_filename(cfg.ms_base)
+        beam_str = normalise_beam(meta_fn.get("beam", ""))
+        sbid_str = str(meta_fn.get("sbid", ""))
+        field_str = str(meta_fn.get("field", ""))
+        wcs_full = _build_cfg_wcs_full(cfg)
+        dm_val = float(annotated[0].get("dm", cfg.current_dm))
+        T = cube.shape[0]
+
+        c_metas = []
+        c_arrays = []
+        valid_cands = []
+        for cand in annotated:
+            if not (times[0] <= cand["time_center"] <= times[-1]):
+                logger.warning(
+                    f"Candidate {cand.get('srcname', '')} has time_center={cand['time_center']} "
+                    f"outside of chunk times [{times[0]}, {times[-1]}], skipping products."
+                )
+                continue
+            y = int(cand["y"])
+            x = int(cand["x"])
+            w = max(1, int(cand.get("width_samples", 1)))
+            srcname = cand["srcname"]
+
+            if "t0_idx" in cand:
+                t0_idx = int(cand["t0_idx"])
+            else:
+                cidx = int(cand.get("center_idx", 0))
+                t0_idx = max(0, min(cidx - (w // 2), T - w))
+            t_center_idx = max(0, min(t0_idx + (w // 2), T - 1))
+            if w > 1:
+                frame_disp = np.mean(cube[max(0, t0_idx) : min(T, t0_idx + w)], axis=0)
+            else:
+                frame_disp = cube[t_center_idx]
+
+            c_meta = dict(cand)
+            c_meta.setdefault("beam", beam_str)
+            c_meta.setdefault("sbid", sbid_str)
+            c_meta.setdefault("field", field_str)
+            c_meta["method"] = "boxcar"
+
+            arr: dict = {"cut_on": _extract_2d_cutout(frame_disp, x, y, spatial_size=50)}
+            if cfg.save_box_lightcurves:
+                rms_full = candidates.compute_candidate_local_rms(
+                    cube, cand, window_size=cfg.local_window_size, clip_sigma=cfg.rms_clip_sigma
+                )
+                arr["lightcurve"] = Lightcurve(
+                    time=np.asarray(times, dtype=np.float64),
+                    flux=np.asarray(cube[:, y, x], dtype=np.float32),
+                    flux_err=np.asarray(rms_full, dtype=np.float32),
+                    width_samples=w,
+                )
+            if srcname in chunk_dynspecs:
+                arr["dynspec"] = chunk_dynspecs[srcname]
+            if cfg.save_box_snippets:
+                snips = candidates.extract_candidate_snippets(
+                    times, cube, [cand],
+                    spatial_size=50, time_factor=50,
+                    pad_mode="constant", pad_value=0.0,
+                    return_indices=True, center_policy="right",
+                )
+                if snips:
+                    arr["snippet"] = snips[0]
+            c_metas.append(c_meta)
+            c_arrays.append(arr)
+            valid_cands.append(cand)
+
+        if c_metas:
+            h5_path = f"{box_root}_candidates.h5"
+            with CandidateHDF5Writer(
+                h5_path,
+                method="boxcar",
+                cutout_size=50,
+                npix_x=cfg.npix_x,
+                npix_y=cfg.npix_y,
+                wcs_full=wcs_full,
+                ms_base=cfg.ms_base,
+                sbid=sbid_str,
+                field=field_str,
+                beam=beam_str,
+                dm=dm_val,
+                has_off_cutout=False,
+            ) as writer:
+                h5_idxs = writer.append_batch(c_metas, c_arrays)
+            for cand, hi in zip(valid_cands, h5_idxs):
+                cand["products_h5"] = h5_path
+                cand["h5_index"] = int(hi)
+        return
+
     for i, cand in enumerate(annotated):
         srcname = cand["srcname"]
         w = max(1, int(cand.get("width_samples", 1)))

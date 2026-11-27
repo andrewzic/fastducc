@@ -158,6 +158,12 @@ def build_cli(argv=None):
         help_true='Defer candidate diagnostic summary PDF rendering during search pass (saves lightweight artifacts only; default: False).',
         help_false='Render candidate diagnostic summary PDF plots immediately during search (default: True).',
     )
+    parser.add_argument(
+        '--product-format',
+        choices=['hdf5', 'legacy'],
+        default='hdf5',
+        help="Candidate artefact storage format: 'hdf5' (monolithic per-(method, beam, DM) HDF5 container; default) or 'legacy' (per-candidate FITS/NPZ/PDF files).",
+    )
     parser.add_argument('--continuum-dir', default=None, help='Path to directory containing deep per-beam continuum fits images.')
 
     # --- Dedispersion & DM search parameters ---
@@ -468,6 +474,7 @@ def make_config(args, paths) -> Config:
         min_uv_distance_m=getattr(args, "min_uv_distance_m", None),
         raster_uv_threshold=float(getattr(args, "raster_uv_threshold", 0.0)),
         dm_tol=float(getattr(args, "dm_tol", 1.0)),
+        product_format=str(getattr(args, "product_format", "hdf5")).strip().lower(),
     )
 
 def main_serial(args):
@@ -820,6 +827,8 @@ def run_pipeline(args):
 
     for trial_dm in dm_trials:
         cfg.current_dm = trial_dm
+        if getattr(cfg, "product_format", "hdf5") == "hdf5":
+            fd_core.merge_chunk_candidate_h5s(cfg, dm=trial_dm)
         fd_core.consolidate_catalogues(cfg)
     log_memory("After consolidate_chunk_catalogues (Finished)")
 

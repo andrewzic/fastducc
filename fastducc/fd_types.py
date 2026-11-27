@@ -68,6 +68,7 @@ class Config:
     min_uv_distance_m: Optional[float] = None
     raster_uv_threshold: float = 0.0
     dm_tol: float = 1.0
+    product_format: str = "hdf5"
 
 @dataclass
 class WelfordState:
