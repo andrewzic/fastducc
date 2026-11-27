@@ -175,19 +175,60 @@ def build_cli_extract_ds(argv: Sequence[str] | None = None) -> argparse.Namespac
         prog="fastducc extract_ds",
         description="Extract in-memory phased visibility dynamic spectra from Measurement Set(s) to HDF5 (.ds)",
     )
-    p.add_argument("--ms", "--msname", dest="ms", default=None, help="Path to Measurement Set")
-    p.add_argument("--out", "-o", dest="out", default=None, help="Output .ds file or directory")
-    p.add_argument("--ra", type=float, default=None, help="Right Ascension in degrees")
-    p.add_argument("--dec", type=float, default=None, help="Declination in degrees")
-    p.add_argument("--cand-id", default=None, help="Candidate identifier")
+    # Single-MS mode
+    p.add_argument("--ms", "--msname", dest="ms", default=None, help="Path to Measurement Set (single-MS mode)")
+    p.add_argument("--out", "-o", "--outdir", dest="out", default=None, help="Output .ds file or directory")
+    p.add_argument("--ra", type=float, default=None, help="Right Ascension in degrees (single-MS mode)")
+    p.add_argument("--dec", type=float, default=None, help="Declination in degrees (single-MS mode)")
+    p.add_argument("--cand-id", default=None, help="Candidate identifier (single-MS mode)")
     p.add_argument("--dm", type=float, default=0.0, help="Dispersion Measure (pc cm^-3)")
-    p.add_argument("--pol", default="I", help="Polarization to extract ('I', 'XX', 'YY', etc.)")
-    p.add_argument("--datacolumn", default="DATA", help="MS data column (DATA, CORRECTED_DATA)")
-    p.add_argument("--chunk-rows", type=int, default=100000, help="Chunk size for MS streaming (default: 100000)")
-    p.add_argument("--sbid", default=None, help="SBID for full observation batch orchestration (e.g. SB77974)")
+
+    # Catalogue / observation batch orchestration mode (mirrors lotrun_periodicity pdmp_refine)
+    p.add_argument("--sbid", default=None, help="SBID for observation batch extraction (e.g. SB77974)")
     p.add_argument("--data-root", default=None, help="Root directory holding SBIDs")
     p.add_argument("--catalogue", default=None, help="Path to candidate catalogue (VOTable or CSV)")
-    p.add_argument("--update-summary-plots", action="store_true", default=True, help="Update candidate summary plots with dynamic spectrum")
+    p.add_argument("--kind", default="boxcar", help="Candidate family for catalogue auto-discovery (default: boxcar)")
+    p.add_argument("--sbid-subdir", default=None, help="Optional subdirectory under <SBID> containing candidates/")
+    p.add_argument("--ms-dir", default=None, help="Directory containing per-beam Measurement Sets")
+    p.add_argument("--combined-dir", default="native_combined", help="Subdirectory under <SBID> for combined MS files")
+    p.add_argument("--ms-glob-template", default="**/cracoData*%s*uvsub.ms", help="Glob template for beam MS discovery")
+    p.add_argument("--min-snr", type=float, default=None, help="Minimum candidate S/N threshold")
+    p.add_argument("--min-dm", type=float, default=None, help="Minimum candidate DM threshold (pc cm^-3)")
+    p.add_argument("--max-cands", type=int, default=None, help="Maximum number of top candidates (by S/N) to extract")
+    p.add_argument("--source-id", default=None, help="Restrict extraction to a single source_id or srcname")
+    p.add_argument("--max-batch-cands-per-beam", "--max-cands-per-pass", dest="max_batch_cands_per_beam", type=int, default=10,
+                   help="Maximum candidates batched per beam MS streaming pass (default: 10)")
+
+    # Extraction options
+    p.add_argument("--pol", default="I", help="Polarisation to extract ('I', 'XX', 'YY', etc.)")
+    p.add_argument("--datacolumn", default="DATA", help="MS data column (DATA, CORRECTED_DATA, MODEL_DATA)")
+    p.add_argument("--chunk-rows", type=int, default=100000, help="Chunk size for MS streaming (default: 100000)")
+    p.add_argument("--min-uv-distance-m", "--minuvdist", dest="min_uv_distance_m", type=float, default=0.0,
+                   help="Minimum baseline UV distance in metres (default: 0.0)")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing .ds files")
+    p.add_argument("--dry-run", action="store_true", help="Print planned batches without extracting")
+    p.add_argument("--update-summary-plots", dest="update_summary_plots", action="store_true", default=True,
+                   help="Update candidate summary plots with dynamic spectrum (default: True)")
+    p.add_argument("--no-update-summary-plots", dest="update_summary_plots", action="store_false",
+                   help="Disable updating candidate summary plots")
+
+    # Dask parallelisation (matches lotrun_periodicity pdmp_refine)
+    p.add_argument("--parallel-mode", choices=["serial", "dask-local", "dask-slurm"], default="serial",
+                   help="Execution mode for catalogue extraction (default: serial)")
+    p.add_argument("--dask-scheduler-address", default=None, help="Existing Dask scheduler address")
+    p.add_argument("--dask-min-workers", type=int, default=1, help="Minimum Dask workers (default: 1)")
+    p.add_argument("--dask-max-workers", type=int, default=48, help="Maximum Dask workers (default: 48)")
+    p.add_argument("--dask-local-workers", type=int, default=4, help="Workers for dask-local mode (default: 4)")
+    p.add_argument("--dask-local-mem", default="6GB", help="Memory limit per local worker (default: 6GB)")
+    p.add_argument("--dask-slurm-partition", default=None, help="Slurm partition for Dask workers")
+    p.add_argument("--dask-slurm-account", default=None, help="Slurm account for Dask workers")
+    p.add_argument("--dask-slurm-cores", type=int, default=2, help="CPUs per Slurm Dask worker (default: 2)")
+    p.add_argument("--dask-slurm-mem", default="6GB", help="Memory per Slurm Dask worker (default: 6GB)")
+    p.add_argument("--dask-slurm-walltime", default="00:30:00", help="Walltime per Slurm Dask worker (default: 00:30:00)")
+    p.add_argument("--dask-slurm-interface", default=None, help="Network interface for Slurm Dask workers")
+    p.add_argument("--dask-slurm-log-dir", default=None, help="Log directory for Slurm Dask workers")
+    p.add_argument("--dask-job-name", default=None, help="Custom Slurm job name for Dask workers")
+    p.add_argument("--dask-target-duration", default="1500s", help="Adaptive scaling target duration (default: 1500s)")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
     return p.parse_args(argv)
 
@@ -299,24 +340,57 @@ def run_periodicity(argv: Sequence[str]) -> int:
 
 
 def run_extract_ds(argv: Sequence[str]) -> int:
-    """Execute dynamic spectrum extraction via fastducc.dynspec or orchestrator."""
+    """Execute dynamic spectrum extraction via fastducc.dynspec (single MS or beam-batched catalogue)."""
     from pathlib import Path
 
-    # If full observation orchestration flags are passed, delegate to extract_ds_orchestrator
-    if any(arg.startswith(("--sbid", "--data-root", "--catalogue")) for arg in argv):
-        try:
-            from dstools import extract_ds_orchestrator
-            return extract_ds_orchestrator.main(list(argv))
-        except ImportError:
-            pass
-
     args = build_cli_extract_ds(list(argv))
-    if args.sbid:
-        from dstools import extract_ds_orchestrator
-        return extract_ds_orchestrator.main(list(argv))
+
+    if args.catalogue or args.sbid:
+        from fastducc.dynspec import batch_extract_catalogue
+
+        summary = batch_extract_catalogue(
+            catalogue_path=args.catalogue,
+            sbid=args.sbid,
+            data_root=args.data_root,
+            kind=args.kind,
+            sbid_subdir=args.sbid_subdir,
+            ms_dir=args.ms_dir,
+            combined_dir=args.combined_dir,
+            ms_glob_template=args.ms_glob_template,
+            out_dir=args.out,
+            min_snr=args.min_snr,
+            min_dm=args.min_dm,
+            max_cands=args.max_cands,
+            source_id=args.source_id,
+            max_batch_cands_per_beam=args.max_batch_cands_per_beam,
+            chunk_rows=args.chunk_rows,
+            pol=args.pol,
+            datacolumn=args.datacolumn,
+            min_uv_distance_m=args.min_uv_distance_m,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+            update_summary_plots=args.update_summary_plots,
+            verbose=args.verbose,
+            parallel_mode=args.parallel_mode,
+            dask_scheduler_address=args.dask_scheduler_address,
+            dask_min_workers=args.dask_min_workers,
+            dask_max_workers=args.dask_max_workers,
+            dask_local_workers=args.dask_local_workers,
+            dask_local_mem=args.dask_local_mem,
+            dask_slurm_partition=args.dask_slurm_partition,
+            dask_slurm_account=args.dask_slurm_account,
+            dask_slurm_cores=args.dask_slurm_cores,
+            dask_slurm_mem=args.dask_slurm_mem,
+            dask_slurm_walltime=args.dask_slurm_walltime,
+            dask_slurm_interface=args.dask_slurm_interface,
+            dask_slurm_log_dir=args.dask_slurm_log_dir,
+            dask_job_name=args.dask_job_name,
+            dask_target_duration=args.dask_target_duration,
+        )
+        return 0 if summary.get("failed", 0) == 0 else 1
 
     if not args.ms:
-        logger.error("Either --ms or --sbid is required for dynamic spectrum extraction.")
+        logger.error("Provide --ms (single-MS mode) or --catalogue / --sbid (catalogue batch mode).")
         return 1
 
     from fastducc.dynspec import extract_phased_dynamic_spectra_from_ms, write_dynamic_spectrum_hdf5
@@ -338,6 +412,7 @@ def run_extract_ds(argv: Sequence[str]) -> int:
         chunk_rows=args.chunk_rows,
         pol=args.pol,
         datacolumn=args.datacolumn,
+        min_uv_distance_m=args.min_uv_distance_m,
         verbose=args.verbose,
     )
 

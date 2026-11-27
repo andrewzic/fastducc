@@ -76,6 +76,8 @@ def derive_dask_job_name(
         prefix = "dask_nufft"
     elif "cube" in stage_lower:
         prefix = "fd_cube"
+    elif "dynspec" in stage_lower or "extract" in stage_lower:
+        prefix = "fd_ds"
     else:
         prefix = f"dask_{stage_lower[:8]}"
 
@@ -207,6 +209,7 @@ def setup_slurm_cluster(
         "unset PYTHONPATH",
         f"source {os.path.dirname(py_exe)}/activate 2>/dev/null || true",
         f"export OMP_NUM_THREADS={cores_per_worker}",
+        f"export NUMBA_NUM_THREADS={cores_per_worker}",
         "export OPENBLAS_NUM_THREADS=1",
         "export MKL_NUM_THREADS=1",
         # Keep worker logs and tool caches completely out of home directory

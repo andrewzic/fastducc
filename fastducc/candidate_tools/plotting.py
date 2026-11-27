@@ -311,7 +311,6 @@ def save_candidate_summary(
                 cont_vmax = float(np.nanpercentile(cont_im, 99.5))
             except Exception as e:
                 logger.debug(f"Could not load continuum cutout: {e}")
-            cont_vmax = np.nanpercentile(cont_im, 99.5)
 
     if np.isfinite(det_time_mjd):
         mjd_tag = f"_MJD{det_time_mjd:.7f}"
@@ -380,7 +379,7 @@ def save_candidate_summary(
                 if ds_slice is not None and ds_slice.size > 0:
                     has_dynspec = True
         except Exception as e:
-            logger.debug(f"Could not load dynamic spectrum for summary plot: {e}")
+            logger.warning(f"Could not load dynamic spectrum for summary plot: {e}")
 
     if has_dynspec:
         fig = plt.figure(figsize=(18, 12.5), dpi=dpi)
@@ -588,9 +587,8 @@ def save_candidate_summary(
     if has_dynspec:
         f_min_ds = float(ds_freqs[0]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
         f_max_ds = float(ds_freqs[-1]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
-        if ds_path_val:
-            ds_name = Path(ds_path_val).name
-            txt += f"\nDynamic Spectrum:\n  {ds_name}\n  ({len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz)"
+        ds_label = Path(ds_path_val).name if ds_path_val else "on-the-fly (chunk)"
+        txt += f"\nDynamic Spectrum:\n  {ds_label}\n  ({len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz)"
         wrapped_txt = wrap_candidate_metadata_text(txt, max_width=33)
         ax_txt.text(
             0.03, 0.98, wrapped_txt,
@@ -669,7 +667,15 @@ def save_candidate_summary(
                     axis=(1, 3)
                 )
 
-        vmin_ds, vmax_ds = np.nanpercentile(ds_disp, [5.0, 99.5])
+        finite_ds = ds_disp[np.isfinite(ds_disp)]
+        if finite_ds.size > 0:
+            vmin_ds, vmax_ds = np.percentile(finite_ds, [5.0, 99.5])
+            if not np.isfinite(vmin_ds) or not np.isfinite(vmax_ds) or vmax_ds <= vmin_ds:
+                vmin_ds, vmax_ds = float(np.min(finite_ds)), float(np.max(finite_ds))
+                if vmax_ds <= vmin_ds:
+                    vmin_ds, vmax_ds = vmin_ds - 1e-6, vmax_ds + 1e-6
+        else:
+            vmin_ds, vmax_ds = 0.0, 1.0
         t_min_ds = float(ds_t_slice[0])
         t_max_ds = float(ds_t_slice[-1])
         f_min_ds = float(ds_freqs[0])
