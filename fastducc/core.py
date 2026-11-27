@@ -8,7 +8,7 @@ from astropy.io import fits
 
 from fastducc import wcs as ducc_wcs
 from fastducc.fd_types import Config
-from fastducc import filters, kernels, candidates, detection, imaging, catalogues
+from fastducc import filters, kernels, candidates, detection, imaging, catalogues, dynspec
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 
@@ -402,6 +402,60 @@ def _load_plot_only_candidates(
     return []
 
 
+def _extract_chunk_dynspecs_for_candidates(
+    cfg: Config,
+    times: np.ndarray,
+    chan_freq: np.ndarray | None,
+    vis_3d: np.ndarray | None,
+    wgt_3d: np.ndarray | None,
+    uvw_3d: np.ndarray | None,
+    cands: list[dict],
+) -> dict[str, dict]:
+    """Extract phased chunk dynamic spectra on the fly for in-chunk candidates."""
+    if not cands or vis_3d is None or wgt_3d is None or uvw_3d is None or chan_freq is None:
+        return {}
+    if len(times) == 0:
+        return {}
+
+    unique_targets: dict[str, dict] = {}
+    t_lo, t_hi = times[0], times[-1]
+    for cand in cands:
+        t_c = cand.get("time_center")
+        if t_c is None or not (t_lo <= t_c <= t_hi):
+            continue
+        srcname = cand.get("srcname")
+        if not srcname or srcname in unique_targets:
+            continue
+        if "ra_rad" in cand and "dec_rad" in cand:
+            unique_targets[srcname] = {
+                "id": srcname,
+                "ra_rad": float(cand["ra_rad"]),
+                "dec_rad": float(cand["dec_rad"]),
+            }
+        elif "ra_deg" in cand and "dec_deg" in cand:
+            unique_targets[srcname] = {
+                "id": srcname,
+                "ra_deg": float(cand["ra_deg"]),
+                "dec_deg": float(cand["dec_deg"]),
+            }
+
+    if not unique_targets:
+        return {}
+
+    pol_label = "I" if cfg.corr_mode in ("stokesI", "average") else str(cfg.single_pol)
+    return dynspec.extract_phased_dynamic_spectra_from_chunk(
+        times=times,
+        chan_freq=chan_freq,
+        vis_3d=vis_3d,
+        wgt_3d=wgt_3d,
+        uvw_3d=uvw_3d,
+        ra0_rad=cfg.ra0_rad,
+        dec0_rad=cfg.dec0_rad,
+        targets=list(unique_targets.values()),
+        pol=pol_label,
+    )
+
+
 def _export_variance_chunk_products(
     cfg: Config,
     times: np.ndarray,
@@ -409,8 +463,17 @@ def _export_variance_chunk_products(
     std_map_partial: np.ndarray,
     annotated_var: list[dict],
     var_root: str,
+    chan_freq: np.ndarray | None = None,
+    vis_3d: np.ndarray | None = None,
+    wgt_3d: np.ndarray | None = None,
+    uvw_3d: np.ndarray | None = None,
 ):
     """Generate lightcurves, summary plots, and snippets for chunk variance candidates."""
+    chunk_dynspecs = (
+        _extract_chunk_dynspecs_for_candidates(cfg, times, chan_freq, vis_3d, wgt_3d, uvw_3d, annotated_var)
+        if cfg.save_var_lightcurves
+        else {}
+    )
     for i, cand in enumerate(annotated_var):
         srcname = cand["srcname"]
         if cfg.save_var_lightcurves:
@@ -440,6 +503,7 @@ def _export_variance_chunk_products(
                     var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
                     rms_full=rms_full,
                     defer_summary_plots=getattr(cfg, "defer_summary_plots", False),
+                    dynspec=chunk_dynspecs.get(srcname),
                 )
             else:
                 logger.warning(f"Candidate {srcname} has time_center={cand['time_center']} outside of chunk times [{times[0]}, {times[-1]}], skipping lightcurve and snippet products.")
@@ -460,8 +524,17 @@ def _export_boxcar_chunk_products(
     cube: np.ndarray,
     annotated: list[dict],
     box_root: str,
+    chan_freq: np.ndarray | None = None,
+    vis_3d: np.ndarray | None = None,
+    wgt_3d: np.ndarray | None = None,
+    uvw_3d: np.ndarray | None = None,
 ):
     """Generate lightcurves, summary plots, and snippets for chunk boxcar candidates."""
+    chunk_dynspecs = (
+        _extract_chunk_dynspecs_for_candidates(cfg, times, chan_freq, vis_3d, wgt_3d, uvw_3d, annotated)
+        if cfg.save_box_lightcurves
+        else {}
+    )
     for i, cand in enumerate(annotated):
         srcname = cand["srcname"]
         w = max(1, int(cand.get("width_samples", 1)))
@@ -491,6 +564,7 @@ def _export_boxcar_chunk_products(
                     method="boxcar",
                     rms_full=rms_full,
                     defer_summary_plots=getattr(cfg, "defer_summary_plots", False),
+                    dynspec=chunk_dynspecs.get(srcname),
                 )
             if cfg.save_box_snippets:
                 snippets = candidates.extract_candidate_snippets(
@@ -525,6 +599,10 @@ def _process_variance_chunk_dm(
     racs_coords,
     psrcat_coords,
     dm0_var_cands: list[dict],
+    chan_freq: np.ndarray | None = None,
+    vis_3d: np.ndarray | None = None,
+    wgt_3d: np.ndarray | None = None,
+    uvw_3d: np.ndarray | None = None,
 ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], list[dict]]:
     """Process variance detection and Welford accumulation for a single trial DM on a chunk."""
     Ny, Nx = cfg.npix_y, cfg.npix_x
@@ -622,6 +700,10 @@ def _process_variance_chunk_dm(
             std_map_partial=std_map_partial,
             annotated_var=annotated_var,
             var_root=var_root,
+            chan_freq=chan_freq,
+            vis_3d=vis_3d,
+            wgt_3d=wgt_3d,
+            uvw_3d=uvw_3d,
         )
 
     return (c_dm, m_dm, M2_dm), annotated_var
@@ -641,6 +723,10 @@ def _process_boxcar_chunk_dm(
     racs_coords,
     psrcat_coords,
     dm0_box_cands: list[dict],
+    chan_freq: np.ndarray | None = None,
+    vis_3d: np.ndarray | None = None,
+    wgt_3d: np.ndarray | None = None,
+    uvw_3d: np.ndarray | None = None,
 ) -> list[dict]:
     """Process boxcar detection for a single trial DM on a chunk."""
     box_root = chunk_root + "_boxcar"
@@ -721,29 +807,46 @@ def _process_boxcar_chunk_dm(
         cube=cube,
         annotated=annotated,
         box_root=box_root,
+        chan_freq=chan_freq,
+        vis_3d=vis_3d,
+        wgt_3d=wgt_3d,
+        uvw_3d=uvw_3d,
     )
 
     return annotated
 
 
-def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: int, end: int, scan_id_str: str = "", chunk_times: np.ndarray | None = None):
+def process_chunk_task(
+    cfg: Config,
+    ms_base: str,
+    candidates_dir: str,
+    start: int,
+    end: int,
+    scan_id_str: str = "",
+    chunk_times: np.ndarray | None = None,
+    preloaded_data: tuple | None = None,
+):
     """
-    Worker task: load the chunk data from MS once, loop over trial DMs in memory,
-    run variance search on each trial DM (if enabled), run boxcar search on all trial DMs,
-    and return per-chunk Welford aggregates.
+    Worker task: load the chunk data from MS once (or reuse preloaded_data),
+    loop over trial DMs in memory (using either CPU ducc0.wgridder or GPU/CPU
+    direct half-plane rasterisation + C2R imaging), run variance and boxcar
+    searches, and return per-chunk Welford aggregates.
     """
     dm_trials = cfg.dm_trials
     if not dm_trials:
         dm_trials = [float(cfg.current_dm)]
 
-    # Load chunk visibility and coordinate data once from MS into RAM
-    times, chan_freq, dt, vis_3d, wgt_3d, uvw_3d = imaging.load_chunk_data(
-        msname=cfg.msname, t_main=None,
-        start_time_idx=start, end_time_idx=end,
-        chunk_times=chunk_times,
-        corr_mode=cfg.corr_mode, basis=cfg.basis, single_pol=cfg.single_pol,
-        data_column=cfg.data_column,
-    )
+    if preloaded_data is not None:
+        times, chan_freq, dt, vis_3d, wgt_3d, uvw_3d = preloaded_data
+    else:
+        times, chan_freq, dt, vis_3d, wgt_3d, uvw_3d = imaging.load_chunk_data(
+            msname=cfg.msname, t_main=None,
+            start_time_idx=start, end_time_idx=end,
+            chunk_times=chunk_times,
+            corr_mode=cfg.corr_mode, basis=cfg.basis, single_pol=cfg.single_pol,
+            data_column=cfg.data_column,
+            min_uv_distance_m=getattr(cfg, "min_uv_distance_m", None),
+        )
 
     welford_by_dm = {}
     cube_dm0 = None
@@ -765,28 +868,69 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
         sorted_dm_trials.remove(0.0)
         sorted_dm_trials.insert(0, 0.0)
 
-    for dm_val in sorted_dm_trials:
-        # In-memory dedispersion + exact UVW wavelength scaling + DUCC gridding
-        cube = imaging.grid_chunk_cube(
+    engine_name = str(getattr(cfg, "engine", "wgridder")).strip().lower()
+    device_name = str(getattr(cfg, "device", "cpu")).strip().lower()
+    use_direct_raster = (engine_name == "direct_raster") or (device_name == "cuda")
+
+    if use_direct_raster:
+        from fastducc import gpu_transient
+
+        dm_cube_iter = gpu_transient.iter_chunk_dirty_cubes_direct_raster(
             vis_3d=vis_3d,
             wgt_3d=wgt_3d,
             uvw_3d=uvw_3d,
             chan_freq=chan_freq,
             dt=dt,
+            dm_trials=sorted_dm_trials,
             npix_x=cfg.npix_x,
             npix_y=cfg.npix_y,
             pixsize_x=cfg.pix_rad,
             pixsize_y=cfg.pix_rad,
+            dedisp_mode=getattr(cfg, "dedisp_mode", "subbanded"),
+            nsubbands=cfg.nsubbands,
+            collapse_channels=cfg.collapse_channels,
+            exact_uvw=cfg.exact_uvw,
+            raster_mode=getattr(cfg, "raster_mode", "wgridder"),
             epsilon=cfg.epsilon,
             do_wgridding=cfg.do_wgridding,
-            nthreads=cfg.nthreads,
-            verbosity=cfg.verbosity,
-            dm=dm_val,
-            collapse_channels=cfg.collapse_channels,
-            nsubbands=cfg.nsubbands,
-            exact_uvw=cfg.exact_uvw,
             min_valid_channels=cfg.min_valid_channels,
+            min_uv_distance_m=getattr(cfg, "min_uv_distance_m", None),
+            uv_threshold=getattr(cfg, "raster_uv_threshold", 0.0),
+            pad_radius=getattr(cfg, "pad_radius", 6),
+            c2r_batch_size=getattr(cfg, "c2r_batch_size", 256),
+            device=device_name if device_name in ("cpu", "cuda", "auto") else "auto",
+            nthreads=max(1, int(cfg.nthreads)) if int(cfg.nthreads) > 0 else 1,
+            tolerance_samples=getattr(cfg, "dm_tol", 1.0),
         )
+    else:
+        def _iter_wgridder_cubes():
+            for dm_val in sorted_dm_trials:
+                cube = imaging.grid_chunk_cube(
+                    vis_3d=vis_3d,
+                    wgt_3d=wgt_3d,
+                    uvw_3d=uvw_3d,
+                    chan_freq=chan_freq,
+                    dt=dt,
+                    npix_x=cfg.npix_x,
+                    npix_y=cfg.npix_y,
+                    pixsize_x=cfg.pix_rad,
+                    pixsize_y=cfg.pix_rad,
+                    epsilon=cfg.epsilon,
+                    do_wgridding=cfg.do_wgridding,
+                    nthreads=cfg.nthreads,
+                    verbosity=cfg.verbosity,
+                    dm=dm_val,
+                    collapse_channels=cfg.collapse_channels,
+                    nsubbands=cfg.nsubbands,
+                    exact_uvw=cfg.exact_uvw,
+                    min_valid_channels=cfg.min_valid_channels,
+                    min_uv_distance_m=getattr(cfg, "min_uv_distance_m", None),
+                )
+                yield dm_val, cube
+
+        dm_cube_iter = _iter_wgridder_cubes()
+
+    for dm_val, cube in dm_cube_iter:
 
         is_search = cfg.is_dm_search or (dm_val != 0.0)
         dm_suffix = f"_dm{dm_val:06.2f}" if is_search else ""
@@ -810,6 +954,10 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 racs_coords=racs_coords,
                 psrcat_coords=psrcat_coords,
                 dm0_var_cands=dm0_var_cands,
+                chan_freq=chan_freq,
+                vis_3d=vis_3d,
+                wgt_3d=wgt_3d,
+                uvw_3d=uvw_3d,
             )
             welford_by_dm[dm_val] = welford_agg
             if dm_val == 0.0:
@@ -836,6 +984,10 @@ def process_chunk_task(cfg: Config, ms_base: str, candidates_dir: str, start: in
                 racs_coords=racs_coords,
                 psrcat_coords=psrcat_coords,
                 dm0_box_cands=dm0_box_cands,
+                chan_freq=chan_freq,
+                vis_3d=vis_3d,
+                wgt_3d=wgt_3d,
+                uvw_3d=uvw_3d,
             )
             if dm_val == 0.0:
                 dm0_box_cands = box_cands

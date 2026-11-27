@@ -60,6 +60,14 @@ class Config:
     ips_snr_ratio_threshold: float = 0.8
     ips_match_radius_arcsec: float = 30.0
     defer_summary_plots: bool = False
+    engine: str = "wgridder"
+    device: str = "cpu"
+    raster_mode: str = "wgridder"
+    pad_radius: int = 6
+    c2r_batch_size: int = 256
+    min_uv_distance_m: Optional[float] = None
+    raster_uv_threshold: float = 0.0
+    dm_tol: float = 1.0
 
 @dataclass
 class WelfordState:

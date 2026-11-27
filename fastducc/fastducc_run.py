@@ -209,6 +209,51 @@ def build_cli(argv=None):
     parser.add_argument('--ips-match-radius-arcsec', type=float, default=30.0,
                         help='Spatial match radius in arcsec for crossmatching candidates with RACS/PSRCAT (default: 30.0).')
 
+    # --- GPU / Direct half-plane rasterisation & C2R imaging options ---
+    parser.add_argument(
+        '--engine',
+        choices=['wgridder', 'direct_raster'],
+        default='wgridder',
+        help="Imaging engine: 'wgridder' (CPU ducc0.wgridder.vis2dirty) or 'direct_raster' (half-plane gridding + batched C2R FFT; default: wgridder).",
+    )
+    parser.add_argument(
+        '--device',
+        choices=['cpu', 'cuda', 'auto'],
+        default='cpu',
+        help="Compute backend for direct_raster imaging: 'cpu', 'cuda', or 'auto' (default: cpu).",
+    )
+    parser.add_argument(
+        '--raster-mode',
+        choices=['wgridder', 'nearest', 'bilinear'],
+        default='wgridder',
+        help="Half-plane gridding kernel for --engine direct_raster: 'wgridder' (DUCC polynomial kernel + deapodisation), 'nearest', or 'bilinear' (default: wgridder).",
+    )
+    parser.add_argument(
+        '--pad-radius',
+        type=int,
+        default=6,
+        help='Active UV-cell dilation radius in grid cells for two-tier subbanded direct_raster mode (default: 6).',
+    )
+    parser.add_argument(
+        '--gpu-c2r-batch-size', '--c2r-batch-size',
+        dest='c2r_batch_size',
+        type=int,
+        default=256,
+        help='Maximum time slices per batched GPU 2D C2R inverse FFT call (default: 256).',
+    )
+    parser.add_argument(
+        '--min-uv-distance-m',
+        type=float,
+        default=None,
+        help='Minimum baseline UV distance in metres to include during gridding (default: None).',
+    )
+    parser.add_argument(
+        '--raster-uv-threshold',
+        type=float,
+        default=0.0,
+        help='Visibility amplitude threshold applied after gridding in direct_raster mode (default: 0.0).',
+    )
+
     # --- Parallel execution flags ---
     parser.add_argument(
         '--parallel-mode',
@@ -370,6 +415,11 @@ def make_config(args, paths) -> Config:
     else:
         nsubbands = int(getattr(args, "nsubbands", 16))
     nthreads = args.nthreads if args.nthreads > 0 else (args.slurm_cores_per_worker if getattr(args, "parallel_mode", "") == 'dask-slurm' else 0)
+    device = str(getattr(args, "device", "cpu")).strip().lower()
+    engine = str(getattr(args, "engine", "wgridder")).strip().lower()
+    if device == "cuda" and engine == "wgridder":
+        logger.info("CUDA device requested with engine='wgridder'; selecting engine='direct_raster' for GPU half-plane gridding and C2R imaging.")
+        engine = "direct_raster"
     return Config(
         msname=args.msname,
         npix_x=args.npix_x, npix_y=args.npix_y,
@@ -410,6 +460,14 @@ def make_config(args, paths) -> Config:
         ips_snr_ratio_threshold=getattr(args, "ips_snr_ratio_threshold", 0.8),
         ips_match_radius_arcsec=getattr(args, "ips_match_radius_arcsec", 30.0),
         defer_summary_plots=getattr(args, "defer_summary_plots", False),
+        engine=engine,
+        device=device,
+        raster_mode=str(getattr(args, "raster_mode", "wgridder")).strip().lower(),
+        pad_radius=int(getattr(args, "pad_radius", 6)),
+        c2r_batch_size=int(getattr(args, "c2r_batch_size", 256)),
+        min_uv_distance_m=getattr(args, "min_uv_distance_m", None),
+        raster_uv_threshold=float(getattr(args, "raster_uv_threshold", 0.0)),
+        dm_tol=float(getattr(args, "dm_tol", 1.0)),
     )
 
 def main_serial(args):
@@ -563,19 +621,79 @@ def run_pipeline(args):
         logger.info(f"Limited to first {len(chunk_bounds)} chunks.")
 
     def _process_chunks(client=None):
-        logger.info(f"Processing {len(chunk_bounds)} chunk(s) across {len(dm_trials)} DM trial(s) ({dm_trials[0]:.2f}..{dm_trials[-1]:.2f} pc cm^-3)")
+        logger.info(
+            "Processing %d chunk(s) across %d DM trial(s) (%.2f..%.2f pc cm^-3) [engine=%s, device=%s, dedisp_mode=%s]",
+            len(chunk_bounds),
+            len(dm_trials),
+            dm_trials[0],
+            dm_trials[-1],
+            cfg.engine,
+            cfg.device,
+            cfg.dedisp_mode,
+        )
         if client is None:
-            # Serial execution
+            # Serial execution (with asynchronous chunk pre-loading for GPU/direct_raster)
             agg_list = []
-            for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
-                logger.info(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...")
-                chunk_times = unique_times[start:end+1]
-                res = fd_core.process_chunk_task(
-                    cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
-                )
-                times, cube, welford_data = res[0], res[1], res[2]
-                sid = res[3] if len(res) > 3 else scan_id_str
-                agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, welford_data, sid))
+            use_prefetch = (cfg.engine == "direct_raster") and (len(chunk_bounds) > 1)
+            if use_prefetch:
+                from concurrent.futures import ThreadPoolExecutor
+
+                def _load_one(s_idx: int, e_idx: int):
+                    return imaging.load_chunk_data(
+                        msname=cfg.msname,
+                        t_main=None,
+                        start_time_idx=s_idx,
+                        end_time_idx=e_idx,
+                        chunk_times=unique_times[s_idx : e_idx + 1],
+                        corr_mode=cfg.corr_mode,
+                        basis=cfg.basis,
+                        single_pol=cfg.single_pol,
+                        data_column=cfg.data_column,
+                        min_uv_distance_m=cfg.min_uv_distance_m,
+                    )
+
+                with ThreadPoolExecutor(max_workers=1) as io_pool:
+                    s0, e0 = chunk_bounds[0]
+                    next_fut = io_pool.submit(_load_one, s0, e0)
+                    for ci, ((start, end), scan_id_str) in enumerate(zip(chunk_bounds, chunk_scan_ids)):
+                        preloaded = next_fut.result()
+                        if ci + 1 < len(chunk_bounds):
+                            sn, en = chunk_bounds[ci + 1]
+                            next_fut = io_pool.submit(_load_one, sn, en)
+                        logger.info(
+                            "[%s] Chunk %d/%d (%d..%d, scan %s) across %d DM trial(s)...",
+                            cfg.device.upper(),
+                            ci + 1,
+                            len(chunk_bounds),
+                            start,
+                            end,
+                            scan_id_str,
+                            len(dm_trials),
+                        )
+                        chunk_times = unique_times[start : end + 1]
+                        res = fd_core.process_chunk_task(
+                            cfg,
+                            ms_base,
+                            candidates_dir,
+                            start,
+                            end,
+                            scan_id_str,
+                            chunk_times,
+                            preloaded_data=preloaded,
+                        )
+                        times, cube, welford_data = res[0], res[1], res[2]
+                        sid = res[3] if len(res) > 3 else scan_id_str
+                        agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, welford_data, sid))
+            else:
+                for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
+                    logger.info(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...")
+                    chunk_times = unique_times[start:end+1]
+                    res = fd_core.process_chunk_task(
+                        cfg, ms_base, candidates_dir, start, end, scan_id_str, chunk_times
+                    )
+                    times, cube, welford_data = res[0], res[1], res[2]
+                    sid = res[3] if len(res) > 3 else scan_id_str
+                    agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, welford_data, sid))
             return agg_list
         else:
             # Dask parallel workers execution

@@ -47,6 +47,8 @@ __all__ = [
     "ragged",
     "ragged_gpu",
     "gpu_raster",
+    "gpu_c2r",
+    "gpu_transient",
     "gpu_direct_cube",
     "gpu_nufft",
 ]
