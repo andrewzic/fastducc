@@ -207,6 +207,59 @@ def continuum_image(
 
     return dirty
     
+def build_ms_row_index(
+    msname: str,
+    *,
+    use_weight_spectrum: bool = True,
+) -> dict[str, Any]:
+    """
+    Single-pass MS metadata and contiguous time-to-row index builder.
+
+    Reads ``TIME``/``TIME_CENTROID`` once to determine whether rows are
+    monotonically time-ordered. When sorted, ``row_starts[i]..row_ends[i]``
+    gives the exact contiguous row slice for unique timestamp ``i``, enabling
+    O(1) ``table.getcol(..., startrow=..., nrow=...)`` chunk reads without
+    repeated ``table.query()`` full-table scans.
+    """
+    with table(msname, readonly=True, ack=False) as t_main:
+        colnames = set(t_main.colnames())
+        time_col = "TIME_CENTROID" if "TIME_CENTROID" in colnames else "TIME"
+        all_times = np.asarray(t_main.getcol(time_col), dtype=np.float64)
+        has_flag_row = "FLAG_ROW" in colnames
+        has_weight_spectrum = bool(use_weight_spectrum and ("WEIGHT_SPECTRUM" in colnames))
+
+    with table(f"{msname}/SPECTRAL_WINDOW", readonly=True, ack=False) as t_spw:
+        n_spw = int(t_spw.nrows())
+        if n_spw != 1:
+            raise ValueError(f"fastducc currently supports a single SPW; found {n_spw}")
+        chan_freq = np.asarray(t_spw.getcell("CHAN_FREQ", 0), dtype=np.float64)
+
+    labels, lbl2idx = ms_utils.get_corr_label_indices(msname)
+
+    is_sorted = bool(all_times.size <= 1 or np.all(all_times[1:] >= all_times[:-1]))
+    row_starts = None
+    row_ends = None
+    unique_times = None
+    if is_sorted and all_times.size > 0:
+        change = np.flatnonzero(all_times[1:] != all_times[:-1]) + 1
+        row_starts = np.concatenate(([0], change)).astype(np.int64)
+        row_ends = np.concatenate((change, [all_times.size])).astype(np.int64)
+        unique_times = all_times[row_starts]
+
+    return {
+        "time_col": time_col,
+        "chan_freq": chan_freq,
+        "labels": labels,
+        "lbl2idx": lbl2idx,
+        "has_flag_row": has_flag_row,
+        "has_weight_spectrum": has_weight_spectrum,
+        "is_sorted": is_sorted,
+        "unique_times": unique_times,
+        "row_starts": row_starts,
+        "row_ends": row_ends,
+    }
+
+
 def load_chunk_data(
     msname: str,
     *,
@@ -222,10 +275,16 @@ def load_chunk_data(
     corr_index: int | None = None,
     use_weight_spectrum: bool = True,
     min_uv_distance_m: float | None = None,
+    row_slice: Tuple[int, int] | None = None,
+    cached_meta: dict[str, Any] | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Read visibilities, weights, and UVW coordinates from Measurement Set for a single
     time chunk into memory arrays.
+
+    When ``row_slice=(startrow, nrow)`` is supplied (from :func:`build_ms_row_index`),
+    reads the contiguous row range directly via ``getcol(startrow=..., nrow=...)``
+    instead of running a full-table TaQL ``query()``.
 
     Returns
     -------
@@ -237,51 +296,75 @@ def load_chunk_data(
     """
     opened_locally = False
     if t_main is None:
-        t_main = table(msname, readonly=True)
+        t_main = table(msname, readonly=True, ack=False)
         opened_locally = True
 
     t_chunk_window = None
     try:
-        colnames = set(t_main.colnames())
-        time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
-
-        # Frequencies
-        with table(f"{msname}/SPECTRAL_WINDOW", readonly=True) as t_spw:
-            n_spw = t_spw.nrows()
-            if n_spw != 1:
-                raise ValueError(f"fastducc currently supports a single SPW; found {n_spw}")
-            chan_freq = t_spw.getcell('CHAN_FREQ', 0)  # [nchan] Hz
-
-        if chunk_times is not None:
-            times = chunk_times
-            query_str = f"{time_col} >= {times[0]:.17g} AND {time_col} <= {times[-1]:.17g}"
-            t_chunk_window = t_main.query(query_str)
+        if cached_meta is not None:
+            time_col = cached_meta["time_col"]
+            chan_freq = cached_meta["chan_freq"]
+            labels = cached_meta["labels"]
+            lbl2idx = cached_meta["lbl2idx"]
+            has_flag_row = bool(cached_meta["has_flag_row"])
+            has_wgt_spec = bool(use_weight_spectrum and cached_meta["has_weight_spectrum"])
         else:
-            nsub, vis_time, all_times = ms_utils.get_time(t_main)
-            start_idx = 0 if start_time_idx is None else int(start_time_idx)
-            end_idx   = (nsub - 1) if end_time_idx is None else int(end_time_idx)
-            if start_idx < 0 or end_idx < start_idx or end_idx >= nsub:
-                raise ValueError("Invalid start/end time indices")
-            times = all_times[start_idx:end_idx+1]
-            query_str = f"{time_col} >= {times[0]:.17g} AND {time_col} <= {times[-1]:.17g}"
-            t_chunk_window = t_main.query(query_str)
+            colnames = set(t_main.colnames())
+            time_col = 'TIME_CENTROID' if 'TIME_CENTROID' in colnames else 'TIME'
+            has_flag_row = 'FLAG_ROW' in colnames
+            has_wgt_spec = bool(use_weight_spectrum and ('WEIGHT_SPECTRUM' in colnames))
+            with table(f"{msname}/SPECTRAL_WINDOW", readonly=True, ack=False) as t_spw:
+                n_spw = t_spw.nrows()
+                if n_spw != 1:
+                    raise ValueError(f"fastducc currently supports a single SPW; found {n_spw}")
+                chan_freq = t_spw.getcell('CHAN_FREQ', 0)  # [nchan] Hz
+            labels, lbl2idx = ms_utils.get_corr_label_indices(msname)
+
+        if row_slice is not None:
+            startrow, nrow = int(row_slice[0]), int(row_slice[1])
+            time_vals = t_main.getcol(time_col, startrow=startrow, nrow=nrow)
+            a1 = t_main.getcol('ANTENNA1', startrow=startrow, nrow=nrow)
+            a2 = t_main.getcol('ANTENNA2', startrow=startrow, nrow=nrow)
+            uvw_all = t_main.getcol('UVW', startrow=startrow, nrow=nrow)
+            data_all = t_main.getcol(data_column, startrow=startrow, nrow=nrow)
+            flags_all = t_main.getcol('FLAG', startrow=startrow, nrow=nrow)
+            flag_row = t_main.getcol('FLAG_ROW', startrow=startrow, nrow=nrow) if has_flag_row else None
+            if has_wgt_spec:
+                wgt_all = t_main.getcol('WEIGHT_SPECTRUM', startrow=startrow, nrow=nrow)
+            else:
+                wgt_row = t_main.getcol('WEIGHT', startrow=startrow, nrow=nrow)
+                wgt_all = np.broadcast_to(wgt_row[:, None, :], data_all.shape)
+            times = chunk_times if chunk_times is not None else np.unique(time_vals)
+        else:
+            if chunk_times is not None:
+                times = chunk_times
+                query_str = f"{time_col} >= {times[0]:.17g} AND {time_col} <= {times[-1]:.17g}"
+                t_chunk_window = t_main.query(query_str)
+            else:
+                nsub, vis_time, all_times = ms_utils.get_time(t_main)
+                start_idx = 0 if start_time_idx is None else int(start_time_idx)
+                end_idx   = (nsub - 1) if end_time_idx is None else int(end_time_idx)
+                if start_idx < 0 or end_idx < start_idx or end_idx >= nsub:
+                    raise ValueError("Invalid start/end time indices")
+                times = all_times[start_idx:end_idx+1]
+                query_str = f"{time_col} >= {times[0]:.17g} AND {time_col} <= {times[-1]:.17g}"
+                t_chunk_window = t_main.query(query_str)
+
+            time_vals = t_chunk_window.getcol(time_col)
+            a1 = t_chunk_window.getcol('ANTENNA1')
+            a2 = t_chunk_window.getcol('ANTENNA2')
+            uvw_all = t_chunk_window.getcol('UVW')
+            data_all = t_chunk_window.getcol(data_column)
+            flags_all = t_chunk_window.getcol('FLAG')
+            win_cols = set(t_chunk_window.colnames())
+            flag_row = t_chunk_window.getcol('FLAG_ROW') if 'FLAG_ROW' in win_cols else None
+            if use_weight_spectrum and 'WEIGHT_SPECTRUM' in win_cols:
+                wgt_all = t_chunk_window.getcol('WEIGHT_SPECTRUM')
+            else:
+                wgt_row = t_chunk_window.getcol('WEIGHT')
+                wgt_all = np.broadcast_to(wgt_row[:, None, :], data_all.shape)
 
         dt = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
-        labels, lbl2idx = ms_utils.get_corr_label_indices(msname)
-
-        time_vals = t_chunk_window.getcol(time_col)
-        a1 = t_chunk_window.getcol('ANTENNA1')
-        a2 = t_chunk_window.getcol('ANTENNA2')
-        uvw_all = t_chunk_window.getcol('UVW')
-        data_all = t_chunk_window.getcol(data_column)
-        flags_all = t_chunk_window.getcol('FLAG')
-        flag_row = t_chunk_window.getcol('FLAG_ROW') if 'FLAG_ROW' in set(t_chunk_window.colnames()) else None
-
-        if use_weight_spectrum and 'WEIGHT_SPECTRUM' in set(t_chunk_window.colnames()):
-            wgt_all = t_chunk_window.getcol('WEIGHT_SPECTRUM')
-        else:
-            wgt_row = t_chunk_window.getcol('WEIGHT')
-            wgt_all = np.broadcast_to(wgt_row[:, None, :], data_all.shape)
 
         good = ~flags_all
         if flag_row is not None:

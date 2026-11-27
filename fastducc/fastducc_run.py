@@ -638,10 +638,29 @@ def run_pipeline(args):
             if use_prefetch:
                 from concurrent.futures import ThreadPoolExecutor
 
+                ms_row_idx = imaging.build_ms_row_index(cfg.msname)
+                use_row_slices = bool(
+                    ms_row_idx["is_sorted"]
+                    and ms_row_idx["row_starts"] is not None
+                    and len(ms_row_idx["unique_times"]) == len(unique_times)
+                )
+                logger.info(
+                    "[%s] MS row-slice streaming: %s (%d chunks)",
+                    cfg.device.upper(),
+                    "enabled (O(1) direct getcol)" if use_row_slices else "fallback (TaQL query)",
+                    len(chunk_bounds),
+                )
+                t_io = table(cfg.msname, readonly=True, ack=False)
+
                 def _load_one(s_idx: int, e_idx: int):
+                    r_slice = None
+                    if use_row_slices:
+                        r0 = int(ms_row_idx["row_starts"][s_idx])
+                        r1 = int(ms_row_idx["row_ends"][e_idx])
+                        r_slice = (r0, max(0, r1 - r0))
                     return imaging.load_chunk_data(
                         msname=cfg.msname,
-                        t_main=None,
+                        t_main=t_io,
                         start_time_idx=s_idx,
                         end_time_idx=e_idx,
                         chunk_times=unique_times[s_idx : e_idx + 1],
@@ -650,40 +669,45 @@ def run_pipeline(args):
                         single_pol=cfg.single_pol,
                         data_column=cfg.data_column,
                         min_uv_distance_m=cfg.min_uv_distance_m,
+                        row_slice=r_slice,
+                        cached_meta=ms_row_idx,
                     )
 
-                with ThreadPoolExecutor(max_workers=1) as io_pool:
-                    s0, e0 = chunk_bounds[0]
-                    next_fut = io_pool.submit(_load_one, s0, e0)
-                    for ci, ((start, end), scan_id_str) in enumerate(zip(chunk_bounds, chunk_scan_ids)):
-                        preloaded = next_fut.result()
-                        if ci + 1 < len(chunk_bounds):
-                            sn, en = chunk_bounds[ci + 1]
-                            next_fut = io_pool.submit(_load_one, sn, en)
-                        logger.info(
-                            "[%s] Chunk %d/%d (%d..%d, scan %s) across %d DM trial(s)...",
-                            cfg.device.upper(),
-                            ci + 1,
-                            len(chunk_bounds),
-                            start,
-                            end,
-                            scan_id_str,
-                            len(dm_trials),
-                        )
-                        chunk_times = unique_times[start : end + 1]
-                        res = fd_core.process_chunk_task(
-                            cfg,
-                            ms_base,
-                            candidates_dir,
-                            start,
-                            end,
-                            scan_id_str,
-                            chunk_times,
-                            preloaded_data=preloaded,
-                        )
-                        times, cube, welford_data = res[0], res[1], res[2]
-                        sid = res[3] if len(res) > 3 else scan_id_str
-                        agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, welford_data, sid))
+                try:
+                    with ThreadPoolExecutor(max_workers=1) as io_pool:
+                        s0, e0 = chunk_bounds[0]
+                        next_fut = io_pool.submit(_load_one, s0, e0)
+                        for ci, ((start, end), scan_id_str) in enumerate(zip(chunk_bounds, chunk_scan_ids)):
+                            preloaded = next_fut.result()
+                            if ci + 1 < len(chunk_bounds):
+                                sn, en = chunk_bounds[ci + 1]
+                                next_fut = io_pool.submit(_load_one, sn, en)
+                            logger.info(
+                                "[%s] Chunk %d/%d (%d..%d, scan %s) across %d DM trial(s)...",
+                                cfg.device.upper(),
+                                ci + 1,
+                                len(chunk_bounds),
+                                start,
+                                end,
+                                scan_id_str,
+                                len(dm_trials),
+                            )
+                            chunk_times = unique_times[start : end + 1]
+                            res = fd_core.process_chunk_task(
+                                cfg,
+                                ms_base,
+                                candidates_dir,
+                                start,
+                                end,
+                                scan_id_str,
+                                chunk_times,
+                                preloaded_data=preloaded,
+                            )
+                            times, cube, welford_data = res[0], res[1], res[2]
+                            sid = res[3] if len(res) > 3 else scan_id_str
+                            agg_list.append((times, cube if cfg.save_full_var_lightcurves else None, welford_data, sid))
+                finally:
+                    t_io.close()
             else:
                 for (start, end), scan_id_str in zip(chunk_bounds, chunk_scan_ids):
                     logger.info(f"[Serial] Chunk {start}..{end} (scan {scan_id_str}) across {len(dm_trials)} DM trials...")

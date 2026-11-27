@@ -461,8 +461,6 @@ def iter_chunk_dirty_cubes_direct_raster(
         finally:
             ws.release()
             del d_vis, d_wgt, d_uvw, d_cfu, d_cfv
-            with cp.cuda.Device(int(device_id)):
-                cp.get_default_memory_pool().free_all_blocks()
             logger.debug(
                 "[GPU Transient] Finished chunk nt=%d across %d DM(s) in %.2fs",
                 nt,

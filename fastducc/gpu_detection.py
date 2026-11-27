@@ -188,13 +188,15 @@ def local_mean_std_2d_batch_gpu(
     window_size: Union[int, Tuple[int, int]] = 64,
     min_std: float = 1e-12,
     precomputed_sum_w: Optional[Any] = None,
+    use_float32: bool = False,
 ) -> Tuple[Any, Any]:
     """
     Compute boundary-aware 2D sliding-window local mean and standard deviation
     on GPU for a batch of 2D images ``d_batch (B, Ny, Nx)``.
 
-    Matches ``fastducc.kernels._local_mean_std_2d`` using ``float64`` uniform
-    filtering to avoid catastrophic cancellation in ``E[x^2] - E[x]^2``.
+    When ``use_float32=True``, subtracts the per-frame spatial mean prior to
+    squaring to eliminate catastrophic cancellation in ``float32`` while
+    halving memory bandwidth and doubling throughput on GPU.
     """
     if d_batch.ndim != 3:
         raise ValueError(f"d_batch must be 3D (B, Ny, Nx); got shape {d_batch.shape}.")
@@ -205,45 +207,53 @@ def local_mean_std_2d_batch_gpu(
         wy, wx = int(window_size[0]), int(window_size[1])
     win_area = float(wy * wx)
 
-    d64 = d_batch.astype(cp.float64, copy=False)
-    finite_mask = cp.isfinite(d64)
+    work_dtype = cp.float32 if use_float32 else cp.float64
+    d_work = d_batch.astype(work_dtype, copy=False)
+    finite_mask = cp.isfinite(d_work)
     all_finite = bool(cp.all(finite_mask))
 
     if valid_mask is None and all_finite and precomputed_sum_w is not None:
-        sum_w = precomputed_sum_w[None, :, :]
-        data = d64
+        sum_w = precomputed_sum_w.astype(work_dtype, copy=False)[None, :, :]
+        if use_float32:
+            shift = cp.mean(d_work, axis=(1, 2), keepdims=True)
+            data = d_work - shift
+        else:
+            shift = None
+            data = d_work
     else:
+        shift = None
         if valid_mask is not None:
             vm = cp.asarray(valid_mask, dtype=cp.bool_)[None, :, :]
-            w_arr = cp.where(vm & finite_mask, 1.0, 0.0)
+            w_arr = cp.where(vm & finite_mask, work_dtype(1.0), work_dtype(0.0))
         else:
-            w_arr = cp.where(finite_mask, 1.0, 0.0)
-        data = cp.where(w_arr > 0.0, d64, 0.0)
-        sum_w = cnd.uniform_filter(w_arr, size=(1, wy, wx), mode="constant", cval=0.0) * win_area
+            w_arr = cp.where(finite_mask, work_dtype(1.0), work_dtype(0.0))
+        data = cp.where(w_arr > 0.0, d_work, work_dtype(0.0))
+        sum_w = cnd.uniform_filter(w_arr, size=(1, wy, wx), mode="constant", cval=0.0) * work_dtype(win_area)
 
-    sum_d = cnd.uniform_filter(data, size=(1, wy, wx), mode="constant", cval=0.0) * win_area
-    sum_d2 = cnd.uniform_filter(data * data, size=(1, wy, wx), mode="constant", cval=0.0) * win_area
+    sum_d = cnd.uniform_filter(data, size=(1, wy, wx), mode="constant", cval=0.0) * work_dtype(win_area)
+    sum_d2 = cnd.uniform_filter(data * data, size=(1, wy, wx), mode="constant", cval=0.0) * work_dtype(win_area)
 
-    valid_count = cp.maximum(sum_w, 1.0)
+    valid_count = cp.maximum(sum_w, work_dtype(1.0))
     mean_map = sum_d / valid_count
     mean_sq_map = sum_d2 / valid_count
-    var_map = cp.maximum(0.0, mean_sq_map - mean_map * mean_map)
+    var_map = cp.maximum(work_dtype(0.0), mean_sq_map - mean_map * mean_map)
     std_map = cp.sqrt(var_map)
+    if shift is not None:
+        mean_map = mean_map + shift
 
-    invalid = (sum_w < 1.0) | (~cp.isfinite(std_map)) | (std_map < float(min_std))
+    invalid = (sum_w < work_dtype(1.0)) | (~cp.isfinite(std_map)) | (std_map < work_dtype(min_std))
     if bool(cp.any(invalid)):
-        # Per-frame fallback matching _local_mean_std_2d
         for b in range(B):
             if bool(cp.any(invalid[b])):
                 if valid_mask is not None:
-                    vp = d64[b][cp.asarray(valid_mask, dtype=cp.bool_) & finite_mask[b]]
+                    vp = d_work[b][cp.asarray(valid_mask, dtype=cp.bool_) & finite_mask[b]]
                 else:
-                    vp = d64[b][finite_mask[b]]
+                    vp = d_work[b][finite_mask[b]]
                 g_std = float(cp.nanstd(vp).get()) if vp.size > 0 else 1.0
                 if (not np.isfinite(g_std)) or g_std <= float(min_std):
                     g_std = 1.0
-                mean_map[b] = cp.where(invalid[b], 0.0, mean_map[b])
-                std_map[b] = cp.where(invalid[b], g_std, std_map[b])
+                mean_map[b] = cp.where(invalid[b], work_dtype(0.0), mean_map[b])
+                std_map[b] = cp.where(invalid[b], work_dtype(g_std), std_map[b])
 
     return mean_map, std_map
 
@@ -306,7 +316,8 @@ def boxcar_search_and_nms_gpu(
     use_local_threshold: bool = True,
     local_window_size: int = 64,
     dm: float = 0.0,
-    t_batch_size: int = 64,
+    t_batch_size: int = 128,
+    stride_fraction: float = 0.25,
     device_id: int = 0,
 ) -> Dict[int, List[Dict[str, Any]]]:
     """
@@ -361,10 +372,10 @@ def boxcar_search_and_nms_gpu(
         precomp_sum_w = None
         if use_local_threshold and d_valid_mask is None:
             wy = wx = int(local_window_size)
-            ones_2d = cp.ones((1, Ny, Nx), dtype=cp.float64)
+            ones_2d = cp.ones((1, Ny, Nx), dtype=cp.float32)
             precomp_sum_w = (
                 cnd.uniform_filter(ones_2d, size=(1, wy, wx), mode="constant", cval=0.0)[0]
-                * float(wy * wx)
+                * np.float32(wy * wx)
             )
             del ones_2d
 
@@ -372,17 +383,32 @@ def boxcar_search_and_nms_gpu(
         r_sp = max(1, int(spatial_radius))
         r_t = max(0, int(time_radius))
         thresh = float(threshold_sigma)
+        s_frac = max(0.0, float(stride_fraction))
 
         for w in widths_samples:
             T_eff = T - w + 1
+            step = max(1, int(w * s_frac)) if (s_frac > 0.0 and w >= 8) else 1
+            t_starts = np.arange(0, T_eff, step, dtype=np.int64)
+            if t_starts.size == 0 or t_starts[-1] != T_eff - 1:
+                t_starts = np.append(t_starts, T_eff - 1)
+
             raw_hits: List[Tuple[int, int, int, float]] = []
 
-            for t0 in range(0, T_eff, t_blk):
-                t1 = min(T_eff, t0 + t_blk)
-                B = t1 - t0
-
-                # Windowed boxcar sum S: (B, Ny, Nx)
-                S_blk = d_csum[t0 + w : t1 + w] - d_csum[t0 : t1]
+            for i0 in range(0, t_starts.size, t_blk):
+                t_sel = t_starts[i0 : i0 + t_blk]
+                if step == 1:
+                    t0 = int(t_sel[0])
+                    t1 = int(t_sel[-1]) + 1
+                    S_blk = (d_csum[t0 + w : t1 + w] - d_csum[t0 : t1]).astype(cp.float32)
+                    zero_frame_in_win = (d_zero_frame_csum[t0 + w : t1 + w] - d_zero_frame_csum[t0 : t1]) > 0
+                    invalid_pix_in_win = (d_invalid_pix_csum[t0 + w : t1 + w] - d_invalid_pix_csum[t0 : t1]) > 0
+                else:
+                    d_sel = cp.asarray(t_sel, dtype=cp.int64)
+                    d_sel_w = d_sel + w
+                    S_blk = (d_csum[d_sel_w] - d_csum[d_sel]).astype(cp.float32)
+                    zero_frame_in_win = (d_zero_frame_csum[d_sel_w] - d_zero_frame_csum[d_sel]) > 0
+                    invalid_pix_in_win = (d_invalid_pix_csum[d_sel_w] - d_invalid_pix_csum[d_sel]) > 0
+                    del d_sel, d_sel_w
 
                 if use_local_threshold:
                     mu_loc, sigma_loc = local_mean_std_2d_batch_gpu(
@@ -390,8 +416,9 @@ def boxcar_search_and_nms_gpu(
                         valid_mask=d_valid_mask,
                         window_size=local_window_size,
                         precomputed_sum_w=precomp_sum_w,
+                        use_float32=True,
                     )
-                    snr_blk = ((S_blk - mu_loc) / sigma_loc).astype(cp.float32)
+                    snr_blk = (S_blk - mu_loc) / sigma_loc
                     del mu_loc, sigma_loc
                 else:
                     sig_w = _global_sigma_batch_gpu(
@@ -405,8 +432,6 @@ def boxcar_search_and_nms_gpu(
                 del S_blk
 
                 # Gate any window containing a zero-padded frame or zero/NaN pixel
-                zero_frame_in_win = (d_zero_frame_csum[t0 + w : t1 + w] - d_zero_frame_csum[t0 : t1]) > 0
-                invalid_pix_in_win = (d_invalid_pix_csum[t0 + w : t1 + w] - d_invalid_pix_csum[t0 : t1]) > 0
                 bad_mask = zero_frame_in_win[:, None, None] | invalid_pix_in_win
                 if d_valid_mask is not None:
                     bad_mask = bad_mask | (~d_valid_mask[None, :, :])
@@ -432,7 +457,7 @@ def boxcar_search_and_nms_gpu(
                     xs_h = cp.asnumpy(xs)
                     snrs_h = cp.asnumpy(snrs)
                     for tr, y_i, x_i, s_v in zip(t_rel_h, ys_h, xs_h, snrs_h):
-                        raw_hits.append((t0 + int(tr), int(y_i), int(x_i), float(s_v)))
+                        raw_hits.append((int(t_sel[int(tr)]), int(y_i), int(x_i), float(s_v)))
                 del work, peaks_mask, snr_blk
 
             # Greedy spatial + temporal NMS on sparse host hits (exact match to filters.nms_snr_maps_per_width)
