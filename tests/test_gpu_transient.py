@@ -314,3 +314,63 @@ def test_gpu_vs_cpu_direct_raster_transient_parity():
         )
         for dm_val in (0.0, 25.0):
             np.testing.assert_allclose(gpu_out[dm_val], cpu_out[dm_val], rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not gpu_raster.is_cuda_available(), reason="CUDA device unavailable")
+def test_gpu_welford_and_boxcar_detection_parity():
+    """Verify GPU Welford variance, local noise thresholding, and boxcar NMS match CPU."""
+    import cupy as cp
+    from fastducc import detection, filters, gpu_detection, kernels
+
+    rng = np.random.default_rng(99)
+    T, Ny, Nx = 64, 96, 96
+    times = np.arange(T, dtype=np.float64) * 0.11
+    cube = rng.standard_normal((T, Ny, Nx)).astype(np.float32)
+
+    # Inject a bright 4-sample transient pulse at (y=40, x=55, t=20..23)
+    cube[20:24, 40, 55] += 12.0
+
+    # 1. Welford parity (with EMA high-pass filter)
+    d_cube = cp.asarray(cube)
+    c_gpu, m_gpu, M2_gpu, std_gpu = gpu_detection.welford_update_cube_gpu(
+        d_cube, times, var_highpass_cutoff_sec=30.0
+    )
+
+    dt_med = float(np.median(np.diff(times)))
+    alphas = np.array([1.0 - np.exp(-dt_med / 30.0)] * T, dtype=np.float64)
+    ema_cpu = np.nanmean(cube, axis=0, dtype=np.float64)
+    c_cpu = np.zeros((Ny, Nx), dtype=np.int64)
+    m_cpu = np.zeros((Ny, Nx), dtype=np.float64)
+    M2_cpu = np.zeros((Ny, Nx), dtype=np.float64)
+    kernels.welford_update_cube(c_cpu, m_cpu, M2_cpu, ema_cpu, cube, alphas, do_highpass=True, ignore_nan=True)
+    std_cpu = kernels.welford_finalise_std(c_cpu, M2_cpu, ddof=1)
+
+    np.testing.assert_array_equal(c_gpu, c_cpu)
+    np.testing.assert_allclose(m_gpu, m_cpu, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(M2_gpu, M2_cpu, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(std_gpu, std_cpu, rtol=1e-5, atol=1e-5)
+
+    # 2. Variance local-threshold search parity
+    var_gpu, snr_gpu = gpu_detection.variance_search_welford_gpu(
+        std_gpu, threshold_sigma=6.0, use_local_threshold=True, local_window_size=32
+    )
+    var_cpu, snr_cpu = detection.variance_search_welford(
+        std_cpu, threshold_sigma=6.0, return_snr_image=True, use_local_threshold=True, local_window_size=32
+    )
+    np.testing.assert_allclose(snr_gpu, snr_cpu, rtol=1e-4, atol=1e-4)
+    assert len(var_gpu) == len(var_cpu) and len(var_gpu) >= 1
+    assert (var_gpu[0]["y"], var_gpu[0]["x"]) == (40, 55)
+
+    # 3. Boxcar cumsum + local threshold + NMS parity
+    dets_gpu_by_w = gpu_detection.boxcar_search_and_nms_gpu(
+        times, d_cube, widths=[1, 2, 4, 8], threshold_sigma=7.0,
+        spatial_radius=4, time_radius=2, use_local_threshold=True, local_window_size=32,
+    )
+    final_gpu = filters.group_filter_across_widths(
+        dets_gpu_by_w, times, spatial_radius=4, time_radius=8, ny_nx=(Ny, Nx), cube=cube
+    )
+    assert len(final_gpu) >= 1
+    top = final_gpu[0]
+    assert (top["y"], top["x"]) == (40, 55)
+    assert top["width_samples"] == 4
+    assert top["snr"] > 15.0

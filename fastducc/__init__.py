@@ -48,6 +48,7 @@ __all__ = [
     "ragged_gpu",
     "gpu_raster",
     "gpu_c2r",
+    "gpu_detection",
     "gpu_transient",
     "gpu_direct_cube",
     "gpu_nufft",

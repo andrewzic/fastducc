@@ -588,7 +588,7 @@ def _export_boxcar_chunk_products(
 def _process_variance_chunk_dm(
     cfg: Config,
     times: np.ndarray,
-    cube: np.ndarray,
+    cube: Any,
     dm_val: float,
     chunk_root: str,
     scan_id_str: str,
@@ -603,55 +603,84 @@ def _process_variance_chunk_dm(
     vis_3d: np.ndarray | None = None,
     wgt_3d: np.ndarray | None = None,
     uvw_3d: np.ndarray | None = None,
+    is_gpu_cube: bool = False,
+    get_host_cube=None,
 ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], list[dict]]:
     """Process variance detection and Welford accumulation for a single trial DM on a chunk."""
     Ny, Nx = cfg.npix_y, cfg.npix_x
-    do_highpass = cfg.var_highpass_cutoff_sec > 0
-    alphas = np.zeros(len(times), dtype=np.float64)
-    if do_highpass:
-        ema_mean = np.nanmean(cube, axis=0, dtype=np.float64)
-        last_t = np.nan
-        dt_median = np.median(np.diff(times)) if len(times) > 1 else 0.0
-        for i, t in enumerate(times):
-            if np.isnan(last_t):
-                alphas[i] = 1.0 - np.exp(-dt_median / cfg.var_highpass_cutoff_sec)
-            else:
-                dt_step = max(0.0, t - last_t)
-                alphas[i] = 1.0 - np.exp(-dt_step / cfg.var_highpass_cutoff_sec)
-            last_t = t
-    else:
-        ema_mean = np.full((Ny, Nx), np.nan, dtype=np.float64)
+    if is_gpu_cube:
+        from fastducc import gpu_detection
 
-    c_dm = np.zeros((Ny, Nx), dtype=np.int64)
-    m_dm = np.zeros((Ny, Nx), dtype=np.float64)
-    M2_dm = np.zeros((Ny, Nx), dtype=np.float64)
-    kernels.welford_update_cube(c_dm, m_dm, M2_dm, ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
+        c_dm, m_dm, M2_dm, std_map_partial = gpu_detection.welford_update_cube_gpu(
+            cube,
+            times,
+            var_highpass_cutoff_sec=cfg.var_highpass_cutoff_sec,
+            ignore_nan=True,
+        )
+    else:
+        do_highpass = cfg.var_highpass_cutoff_sec > 0
+        alphas = np.zeros(len(times), dtype=np.float64)
+        if do_highpass:
+            ema_mean = np.nanmean(cube, axis=0, dtype=np.float64)
+            last_t = np.nan
+            dt_median = np.median(np.diff(times)) if len(times) > 1 else 0.0
+            for i, t in enumerate(times):
+                if np.isnan(last_t):
+                    alphas[i] = 1.0 - np.exp(-dt_median / cfg.var_highpass_cutoff_sec)
+                else:
+                    dt_step = max(0.0, t - last_t)
+                    alphas[i] = 1.0 - np.exp(-dt_step / cfg.var_highpass_cutoff_sec)
+                last_t = t
+        else:
+            ema_mean = np.full((Ny, Nx), np.nan, dtype=np.float64)
+
+        c_dm = np.zeros((Ny, Nx), dtype=np.int64)
+        m_dm = np.zeros((Ny, Nx), dtype=np.float64)
+        M2_dm = np.zeros((Ny, Nx), dtype=np.float64)
+        kernels.welford_update_cube(c_dm, m_dm, M2_dm, ema_mean, cube, alphas, do_highpass=do_highpass, ignore_nan=True)
+        std_map_partial = kernels.welford_finalise_std(c_dm, M2_dm, ddof=1) if cfg.enable_var_chunk else None
 
     annotated_var: list[dict] = []
     if cfg.enable_var_chunk:
         var_root = chunk_root + "_var"
-        std_map_partial = kernels.welford_finalise_std(c_dm, M2_dm, ddof=1)
         if cfg.do_var_search:
-            var_dets, snr_img = detection.variance_search_welford(
-                std_map_partial,
-                threshold_sigma=cfg.var_threshold,
-                return_snr_image=True,
-                keep_top_k=cfg.var_keep_k,
-                valid_mask=None,
-                spatial_estimator="clipped_rms",
-                clip_sigma=cfg.rms_clip_sigma,
-                subtract_mean_of_std_map=True,
-                use_local_threshold=cfg.use_local_threshold,
-                local_window_size=cfg.local_window_size,
-                dm=dm_val,
-            )
+            if is_gpu_cube:
+                from fastducc import gpu_detection
+
+                var_dets, snr_img = gpu_detection.variance_search_welford_gpu(
+                    std_map_partial,
+                    threshold_sigma=cfg.var_threshold,
+                    keep_top_k=cfg.var_keep_k,
+                    valid_mask=None,
+                    spatial_estimator="clipped_rms",
+                    clip_sigma=cfg.rms_clip_sigma,
+                    subtract_mean_of_std_map=True,
+                    use_local_threshold=cfg.use_local_threshold,
+                    local_window_size=cfg.local_window_size,
+                    dm=dm_val,
+                )
+            else:
+                var_dets, snr_img = detection.variance_search_welford(
+                    std_map_partial,
+                    threshold_sigma=cfg.var_threshold,
+                    return_snr_image=True,
+                    keep_top_k=cfg.var_keep_k,
+                    valid_mask=None,
+                    spatial_estimator="clipped_rms",
+                    clip_sigma=cfg.rms_clip_sigma,
+                    subtract_mean_of_std_map=True,
+                    use_local_threshold=cfg.use_local_threshold,
+                    local_window_size=cfg.local_window_size,
+                    dm=dm_val,
+                )
             if len(var_dets) > 0:
+                host_cube = get_host_cube() if (is_gpu_cube and get_host_cube is not None) else cube
                 var_nms = filters.nms_snr_map_2d(
                     snr_2d=snr_img, base_detections=var_dets,
                     threshold_sigma=cfg.var_threshold,
                     spatial_radius=cfg.nms_radius,
                     valid_mask=None,
-                    times=times, cube=cube, time_tag_policy="peak_absdev"
+                    times=times, cube=host_cube, time_tag_policy="peak_absdev"
                 )
                 annotated_var = ducc_wcs.annotate_candidates_with_sky_coords(
                     msname=cfg.msname, final_detections=var_nms,
@@ -693,18 +722,20 @@ def _process_variance_chunk_dm(
                 search_type="variance",
             )
 
-        _export_variance_chunk_products(
-            cfg=cfg,
-            times=times,
-            cube=cube,
-            std_map_partial=std_map_partial,
-            annotated_var=annotated_var,
-            var_root=var_root,
-            chan_freq=chan_freq,
-            vis_3d=vis_3d,
-            wgt_3d=wgt_3d,
-            uvw_3d=uvw_3d,
-        )
+        if len(annotated_var) > 0:
+            host_cube_exp = get_host_cube() if (is_gpu_cube and get_host_cube is not None) else cube
+            _export_variance_chunk_products(
+                cfg=cfg,
+                times=times,
+                cube=host_cube_exp,
+                std_map_partial=std_map_partial,
+                annotated_var=annotated_var,
+                var_root=var_root,
+                chan_freq=chan_freq,
+                vis_3d=vis_3d,
+                wgt_3d=wgt_3d,
+                uvw_3d=uvw_3d,
+            )
 
     return (c_dm, m_dm, M2_dm), annotated_var
 
@@ -712,7 +743,7 @@ def _process_variance_chunk_dm(
 def _process_boxcar_chunk_dm(
     cfg: Config,
     times: np.ndarray,
-    cube: np.ndarray,
+    cube: Any,
     dm_val: float,
     chunk_root: str,
     scan_id_str: str,
@@ -727,39 +758,70 @@ def _process_boxcar_chunk_dm(
     vis_3d: np.ndarray | None = None,
     wgt_3d: np.ndarray | None = None,
     uvw_3d: np.ndarray | None = None,
+    is_gpu_cube: bool = False,
+    get_host_cube=None,
 ) -> list[dict]:
     """Process boxcar detection for a single trial DM on a chunk."""
     box_root = chunk_root + "_boxcar"
     annotated: list[dict] = []
     if cfg.do_boxcar_search:
-        dets, snr_cubes = detection.boxcar_search_time(
-            times, cube,
-            widths=cfg.boxcar_widths,
-            widths_in_seconds=False,
-            threshold_sigma=cfg.boxcar_threshold,
-            return_snr_cubes=True,
-            keep_top_k=50,
-            std_mode="spatial_per_window",
-            subtract_mean_per_pixel=True,
-            use_local_threshold=cfg.use_local_threshold,
-            local_window_size=cfg.local_window_size,
-            dm=dm_val,
-        )
-        dets_by_w = filters.nms_snr_maps_per_width(
-            snr_cubes, times,
-            threshold_sigma=cfg.boxcar_threshold,
-            spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None,
-            cube=cube
-        )
-        final_dets = filters.group_filter_across_widths(
-            dets_by_w, times,
-            spatial_radius=cfg.nms_radius,
-            time_radius=8,
-            policy="max_snr",
-            max_per_time_group=1,
-            ny_nx=(cube.shape[1], cube.shape[2]),
-            cube=cube
-        )
+        if is_gpu_cube:
+            from fastducc import gpu_detection
+
+            dets_by_w = gpu_detection.boxcar_search_and_nms_gpu(
+                times=times,
+                d_cube=cube,
+                widths=cfg.boxcar_widths,
+                threshold_sigma=cfg.boxcar_threshold,
+                spatial_radius=cfg.nms_radius,
+                time_radius=2,
+                valid_mask=None,
+                subtract_mean_per_pixel=True,
+                std_mode="spatial_per_window",
+                use_local_threshold=cfg.use_local_threshold,
+                local_window_size=cfg.local_window_size,
+                dm=dm_val,
+            )
+            has_any_hits = any(len(v) > 0 for v in dets_by_w.values())
+            host_cube = get_host_cube() if (has_any_hits and get_host_cube is not None) else None
+            final_dets = filters.group_filter_across_widths(
+                dets_by_w, times,
+                spatial_radius=cfg.nms_radius,
+                time_radius=8,
+                policy="max_snr",
+                max_per_time_group=1,
+                ny_nx=(int(cube.shape[1]), int(cube.shape[2])),
+                cube=host_cube,
+            ) if has_any_hits else []
+        else:
+            dets, snr_cubes = detection.boxcar_search_time(
+                times, cube,
+                widths=cfg.boxcar_widths,
+                widths_in_seconds=False,
+                threshold_sigma=cfg.boxcar_threshold,
+                return_snr_cubes=True,
+                keep_top_k=50,
+                std_mode="spatial_per_window",
+                subtract_mean_per_pixel=True,
+                use_local_threshold=cfg.use_local_threshold,
+                local_window_size=cfg.local_window_size,
+                dm=dm_val,
+            )
+            dets_by_w = filters.nms_snr_maps_per_width(
+                snr_cubes, times,
+                threshold_sigma=cfg.boxcar_threshold,
+                spatial_radius=cfg.nms_radius, time_radius=2, valid_mask=None,
+                cube=cube
+            )
+            final_dets = filters.group_filter_across_widths(
+                dets_by_w, times,
+                spatial_radius=cfg.nms_radius,
+                time_radius=8,
+                policy="max_snr",
+                max_per_time_group=1,
+                ny_nx=(cube.shape[1], cube.shape[2]),
+                cube=cube
+            )
         if len(final_dets) > 0:
             annotated = ducc_wcs.annotate_candidates_with_sky_coords(
                 msname=cfg.msname, final_detections=final_dets,
@@ -801,17 +863,19 @@ def _process_boxcar_chunk_dm(
             search_type="boxcar",
         )
 
-    _export_boxcar_chunk_products(
-        cfg=cfg,
-        times=times,
-        cube=cube,
-        annotated=annotated,
-        box_root=box_root,
-        chan_freq=chan_freq,
-        vis_3d=vis_3d,
-        wgt_3d=wgt_3d,
-        uvw_3d=uvw_3d,
-    )
+    if len(annotated) > 0:
+        host_cube_exp = get_host_cube() if (is_gpu_cube and get_host_cube is not None) else cube
+        _export_boxcar_chunk_products(
+            cfg=cfg,
+            times=times,
+            cube=host_cube_exp,
+            annotated=annotated,
+            box_root=box_root,
+            chan_freq=chan_freq,
+            vis_3d=vis_3d,
+            wgt_3d=wgt_3d,
+            uvw_3d=uvw_3d,
+        )
 
     return annotated
 
@@ -872,8 +936,12 @@ def process_chunk_task(
     device_name = str(getattr(cfg, "device", "cpu")).strip().lower()
     use_direct_raster = (engine_name == "direct_raster") or (device_name == "cuda")
 
+    use_gpu_detection = False
     if use_direct_raster:
-        from fastducc import gpu_transient
+        from fastducc import gpu_raster, gpu_transient
+
+        eff_dev = gpu_raster.resolve_device(device_name if device_name in ("cpu", "cuda", "auto") else "auto")
+        use_gpu_detection = (eff_dev == "cuda")
 
         dm_cube_iter = gpu_transient.iter_chunk_dirty_cubes_direct_raster(
             vis_3d=vis_3d,
@@ -898,9 +966,10 @@ def process_chunk_task(
             uv_threshold=getattr(cfg, "raster_uv_threshold", 0.0),
             pad_radius=getattr(cfg, "pad_radius", 6),
             c2r_batch_size=getattr(cfg, "c2r_batch_size", 256),
-            device=device_name if device_name in ("cpu", "cuda", "auto") else "auto",
+            device=eff_dev,
             nthreads=max(1, int(cfg.nthreads)) if int(cfg.nthreads) > 0 else 1,
             tolerance_samples=getattr(cfg, "dm_tol", 1.0),
+            return_device=use_gpu_detection,
         )
     else:
         def _iter_wgridder_cubes():
@@ -936,6 +1005,15 @@ def process_chunk_task(
         dm_suffix = f"_dm{dm_val:06.2f}" if is_search else ""
         chunk_root = os.path.join(candidates_dir, f"{ms_base}{scan_suffix}{dm_suffix}_chunk_{start:06d}")
 
+        host_cube_cache: list[np.ndarray | None] = [None if use_gpu_detection else cube]
+
+        def _get_host_cube() -> np.ndarray:
+            if host_cube_cache[0] is None:
+                import cupy as cp
+
+                host_cube_cache[0] = cp.asnumpy(cube)
+            return host_cube_cache[0]
+
         # ---------------------------------------------------------------------
         # 1. Variance search: on each trial DM (if cfg.enable_var)
         # ---------------------------------------------------------------------
@@ -958,13 +1036,15 @@ def process_chunk_task(
                 vis_3d=vis_3d,
                 wgt_3d=wgt_3d,
                 uvw_3d=uvw_3d,
+                is_gpu_cube=use_gpu_detection,
+                get_host_cube=_get_host_cube,
             )
             welford_by_dm[dm_val] = welford_agg
             if dm_val == 0.0:
                 dm0_var_cands = var_cands
 
             if (dm_val == 0.0 or cube_dm0 is None) and cfg.save_full_var_lightcurves:
-                cube_dm0 = cube.copy()
+                cube_dm0 = _get_host_cube().copy()
 
         # ---------------------------------------------------------------------
         # 2. Boxcar search: applied to ALL DMs (if cfg.enable_boxcar)
@@ -988,11 +1068,14 @@ def process_chunk_task(
                 vis_3d=vis_3d,
                 wgt_3d=wgt_3d,
                 uvw_3d=uvw_3d,
+                is_gpu_cube=use_gpu_detection,
+                get_host_cube=_get_host_cube,
             )
             if dm_val == 0.0:
                 dm0_box_cands = box_cands
 
         # Immediately free cube memory before next DM trial
+        host_cube_cache[0] = None
         del cube
 
     # Free large chunk arrays

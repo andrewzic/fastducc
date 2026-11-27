@@ -200,7 +200,8 @@ def iter_chunk_dirty_cubes_direct_raster(
     nthreads: int = 1,
     tolerance_samples: float = 1.25,
     align_to: str = "fmax",
-) -> Iterator[Tuple[float, np.ndarray]]:
+    return_device: bool = False,
+) -> Iterator[Tuple[float, Any]]:
     """
     Generate dirty image cubes ``(nt, npix_y, npix_x)`` across all ``dm_trials``
     for an in-memory chunk using direct Hermitian half-plane rasterisation and
@@ -406,7 +407,7 @@ def iter_chunk_dirty_cubes_direct_raster(
                                     c2r_batch_size=int(c2r_batch_size),
                                     workspace=ws,
                                     device_id=int(device_id),
-                                    return_host=True,
+                                    return_host=not bool(return_device),
                                 )
                                 del d_vis_active
                             yield dm_val, cube
@@ -453,7 +454,7 @@ def iter_chunk_dirty_cubes_direct_raster(
                             c2r_batch_size=int(c2r_batch_size),
                             workspace=ws,
                             device_id=int(device_id),
-                            return_host=True,
+                            return_host=not bool(return_device),
                         )
                         del d_uv_half
                     yield dm_val, cube
