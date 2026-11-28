@@ -612,6 +612,11 @@ def _extract_chunk_dynspecs_for_candidates(
         return {}
 
     pol_label = "I" if cfg.corr_mode in ("stokesI", "average") else str(cfg.single_pol)
+    min_uv_m = (
+        float(cfg.min_uv_distance_m)
+        if getattr(cfg, "min_uv_distance_m", None) is not None
+        else dynspec.DEFAULT_MIN_UV_DISTANCE_M
+    )
     return dynspec.extract_phased_dynamic_spectra_from_chunk(
         times=times,
         chan_freq=chan_freq,
@@ -622,6 +627,7 @@ def _extract_chunk_dynspecs_for_candidates(
         dec0_rad=cfg.dec0_rad,
         targets=list(unique_targets.values()),
         pol=pol_label,
+        min_uv_distance_m=min_uv_m,
     )
 
 

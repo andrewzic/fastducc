@@ -18,6 +18,7 @@ import math
 import os
 import re
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -43,10 +44,160 @@ logger = logging.getLogger("fastducc.dynspec")
 # Speed of light in m/s
 C_LIGHT = 299792458.0
 
+# Default minimum baseline UV distance in metres (matches fastducc transient search / FD_MIN_UV_DISTANCE_M)
+DEFAULT_MIN_UV_DISTANCE_M: float = 200.0
+
 _CORR_CODE_TO_NAME = {
     5: "RR", 6: "RL", 7: "LR", 8: "LL",
     9: "XX", 10: "XY", 11: "YX", 12: "YY",
 }
+
+
+def flag_dynspec_rfi_mad(
+    data: np.ndarray,
+    *,
+    rfi_mad_thresh: float = 3.0,
+    fill_value: float = np.nan,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Flag narrowband RFI channels along the frequency axis using per-channel variance MAD.
+
+    Computes the temporal variance of each frequency channel and flags channels whose
+    variance exceeds ``median + rfi_mad_thresh * 1.4826 * MAD`` across active channels
+    (as well as non-finite or all-zero dead channels). Operates strictly along the
+    frequency axis so genuine broadband short-duration transient bursts in time are
+    preserved.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2D dynamic spectrum array of shape ``(Ntime, Nchan)``.
+    rfi_mad_thresh : float, default 3.0
+        MAD sigma threshold above median channel variance. Set ``<= 0`` to disable.
+    fill_value : float, default np.nan
+        Replacement value written into flagged frequency channels.
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Float32 copy of ``data`` with flagged frequency channels set to ``fill_value``.
+    chan_mask : np.ndarray
+        Boolean mask of shape ``(Nchan,)`` where ``True`` marks a flagged channel.
+    """
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D dynamic spectrum (Ntime, Nchan), got shape {arr.shape}")
+
+    cleaned = arr.copy()
+    nt, nchan = cleaned.shape
+    chan_mask = np.zeros(nchan, dtype=bool)
+    if nt == 0 or nchan == 0 or rfi_mad_thresh is None or float(rfi_mad_thresh) <= 0.0:
+        return cleaned, chan_mask
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        chan_vars = np.nanvar(cleaned.astype(np.float64, copy=False), axis=0)
+
+    active = np.isfinite(chan_vars) & (chan_vars > 0.0)
+    if not np.any(active):
+        chan_mask[:] = True
+        cleaned[:, chan_mask] = fill_value
+        return cleaned, chan_mask
+
+    active_vars = chan_vars[active]
+    med_var = float(np.median(active_vars))
+    mad_var = float(np.median(np.abs(active_vars - med_var)))
+    sigma_var = 1.4826 * mad_var
+
+    if sigma_var > 0.0:
+        var_thresh = med_var + float(rfi_mad_thresh) * sigma_var
+        chan_mask = (chan_vars > var_thresh) | (~active)
+    else:
+        chan_mask = ~active
+
+    if np.any(chan_mask):
+        cleaned[:, chan_mask] = fill_value
+        logger.debug(
+            "Dynamic spectrum RFI flagging: flagged %d/%d channels (rfi_mad_thresh=%.1f)",
+            int(np.sum(chan_mask)),
+            nchan,
+            float(rfi_mad_thresh),
+        )
+    return cleaned, chan_mask
+
+
+def dedisperse_dynamic_spectrum(
+    data: np.ndarray,
+    freqs: np.ndarray,
+    tsamp_s: float,
+    dm_pccc: float,
+    *,
+    align_to: str = "fmax",
+    fill_value: float = np.nan,
+) -> np.ndarray:
+    """Incoherently dedisperse a 2D dynamic spectrum ``(Ntime, Nchan)`` to ``dm_pccc``.
+
+    Uses :func:`fastducc.dedisp.get_dm_delays` (``align_to="fmax"`` by default) and
+    pads the left and right edges of the time axis with ``fill_value`` prior to
+    applying per-channel integer-sample shifts so wrapped edge samples are cleanly
+    masked rather than contaminating the opposite edge.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2D dynamic spectrum array of shape ``(Ntime, Nchan)``.
+    freqs : np.ndarray
+        1D channel frequency array of shape ``(Nchan,)`` in MHz or Hz.
+    tsamp_s : float
+        Sampling interval in seconds.
+    dm_pccc : float
+        Dispersion measure in pc cm^-3.
+    align_to : {'fmax', 'fmin'}, default 'fmax'
+        Reference frequency alignment convention passed to ``fastducc.dedisp.get_dm_delays``.
+    fill_value : float, default np.nan
+        Edge padding value for out-of-bounds shifted samples.
+
+    Returns
+    -------
+    np.ndarray
+        Float32 dedispersed dynamic spectrum of shape ``(Ntime, Nchan)``.
+    """
+    arr = np.asarray(data, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D dynamic spectrum (Ntime, Nchan), got shape {arr.shape}")
+
+    nt, nchan = arr.shape
+    if (
+        nt == 0
+        or nchan == 0
+        or dm_pccc is None
+        or not np.isfinite(float(dm_pccc))
+        or abs(float(dm_pccc)) <= 0.0
+        or tsamp_s is None
+        or not np.isfinite(float(tsamp_s))
+        or float(tsamp_s) <= 0.0
+    ):
+        return arr.copy()
+
+    freq_arr = np.asarray(freqs, dtype=np.float64)
+    if freq_arr.shape != (nchan,):
+        raise ValueError(f"freqs length ({freq_arr.size}) does not match data channel axis ({nchan})")
+    freqs_hz = freq_arr * 1e6 if float(np.nanmax(freq_arr)) < 1e6 else freq_arr
+
+    from fastducc.dedisp import get_dm_delays
+
+    delays = get_dm_delays(freqs_hz, float(dm_pccc), float(tsamp_s), align_to=align_to)
+    pad = int(np.max(np.abs(delays))) if delays.size > 0 else 0
+    if pad == 0:
+        return arr.copy()
+
+    padded = np.full((nt + 2 * pad, nchan), fill_value, dtype=np.float32)
+    padded[pad : pad + nt, :] = arr
+
+    out = np.empty_like(arr, dtype=np.float32)
+    for c in range(nchan):
+        d = int(delays[c])
+        out[:, c] = padded[pad + d : pad + d + nt, c]
+    return out
 
 
 # =============================================================================
@@ -305,7 +456,7 @@ def extract_phased_dynamic_spectra_from_ms(
     verbose: bool = True,
     n_threads: Optional[int] = None,
     datacolumn: str = "DATA",
-    min_uv_distance_m: float = 0.0,
+    min_uv_distance_m: float = DEFAULT_MIN_UV_DISTANCE_M,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Extract phased, baseline-averaged dynamic spectra directly from a Measurement Set in RAM
@@ -598,6 +749,7 @@ def extract_phased_dynamic_spectra_from_ms(
             "telescope": "ASKAP",
             "pol": f"Stokes {pol}",
             "cand_id": c_id,
+            "min_uv_distance_m": float(min_uv_distance_m or 0.0),
         }
 
     t_total = time.time() - t_start
@@ -621,7 +773,7 @@ def extract_phased_dynamic_spectra_from_chunk(
     targets: List[Dict[str, Any]],
     *,
     pol: str = "I",
-    min_uv_distance_m: float = 0.0,
+    min_uv_distance_m: float = DEFAULT_MIN_UV_DISTANCE_M,
     telescope: str = "ASKAP",
 ) -> Dict[str, Dict[str, Any]]:
     """
@@ -746,6 +898,7 @@ def extract_phased_dynamic_spectra_from_chunk(
             "telescope": telescope,
             "pol": f"Stokes {pol}" if pol.upper() == "I" else pol,
             "cand_id": c_id,
+            "min_uv_distance_m": float(min_uv_distance_m or 0.0),
         }
 
     return results
@@ -806,6 +959,8 @@ def write_dynamic_spectrum_hdf5(
         f.attrs["cand_id"] = str(spec_data.get("cand_id", ""))
         f.attrs["ra_deg"] = float(spec_data.get("ra_deg", 0.0))
         f.attrs["dec_deg"] = float(spec_data.get("dec_deg", 0.0))
+        if "min_uv_distance_m" in spec_data:
+            f.attrs["min_uv_distance_m"] = float(spec_data["min_uv_distance_m"])
 
         if attrs:
             for k, v in attrs.items():
@@ -1345,7 +1500,7 @@ def batch_extract_catalogue(
     chunk_rows: int = 100000,
     pol: str = "I",
     datacolumn: str = "DATA",
-    min_uv_distance_m: float = 0.0,
+    min_uv_distance_m: float = DEFAULT_MIN_UV_DISTANCE_M,
     overwrite: bool = False,
     dry_run: bool = False,
     update_summary_plots: bool = True,
