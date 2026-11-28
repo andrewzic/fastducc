@@ -79,6 +79,14 @@ def build_cli_aggregate_obs(argv: Sequence[str] | None = None) -> argparse.Names
                    help="Maximum events per candidate source to output in full candidate list (default: 100)")
     p.add_argument("--psrcat-path", default=None, help="Override path to PSRCAT CSV catalogue (default: packaged file)")
     p.add_argument("--racs-path", default=None, help="Override path to RACS VOTable catalogue (default: packaged file)")
+    p.add_argument("--render-summary-plots", dest="render_summary_plots", action="store_true", default=False,
+                   help="Render summary PDFs from HDF5 containers for each source exemplar and top-N events")
+    p.add_argument("--no-render-summary-plots", dest="render_summary_plots", action="store_false",
+                   help="Disable exemplar and top-N event summary PDF rendering during aggregate_obs")
+    p.add_argument("--summary-top-events-per-source", type=int, default=5,
+                   help="Number of top-S/N candidate events per source to render summary PDFs for (default: 5)")
+    p.add_argument("--continuum-dir", default=None,
+                   help="Directory containing continuum FITS images for summary plot overlays (default: <obs-root>/continuum_images)")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
     return p.parse_args(argv)
 
@@ -331,6 +339,9 @@ def run_aggregate_obs(argv: Sequence[str]) -> int:
         link_mode=args.link_mode,
         organize_structure=args.organize_structure,
         max_n_candidates_per_source=args.max_n_candidates_per_source,
+        render_summary_plots=args.render_summary_plots,
+        summary_top_events_per_source=args.summary_top_events_per_source,
+        continuum_dir=args.continuum_dir,
     )
     return 0
 

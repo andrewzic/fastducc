@@ -3124,3 +3124,260 @@ def plot_summaries_from_catalogue_and_h5(
         "missing_srcnames": missing_rows,
         "outputs": rendered_outputs,
     }
+
+
+def render_obs_exemplar_and_top_event_summaries(
+    obs_root: Union[str, Path],
+    out_dir: Union[str, Path],
+    kind: str,
+    out_tab: Any,
+    *,
+    cons_h5_path: Optional[Union[str, Path]] = None,
+    trial_h5_paths: Optional[Sequence[Union[str, Path]]] = None,
+    continuum_dir: Optional[Union[str, Path]] = None,
+    top_events_per_source: int = 5,
+    structure: str = "categorized",
+    rfi_mad_thresh: float = 3.0,
+    dedisperse_dynspec: bool = True,
+    dpi: int = 200,
+    cmap: str = "viridis",
+) -> Dict[str, int]:
+    """Render summary PDFs for each source's exemplar and top-N candidate events.
+
+    Reads artefacts from the consolidated exemplar HDF5 container and the raw
+    per-(method, beam, DM) trial HDF5 containers via :class:`CandidateStore`
+    without modifying or removing any raw HDF5 files.
+    """
+    import csv
+    from fastducc.candidate_store import CandidateStore, normalise_beam, parse_trial_h5_filename
+
+    kind_norm = str(kind).strip().lower()
+    if out_tab is None or len(out_tab) == 0:
+        return {"exemplars_rendered": 0, "events_rendered": 0, "missing": 0}
+
+    out_d = Path(out_dir).resolve()
+    kind_dir = out_d / kind_norm
+    cont_dir_str = str(Path(continuum_dir).resolve()) if continuum_dir else str(Path(obs_root).resolve() / "continuum_images")
+    if not os.path.isdir(cont_dir_str):
+        cont_dir_str = None
+
+    # Index raw trial HDF5 paths by (beam, rounded_dm) and by beam for fast lookup
+    trial_by_beam_dm: Dict[Tuple[str, float], List[Path]] = {}
+    trial_by_beam: Dict[str, List[Path]] = {}
+    for p in (trial_h5_paths or []):
+        hp = Path(p)
+        if not hp.is_file():
+            continue
+        meta = parse_trial_h5_filename(hp)
+        b_key = normalise_beam(meta.get("beam", ""))
+        dm_meta = meta.get("dm")
+        if b_key:
+            trial_by_beam.setdefault(b_key, []).append(hp)
+            if dm_meta is not None:
+                trial_by_beam_dm.setdefault((b_key, round(float(dm_meta), 2)), []).append(hp)
+
+    open_stores: Dict[Path, Any] = {}
+
+    def _get_store(h5_p: Path) -> Optional[Any]:
+        st = open_stores.get(h5_p)
+        if st is None:
+            try:
+                st = CandidateStore(h5_p)
+                st.__enter__()
+                open_stores[h5_p] = st
+            except Exception as exc:
+                logger.warning("Could not open candidate HDF5 %s: %s", h5_p, exc)
+                return None
+        return st
+
+    def _find_in_trial_h5s(
+        srcname: str,
+        beam: str,
+        dm_val: Optional[float],
+        time_center: Optional[float],
+        x_val: Optional[int],
+        y_val: Optional[int],
+    ) -> Optional[Any]:
+        b_norm = normalise_beam(beam)
+        cand_paths: List[Path] = []
+        if b_norm and dm_val is not None and np.isfinite(dm_val):
+            cand_paths.extend(trial_by_beam_dm.get((b_norm, round(float(dm_val), 2)), []))
+        if b_norm:
+            for p in trial_by_beam.get(b_norm, []):
+                if p not in cand_paths:
+                    cand_paths.append(p)
+        for hp in cand_paths:
+            st = _get_store(hp)
+            if st is None:
+                continue
+            rec = st.find(
+                srcname=srcname or None,
+                beam=b_norm or None,
+                dm=dm_val if (dm_val is not None and np.isfinite(dm_val)) else None,
+                time_center=time_center,
+                x=x_val,
+                y=y_val,
+            )
+            if rec is not None:
+                return rec
+        return None
+
+    exemplars_rendered = 0
+    events_rendered = 0
+    missing = 0
+    cons_p = Path(cons_h5_path).resolve() if (cons_h5_path and os.path.isfile(str(cons_h5_path))) else None
+
+    try:
+        cons_store = _get_store(cons_p) if cons_p is not None else None
+        colnames = set(out_tab.colnames)
+
+        for row in out_tab:
+            srcname = str(row["srcname"]).strip()
+            if not srcname:
+                continue
+            safe_srcname = srcname.replace("/", "_")
+            cand_dir = kind_dir / safe_srcname
+            plots_dir = (cand_dir / "plots") if structure == "categorized" else cand_dir
+            ds_dir = (cand_dir / "dynamic_spectra") if structure == "categorized" else cand_dir
+            cat_dir = (cand_dir / "catalogs") if structure == "categorized" else cand_dir
+            plots_dir.mkdir(parents=True, exist_ok=True)
+
+            # Parse exemplar fields
+            ex_h5_idx = int(row["h5_index"]) if ("h5_index" in colnames and np.isfinite(float(row["h5_index"])) and int(row["h5_index"]) >= 0) else None
+            ex_beam = str(row["max_snr_beam"]) if "max_snr_beam" in colnames else (str(row["beam"]) if "beam" in colnames else "")
+            ex_dm = None
+            for col in ("best_dm", "dm", "DM"):
+                if col in colnames:
+                    try:
+                        ex_dm = float(str(row[col]).split(",")[0])
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            ex_time = None
+            for col in ("max_snr_time_center", "time_center"):
+                if col in colnames:
+                    try:
+                        tv = float(row[col])
+                        if np.isfinite(tv):
+                            ex_time = tv
+                            break
+                    except (TypeError, ValueError):
+                        pass
+
+            extra_meta = {
+                k: row[k]
+                for k in ("source_id", "n_events", "beams_all", "dm_all", "width_samples_all", "psrcat_match_name", "racs_match_name")
+                if k in colnames
+            }
+
+            # 1. Render exemplar summary plot
+            ex_rec = None
+            if cons_store is not None:
+                ex_rec = cons_store.find(
+                    h5_index=ex_h5_idx,
+                    srcname=srcname,
+                    beam=normalise_beam(ex_beam) or None,
+                    dm=ex_dm,
+                    time_center=ex_time,
+                )
+            if ex_rec is None:
+                ex_rec = _find_in_trial_h5s(srcname, ex_beam, ex_dm, ex_time, None, None)
+
+            if ex_rec is not None:
+                ext_ds = _resolve_external_dynspec(ds_dir, srcname, ex_rec.beam or ex_beam) if (ex_rec.dynspec is None and ds_dir.is_dir()) else None
+                ex_pdf = plots_dir / f"{safe_srcname}_{ex_rec.beam or 'beamXX'}_dm{ex_rec.dm:.2f}_{kind_norm}_exemplar_summary.pdf"
+                try:
+                    render_candidate_summary_from_record(
+                        ex_rec,
+                        out_path=ex_pdf,
+                        continuum_dir=cont_dir_str,
+                        dpi=dpi,
+                        cmap=cmap,
+                        ds_path=ext_ds,
+                        rfi_mad_thresh=rfi_mad_thresh,
+                        dedisperse_dynspec=dedisperse_dynspec,
+                        extra_meta=extra_meta,
+                    )
+                    exemplars_rendered += 1
+                except Exception as exc:
+                    logger.warning("[ObsPlots] Failed to render exemplar for %s: %s", srcname, exc)
+                    missing += 1
+            else:
+                missing += 1
+
+            # 2. Render top-N candidate event summary plots for this source
+            n_top = max(0, int(top_events_per_source))
+            full_csv = cat_dir / f"{safe_srcname}_full_candidate_list.csv"
+            if n_top > 0 and full_csv.is_file():
+                try:
+                    with open(full_csv, "r", encoding="utf-8", errors="replace") as fh:
+                        comp_rows = list(csv.DictReader(fh))
+                except Exception as exc:
+                    logger.warning("[ObsPlots] Could not read %s: %s", full_csv, exc)
+                    comp_rows = []
+
+                for ev_rank, erow in enumerate(comp_rows[:n_top], start=1):
+                    ev_src = str(erow.get("srcname", srcname)).strip() or srcname
+                    ev_beam = str(erow.get("beam", erow.get("max_snr_beam", ex_beam))).strip()
+                    ev_dm = None
+                    for col in ("dm", "best_dm", "DM"):
+                        if erow.get(col) not in (None, "", "nan", "None"):
+                            try:
+                                ev_dm = float(str(erow[col]).split(",")[0])
+                                break
+                            except (TypeError, ValueError):
+                                pass
+                    ev_time = None
+                    for col in ("time_center", "max_snr_time_center"):
+                        if erow.get(col) not in (None, "", "nan", "None"):
+                            try:
+                                tv = float(erow[col])
+                                if np.isfinite(tv):
+                                    ev_time = tv
+                                    break
+                            except (TypeError, ValueError):
+                                pass
+                    ev_x = int(float(erow["x"])) if erow.get("x") not in (None, "", "nan", "None") else None
+                    ev_y = int(float(erow["y"])) if erow.get("y") not in (None, "", "nan", "None") else None
+
+                    ev_rec = _find_in_trial_h5s(ev_src, ev_beam, ev_dm, ev_time, ev_x, ev_y)
+                    if ev_rec is None:
+                        missing += 1
+                        continue
+                    ext_ds = _resolve_external_dynspec(ds_dir, ev_src, ev_rec.beam or ev_beam) if (ev_rec.dynspec is None and ds_dir.is_dir()) else None
+                    ev_pdf = plots_dir / f"{safe_srcname}_{ev_rec.beam or 'beamXX'}_dm{ev_rec.dm:.2f}_{kind_norm}_top{ev_rank:02d}_summary.pdf"
+                    try:
+                        render_candidate_summary_from_record(
+                            ev_rec,
+                            out_path=ev_pdf,
+                            continuum_dir=cont_dir_str,
+                            dpi=dpi,
+                            cmap=cmap,
+                            ds_path=ext_ds,
+                            rfi_mad_thresh=rfi_mad_thresh,
+                            dedisperse_dynspec=dedisperse_dynspec,
+                            extra_meta=extra_meta,
+                        )
+                        events_rendered += 1
+                    except Exception as exc:
+                        logger.warning("[ObsPlots] Failed to render event #%d for %s: %s", ev_rank, srcname, exc)
+                        missing += 1
+    finally:
+        for st in open_stores.values():
+            try:
+                st.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    logger.info(
+        "[ObsPlots] kind=%s: rendered %d exemplar(s) and %d top-event summary plot(s) (%d missing)",
+        kind_norm,
+        exemplars_rendered,
+        events_rendered,
+        missing,
+    )
+    return {
+        "exemplars_rendered": exemplars_rendered,
+        "events_rendered": events_rendered,
+        "missing": missing,
+    }

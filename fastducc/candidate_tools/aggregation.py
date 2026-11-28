@@ -780,6 +780,9 @@ def aggregate_observation_from_super_summaries(
     link_mode: str = "symlink",
     organize_structure: str = "categorized",
     max_n_candidates_per_source: Optional[int] = 100,
+    render_summary_plots: bool = False,
+    summary_top_events_per_source: int = 5,
+    continuum_dir: Optional[str] = None,
 ) -> Table:    
     """
     Read per-scan cross-beam super summaries under obs_root,
@@ -1005,6 +1008,8 @@ def aggregate_observation_from_super_summaries(
     field = field_for_name or "field"
     sbid = sbid_for_name or os.path.basename(os.path.abspath(obs_root))
 
+    cons_h5_path: Optional[str] = None
+    trial_h5s: List[str] = []
     # Consolidate per-(method, beam, DM) HDF5 trial containers into one exemplar HDF5 for this method
     try:
         from fastducc.candidate_store import (
@@ -1017,9 +1022,9 @@ def aggregate_observation_from_super_summaries(
         for sub_cand in sorted(glob.glob(os.path.join(obs_root, "*", "candidates"))):
             if os.path.isdir(sub_cand) and sub_cand not in h5_search_dirs:
                 h5_search_dirs.append(sub_cand)
-        trial_h5s = discover_trial_h5_files(h5_search_dirs, method=kind)
+        trial_h5s = [str(p) for p in discover_trial_h5_files(h5_search_dirs, method=kind)]
         if trial_h5s and len(out_tab) > 0:
-            cons_h5_path = build_consolidated_h5_path(out_dir, method=kind, sbid=sbid, field=field)
+            cons_h5_path = str(build_consolidated_h5_path(out_dir, method=kind, sbid=sbid, field=field))
             _, matched_pairs = consolidate_candidate_h5(
                 trial_h5s,
                 out_tab,
@@ -1072,5 +1077,23 @@ def aggregate_observation_from_super_summaries(
             )
         except Exception as e:
             logger.warning(f"[ObsSuper] Candidate output organization failed: {e}")
+
+        if render_summary_plots:
+            try:
+                from fastducc.candidate_tools.plotting import render_obs_exemplar_and_top_event_summaries
+
+                render_obs_exemplar_and_top_event_summaries(
+                    obs_root=obs_root,
+                    out_dir=out_dir,
+                    kind=kind,
+                    out_tab=out_tab,
+                    cons_h5_path=cons_h5_path,
+                    trial_h5_paths=trial_h5s,
+                    continuum_dir=continuum_dir,
+                    top_events_per_source=summary_top_events_per_source,
+                    structure=organize_structure,
+                )
+            except Exception as e:
+                logger.warning(f"[ObsSuper] Exemplar/top-event summary plot rendering failed: {e}")
 
     return out_tab

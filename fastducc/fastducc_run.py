@@ -512,6 +512,9 @@ def aggregate_obs_main(argv=None):
         link_mode=args.link_mode,
         organize_structure=args.organize_structure,
         max_n_candidates_per_source=args.max_n_candidates_per_source,
+        render_summary_plots=getattr(args, "render_summary_plots", False),
+        summary_top_events_per_source=getattr(args, "summary_top_events_per_source", 5),
+        continuum_dir=getattr(args, "continuum_dir", None),
     )
     return 0
 
