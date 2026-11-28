@@ -10,6 +10,7 @@ import socket
 import getpass
 import datetime
 import textwrap
+import warnings
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, List
 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
 from matplotlib.offsetbox import AnchoredText
+from matplotlib.patches import FancyBboxPatch
 from matplotlib.animation import FuncAnimation, PillowWriter
 
 import astropy.units as u
@@ -94,8 +96,8 @@ def wrap_candidate_metadata_text(text: str, max_width: int = 33) -> str:
                 lines.append(f"{k} {v}")
                 continue
             lines.append(k)
-            # Special handling for coordinates
-            if " " in v and any(c in v for c in ("h", "d", "m", "s", ":")):
+            # Special handling for coordinates (only when key is a coordinate field)
+            if "coord" in k.lower() and " " in v and any(c in v for c in ("h", "d", "m", "s", ":")):
                 v_parts = v.split()
                 if len(v_parts) == 2:
                     lines.append(f"  {v_parts[0]}")
@@ -113,6 +115,356 @@ def wrap_candidate_metadata_text(text: str, max_width: int = 33) -> str:
             for w in wrapped:
                 lines.append(indent + w.replace(". ", ".").replace("_ ", "_"))
     return "\n".join(lines)
+
+
+def _prepare_dynspec_for_summary(
+    ds_dict: Dict[str, Any],
+    *,
+    t_start: Optional[float] = None,
+    t_end: Optional[float] = None,
+    dm_pccc: float = 0.0,
+    rfi_mad_thresh: float = 3.0,
+    dedisperse: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Slice, MAD-flag along frequency, and dedisperse a dynamic spectrum for summary plotting."""
+    if ds_dict is None or "data" not in ds_dict or "freq" not in ds_dict:
+        return None
+
+    from fastducc.dynspec import dedisperse_dynamic_spectrum, flag_dynspec_rfi_mad
+
+    ds_raw_data = np.asarray(ds_dict["data"], dtype=np.float32)
+    ds_freqs = np.asarray(ds_dict["freq"], dtype=np.float64)
+    if ds_raw_data.ndim != 2 or ds_raw_data.size == 0 or ds_freqs.size == 0:
+        return None
+
+    # Normalise frequencies to MHz for display
+    if float(np.nanmax(ds_freqs)) > 1e6:
+        ds_freqs = ds_freqs / 1e6
+
+    ds_raw_times = ds_dict.get("time_raw")
+    if ds_raw_times is not None:
+        ds_raw_times = np.asarray(ds_raw_times, dtype=np.float64)
+    ds_rel_times = ds_dict.get("time")
+    if ds_rel_times is not None:
+        ds_rel_times = np.asarray(ds_rel_times, dtype=np.float64)
+
+    # Determine sampling interval in seconds
+    t_for_dt = ds_raw_times if (ds_raw_times is not None and ds_raw_times.size > 1) else ds_rel_times
+    if t_for_dt is not None and t_for_dt.size > 1:
+        diffs = np.diff(t_for_dt)
+        pos_diffs = diffs[np.isfinite(diffs) & (diffs > 0.0)]
+        tsamp_s = float(np.median(pos_diffs)) if pos_diffs.size > 0 else 1.0
+    else:
+        tsamp_s = 1.0
+
+    dm_val = float(dm_pccc) if (dm_pccc is not None and np.isfinite(float(dm_pccc))) else 0.0
+    do_dedisp = bool(dedisperse and abs(dm_val) > 0.0 and tsamp_s > 0.0)
+
+    max_delay = 0
+    if do_dedisp:
+        from fastducc.dedisp import get_dm_delays
+
+        delays = get_dm_delays(ds_freqs * 1e6, dm_val, tsamp_s, align_to="fmax")
+        max_delay = int(np.max(np.abs(delays))) if delays.size > 0 else 0
+
+    # Slice detection chunk window; when full-observation data extends past idx1,
+    # include up to max_delay lookahead samples before dedispersion so trailing
+    # bins use real data instead of edge NaNs.
+    if (
+        ds_raw_times is not None
+        and ds_raw_times.size == ds_raw_data.shape[0]
+        and t_start is not None
+        and t_end is not None
+        and np.isfinite(t_start)
+        and np.isfinite(t_end)
+    ):
+        idx0 = max(0, int(np.searchsorted(ds_raw_times, float(t_start))) - 1)
+        idx1 = min(len(ds_raw_times), int(np.searchsorted(ds_raw_times, float(t_end))) + 2)
+        if idx1 > idx0:
+            n_target = idx1 - idx0
+            idx1_ext = min(len(ds_raw_times), idx1 + max_delay) if do_dedisp else idx1
+            ds_ext = ds_raw_data[idx0:idx1_ext, :]
+            ds_t_slice = ds_raw_times[idx0:idx1] - float(t_start)
+        else:
+            n_target = ds_raw_data.shape[0]
+            ds_ext = ds_raw_data
+            ds_t_slice = ds_rel_times if (ds_rel_times is not None and ds_rel_times.size == n_target) else np.arange(n_target, dtype=np.float64)
+    else:
+        n_target = ds_raw_data.shape[0]
+        ds_ext = ds_raw_data
+        if ds_raw_times is not None and ds_raw_times.size == n_target and t_start is not None and np.isfinite(t_start):
+            ds_t_slice = ds_raw_times - float(t_start)
+        elif ds_rel_times is not None and ds_rel_times.size == n_target:
+            ds_t_slice = ds_rel_times
+        else:
+            ds_t_slice = np.arange(n_target, dtype=np.float64) * tsamp_s
+
+    # 1. Frequency-axis-only MAD RFI flagging
+    ds_flagged, chan_mask = flag_dynspec_rfi_mad(
+        ds_ext,
+        rfi_mad_thresh=float(rfi_mad_thresh),
+        fill_value=np.nan,
+    )
+
+    # 2. Padded incoherent dedispersion aligned to fmax
+    if do_dedisp:
+        ds_dedisp = dedisperse_dynamic_spectrum(
+            ds_flagged,
+            ds_freqs,
+            tsamp_s,
+            dm_val,
+            align_to="fmax",
+            fill_value=np.nan,
+        )
+        ds_clean = ds_dedisp[:n_target, :]
+    else:
+        ds_clean = ds_flagged[:n_target, :]
+
+    return {
+        "data": ds_clean,
+        "time_rel": np.asarray(ds_t_slice, dtype=np.float64),
+        "freqs": ds_freqs,
+        "tsamp_s": tsamp_s,
+        "n_flagged_chans": int(np.sum(chan_mask)),
+        "n_chans": int(ds_freqs.size),
+        "dedispersed": do_dedisp,
+        "dm": dm_val,
+        "rfi_mad_thresh": float(rfi_mad_thresh),
+        "min_uv_distance_m": ds_dict.get("min_uv_distance_m", ds_dict.get("attrs", {}).get("min_uv_distance_m")),
+    }
+
+
+def _draw_aligned_summary_textbox(
+    fig: plt.Figure,
+    ax_txt: plt.Axes,
+    ax_cut: plt.Axes,
+    raw_text: str,
+    *,
+    title: str = "Candidate Summary",
+    fontsize: float = 9.5,
+    linespacing: float = 1.24,
+) -> None:
+    """Render the Candidate Summary metadata box right-aligned with the cutout panel above it."""
+    ax_txt.set_axis_off()
+    fig.canvas.draw()
+    ax_cut.apply_aspect()
+
+    bbox_cut = ax_cut.get_position()
+    bbox_txt = ax_txt.get_position()
+
+    # Align the right edge cleanly with ax_cut while keeping the left edge clear of the left panels
+    new_x0 = bbox_txt.x0
+    new_x1 = max(bbox_cut.x1, bbox_txt.x0 + 0.12)
+    new_w = new_x1 - new_x0
+    ax_txt.set_position([new_x0, bbox_txt.y0, new_w, bbox_txt.height])
+
+    # Compute dynamic character wrap width from the actual rendered box width in inches
+    fig_w_in, _ = fig.get_size_inches()
+    box_w_in = new_w * fig_w_in
+    approx_char_in = (fontsize * 0.58) / 72.0
+    max_width = max(34, int((box_w_in - 0.35) / max(approx_char_in, 1e-4)))
+    wrapped_txt = wrap_candidate_metadata_text(raw_text, max_width=max_width)
+
+    # Place text first, then size a full-width background box aligned to [0.0, 1.0] in ax_txt
+    txt_artist = ax_txt.text(
+        0.025,
+        0.975,
+        wrapped_txt,
+        transform=ax_txt.transAxes,
+        va="top",
+        ha="left",
+        fontsize=fontsize,
+        linespacing=linespacing,
+        zorder=3,
+    )
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    tb_disp = txt_artist.get_window_extent(renderer=renderer)
+    tb_axes = tb_disp.transformed(ax_txt.transAxes.inverted())
+    y_bottom = max(0.0, float(tb_axes.y0) - 0.025)
+    y_top = 0.995
+    box_h = max(0.05, y_top - y_bottom)
+
+    patch = FancyBboxPatch(
+        (0.0, y_bottom),
+        1.0,
+        box_h,
+        boxstyle="round,pad=0.0,rounding_size=0.012",
+        transform=ax_txt.transAxes,
+        facecolor="#fcfcfc",
+        edgecolor="#bbbbbb",
+        linewidth=1.2,
+        clip_on=False,
+        zorder=2,
+    )
+    ax_txt.add_patch(patch)
+    ax_txt.set_title(title, pad=8, fontsize=11)
+
+
+def _plot_dynspec_panels(
+    fig: plt.Figure,
+    gs_ds_spec: Any,
+    gs_lc_spec: Any,
+    ds_prep: Dict[str, Any],
+    *,
+    width_samples: int,
+    det_time_rel: float,
+    cmap: str = "viridis",
+    dpi: int = 200,
+) -> plt.Axes:
+    """Plot dedispersed/RFI-flagged dynamic spectrum, adjoining spectrum, beamformed LC, and return ax_lc."""
+    fig.canvas.draw()
+    fig_w, fig_h = fig.get_size_inches()
+    bbox_ds_area = gs_ds_spec.get_position(fig)
+    total_w_px = bbox_ds_area.width * fig_w * dpi
+    total_h_px = bbox_ds_area.height * fig_h * dpi
+    h_beam_px = (0.20 / 1.20) * total_h_px
+    w_cbar_px = 24.0
+    pad_cbar_px = 14.0
+    w_ds_spec_total = max(100.0, total_w_px - w_cbar_px - pad_cbar_px)
+    w_spec_px = h_beam_px
+    w_ds_px = max(100.0, w_ds_spec_total - w_spec_px)
+
+    gs_outer = GridSpecFromSubplotSpec(
+        nrows=1,
+        ncols=2,
+        subplot_spec=gs_ds_spec,
+        width_ratios=[w_ds_spec_total, w_cbar_px],
+        wspace=pad_cbar_px / w_ds_spec_total,
+    )
+    gs_inner = GridSpecFromSubplotSpec(
+        nrows=2,
+        ncols=2,
+        subplot_spec=gs_outer[0],
+        height_ratios=[1.0, 0.20],
+        width_ratios=[w_ds_px, w_spec_px],
+        hspace=0.0,
+        wspace=0.0,
+    )
+
+    ax_ds = fig.add_subplot(gs_inner[0, 0])
+    ax_spec = fig.add_subplot(gs_inner[0, 1], sharey=ax_ds)
+    ax_beam_lc = fig.add_subplot(gs_inner[1, 0], sharex=ax_ds)
+    cax = fig.add_subplot(gs_outer[1])
+
+    gs_lc_outer = GridSpecFromSubplotSpec(
+        nrows=1,
+        ncols=2,
+        subplot_spec=gs_lc_spec,
+        width_ratios=[w_ds_spec_total, w_cbar_px],
+        wspace=pad_cbar_px / w_ds_spec_total,
+    )
+    gs_lc_inner = GridSpecFromSubplotSpec(
+        nrows=1,
+        ncols=2,
+        subplot_spec=gs_lc_outer[0],
+        width_ratios=[w_ds_px, w_spec_px],
+        wspace=0.0,
+    )
+    ax_lc = fig.add_subplot(gs_lc_inner[0, 0], sharex=ax_ds)
+
+    ds_clean = ds_prep["data"]
+    ds_t_slice = ds_prep["time_rel"]
+    ds_freqs = ds_prep["freqs"]
+    cand_dm = float(ds_prep["dm"])
+    is_dedisp = bool(ds_prep["dedispersed"])
+
+    # Downsample dynamic spectrum for display according to candidate detection width W
+    ds_disp = ds_clean
+    t_bin = max(1, int(width_samples) // 4)
+    f_bin = t_bin
+    if (t_bin > 1 or f_bin > 1) and ds_clean.ndim == 2:
+        nt_c, nf_c = ds_clean.shape
+        nt_trim = (nt_c // t_bin) * t_bin
+        nf_trim = (nf_c // f_bin) * f_bin
+        if nt_trim > 0 and nf_trim > 0:
+            sub = ds_clean[:nt_trim, :nf_trim]
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                ds_disp = np.nanmean(
+                    sub.reshape(nt_trim // t_bin, t_bin, nf_trim // f_bin, f_bin),
+                    axis=(1, 3),
+                )
+
+    finite_ds = ds_disp[np.isfinite(ds_disp)]
+    if finite_ds.size > 0:
+        vmin_ds, vmax_ds = np.percentile(finite_ds, [5.0, 99.5])
+        if not np.isfinite(vmin_ds) or not np.isfinite(vmax_ds) or vmax_ds <= vmin_ds:
+            vmin_ds, vmax_ds = float(np.min(finite_ds)), float(np.max(finite_ds))
+            if vmax_ds <= vmin_ds:
+                vmin_ds, vmax_ds = vmin_ds - 1e-6, vmax_ds + 1e-6
+    else:
+        vmin_ds, vmax_ds = 0.0, 1.0
+
+    t_min_ds = float(ds_t_slice[0])
+    t_max_ds = float(ds_t_slice[-1])
+    f_min_ds = float(ds_freqs[0])
+    f_max_ds = float(ds_freqs[-1])
+
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad(color="#2b2b2b")
+
+    im_ds = ax_ds.imshow(
+        ds_disp.T,
+        origin="lower",
+        aspect="auto",
+        extent=[t_min_ds, t_max_ds, f_min_ds, f_max_ds],
+        cmap=cmap_obj,
+        vmin=vmin_ds,
+        vmax=vmax_ds,
+    )
+    ax_ds.set_ylabel("Frequency (MHz)", fontsize=10)
+    if is_dedisp:
+        ax_ds.set_title(f"Dedispersed dynamic spectrum (DM = {cand_dm:.2f} pc cm⁻³)", fontsize=11, fontweight="normal")
+    else:
+        ax_ds.set_title(f"Dynamic spectrum (DM = {cand_dm:.2f} pc cm⁻³)", fontsize=11, fontweight="normal")
+
+    has_legend = False
+    if np.isfinite(det_time_rel) and t_min_ds <= det_time_rel <= t_max_ds:
+        det_lbl = "Detection centre (aligned to $f_{\\max}$)" if is_dedisp else "Detection centre"
+        ax_ds.axvline(det_time_rel, color="crimson", ls="--", lw=1.3, alpha=0.9, label=det_lbl)
+        has_legend = True
+        if (not is_dedisp) and cand_dm > 0.0:
+            nu_top = max(f_min_ds, f_max_ds)
+            f_eval = np.linspace(min(f_min_ds, f_max_ds), nu_top, 100)
+            dt_sweep = 4.148808e3 * cand_dm * (f_eval ** (-2) - nu_top ** (-2))
+            ax_ds.plot(
+                det_time_rel + dt_sweep,
+                f_eval,
+                color="gold",
+                ls=":",
+                lw=1.5,
+                alpha=0.9,
+                label=f"DM = {cand_dm:.1f} pc cm⁻³ sweep",
+            )
+    if has_legend:
+        ax_ds.legend(loc="upper right", fontsize=8, framealpha=0.85)
+    ax_ds.tick_params(labelbottom=False, bottom=False)
+
+    cb_ds = fig.colorbar(im_ds, cax=cax, orientation="vertical")
+    cb_ds.set_label("Flux density (Jy)", fontsize=9)
+
+    # Time-averaged spectrum to the right of imshow (wspace=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        beam_spec = np.nanmean(ds_clean, axis=0)
+    ax_spec.plot(beam_spec, ds_freqs, color="indigo", lw=1.2)
+    ax_spec.tick_params(labelleft=False, left=False)
+    ax_spec.set_xlabel("Mean (Jy)", fontsize=8)
+    ax_spec.grid(True, alpha=0.3)
+
+    # Frequency-averaged beamformed lightcurve below imshow (hspace=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        beam_lc = np.nanmean(ds_clean, axis=1) * 1000.0  # mJy
+    ax_beam_lc.plot(ds_t_slice, beam_lc, color="teal", lw=1.2)
+    if np.isfinite(det_time_rel) and t_min_ds <= det_time_rel <= t_max_ds:
+        ax_beam_lc.axvline(det_time_rel, color="crimson", ls="--", lw=1.2, alpha=0.85)
+    ax_beam_lc.set_ylabel("Beamformed\n(mJy)", fontsize=8)
+    ax_beam_lc.tick_params(labelbottom=False)
+    ax_beam_lc.grid(True, alpha=0.3)
+
+    return ax_lc
 
 
 def save_candidate_summary(
@@ -139,6 +491,9 @@ def save_candidate_summary(
     rms_full: Optional[np.ndarray] = None,
     mean_cube: Optional[np.ndarray] = None,
     defer_summary_plots: bool = False,
+    rfi_mad_thresh: float = 3.0,
+    dedisperse_dynspec: bool = True,
+    save_png: bool = False,
     **kwargs: Any,
 ) -> Dict[str, str]:
     """
@@ -378,10 +733,14 @@ def save_candidate_summary(
                 ds_path_val = matches[0]
                 break
 
+    cand_dm_pre = float(
+        candidate.get("dm", 0.0)
+        if candidate.get("dm") is not None and not np.isnan(float(candidate.get("dm", 0.0)))
+        else 0.0
+    )
+
     has_dynspec = False
-    ds_slice = None
-    ds_t_slice = None
-    ds_freqs = None
+    ds_prep = None
     if dynspec_obj is not None or ds_path_val is not None:
         try:
             from fastducc.dynspec import load_dynamic_spectrum_hdf5
@@ -392,27 +751,16 @@ def save_candidate_summary(
             else:
                 ds_dict = None
 
-            if ds_dict is not None and "data" in ds_dict and "freq" in ds_dict:
-                ds_raw_data = np.asarray(ds_dict["data"], dtype=np.float32)
-                ds_freqs = np.asarray(ds_dict["freq"], dtype=np.float64)
-                ds_raw_times = ds_dict.get("time_raw")
-
-                if ds_raw_times is not None and len(ds_raw_times) == ds_raw_data.shape[0] and len(times) > 0:
-                    t_start = times[0]
-                    t_end = times[-1]
-                    idx0 = max(0, int(np.searchsorted(ds_raw_times, t_start)) - 1)
-                    idx1 = min(len(ds_raw_times), int(np.searchsorted(ds_raw_times, t_end)) + 2)
-                    if idx1 > idx0:
-                        ds_slice = ds_raw_data[idx0:idx1, :]
-                        ds_t_slice = ds_raw_times[idx0:idx1] - t_start
-                    else:
-                        ds_slice = ds_raw_data
-                        ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
-                else:
-                    ds_slice = ds_raw_data
-                    ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
-
-                if ds_slice is not None and ds_slice.size > 0:
+            if ds_dict is not None:
+                ds_prep = _prepare_dynspec_for_summary(
+                    ds_dict,
+                    t_start=float(times[0]) if len(times) > 0 else None,
+                    t_end=float(times[-1]) if len(times) > 0 else None,
+                    dm_pccc=cand_dm_pre,
+                    rfi_mad_thresh=rfi_mad_thresh,
+                    dedisperse=dedisperse_dynspec,
+                )
+                if ds_prep is not None:
                     has_dynspec = True
         except Exception as e:
             logger.warning(f"Could not load dynamic spectrum for summary plot: {e}")
@@ -620,146 +968,48 @@ def save_candidate_summary(
         f"{morph_str}"
     )
 
-    if has_dynspec:
-        f_min_ds = float(ds_freqs[0]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
-        f_max_ds = float(ds_freqs[-1]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
+    if has_dynspec and ds_prep is not None:
+        ds_freqs = ds_prep["freqs"]
+        f_min_ds = float(ds_freqs[0]) if ds_freqs.size > 0 else 0.0
+        f_max_ds = float(ds_freqs[-1]) if ds_freqs.size > 0 else 0.0
         ds_label = Path(ds_path_val).name if ds_path_val else "on-the-fly (chunk)"
-        txt += f"\nDynamic Spectrum:\n  {ds_label}\n  ({len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz)"
-        wrapped_txt = wrap_candidate_metadata_text(txt, max_width=33)
-        ax_txt.text(
-            0.03, 0.98, wrapped_txt,
-            transform=ax_txt.transAxes,
-            va="top", ha="left",
-            fontsize=9.5,
-            linespacing=1.26,
-            bbox=dict(boxstyle="square,pad=0.8", facecolor="#fcfcfc", edgecolor="#bbbbbb", lw=1.2),
+        rfi_tag = (
+            f" | RFI flagged: {ds_prep['n_flagged_chans']}/{ds_prep['n_chans']} ch"
+            if ds_prep["rfi_mad_thresh"] > 0
+            else ""
         )
-        ax_txt.set_title("Candidate Summary", pad=8, fontsize=11)
-    else:
-        box = AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10})
-        ax_txt.add_artist(box)
-        ax_txt.set_title("Summary", pad=12)
-
-    if has_dynspec:
-        fig.canvas.draw()
-        fig_w, fig_h = fig.get_size_inches()
-        bbox_ds_area = gs[1, 0:2].get_position(fig)
-        total_w_px = bbox_ds_area.width * fig_w * dpi
-        total_h_px = bbox_ds_area.height * fig_h * dpi
-        h_beam_px = (0.20 / 1.20) * total_h_px
-        w_cbar_px = 24.0
-        pad_cbar_px = 14.0
-        w_ds_spec_total = max(100.0, total_w_px - w_cbar_px - pad_cbar_px)
-        w_spec_px = h_beam_px
-        w_ds_px = max(100.0, w_ds_spec_total - w_spec_px)
-
-        gs_outer = GridSpecFromSubplotSpec(
-            nrows=1, ncols=2,
-            subplot_spec=gs[1, 0:2],
-            width_ratios=[w_ds_spec_total, w_cbar_px],
-            wspace=pad_cbar_px / w_ds_spec_total,
+        uv_m = ds_prep.get("min_uv_distance_m")
+        uv_tag = f" | UV >= {float(uv_m):.0f} m" if (uv_m is not None and np.isfinite(float(uv_m)) and float(uv_m) > 0) else ""
+        txt += (
+            f"\nDynamic Spectrum:\n"
+            f"  {ds_label}\n"
+            f"  {len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz{rfi_tag}{uv_tag}"
         )
 
-        gs_inner = GridSpecFromSubplotSpec(
-            nrows=2, ncols=2,
-            subplot_spec=gs_outer[0],
-            height_ratios=[1.0, 0.20],
-            width_ratios=[w_ds_px, w_spec_px],
-            hspace=0.0, wspace=0.0,
-        )
-
-        ax_ds = fig.add_subplot(gs_inner[0, 0])
-        ax_spec = fig.add_subplot(gs_inner[0, 1], sharey=ax_ds)
-        ax_beam_lc = fig.add_subplot(gs_inner[1, 0], sharex=ax_ds)
-        cax = fig.add_subplot(gs_outer[1])
-
-        # Row 2: Main Image-plane Lightcurve matching height and aligned with ax_ds
-        gs_lc_outer = GridSpecFromSubplotSpec(
-            nrows=1, ncols=2,
-            subplot_spec=gs[2, 0:2],
-            width_ratios=[w_ds_spec_total, w_cbar_px],
-            wspace=pad_cbar_px / w_ds_spec_total,
-        )
-        gs_lc_inner = GridSpecFromSubplotSpec(
-            nrows=1, ncols=2,
-            subplot_spec=gs_lc_outer[0],
-            width_ratios=[w_ds_px, w_spec_px],
-            wspace=0.0,
-        )
-        ax_lc = fig.add_subplot(gs_lc_inner[0, 0], sharex=ax_ds)
-
-        # Downsample dynamic spectrum for display according to candidate detection width W
-        ds_disp = ds_slice
-        t_bin = max(1, w // 4)
-        f_bin = t_bin
-        if (t_bin > 1 or f_bin > 1) and ds_slice.ndim == 2:
-            Nt, Nf = ds_slice.shape
-            Nt_trim = (Nt // t_bin) * t_bin
-            Nf_trim = (Nf // f_bin) * f_bin
-            if Nt_trim > 0 and Nf_trim > 0:
-                sub = ds_slice[:Nt_trim, :Nf_trim]
-                ds_disp = np.nanmean(
-                    sub.reshape(Nt_trim // t_bin, t_bin, Nf_trim // f_bin, f_bin),
-                    axis=(1, 3)
-                )
-
-        finite_ds = ds_disp[np.isfinite(ds_disp)]
-        if finite_ds.size > 0:
-            vmin_ds, vmax_ds = np.percentile(finite_ds, [5.0, 99.5])
-            if not np.isfinite(vmin_ds) or not np.isfinite(vmax_ds) or vmax_ds <= vmin_ds:
-                vmin_ds, vmax_ds = float(np.min(finite_ds)), float(np.max(finite_ds))
-                if vmax_ds <= vmin_ds:
-                    vmin_ds, vmax_ds = vmin_ds - 1e-6, vmax_ds + 1e-6
-        else:
-            vmin_ds, vmax_ds = 0.0, 1.0
-        t_min_ds = float(ds_t_slice[0])
-        t_max_ds = float(ds_t_slice[-1])
-        f_min_ds = float(ds_freqs[0])
-        f_max_ds = float(ds_freqs[-1])
-        im_ds = ax_ds.imshow(
-            ds_disp.T,
-            origin="lower",
-            aspect="auto",
-            extent=[t_min_ds, t_max_ds, f_min_ds, f_max_ds],
+    if has_dynspec and ds_prep is not None:
+        t_det_rel = float(det_time - times[0]) if np.isfinite(det_time) else float("nan")
+        ax_lc = _plot_dynspec_panels(
+            fig,
+            gs[1, 0:2],
+            gs[2, 0:2],
+            ds_prep,
+            width_samples=w,
+            det_time_rel=t_det_rel,
             cmap=cmap,
-            vmin=vmin_ds,
-            vmax=vmax_ds,
+            dpi=dpi,
         )
-        ax_ds.set_ylabel("Frequency (MHz)", fontsize=10)
-        ax_ds.set_title("Dynamic spectrum", fontsize=11, fontweight="normal")
-        if np.isfinite(det_time):
-            t_det_rel = det_time - times[0]
-            if t_min_ds <= t_det_rel <= t_max_ds:
-                ax_ds.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85, label="Det Time")
-                if cand_dm > 0:
-                    nu_top = max(f_min_ds, f_max_ds)
-                    f_eval = np.linspace(min(f_min_ds, f_max_ds), nu_top, 100)
-                    dt_sweep = 4.1488e3 * cand_dm * (f_eval**(-2) - nu_top**(-2))
-                    ax_ds.plot(t_det_rel + dt_sweep, f_eval, color="gold", ls=":", lw=1.5, alpha=0.9, label=f"DM={cand_dm:.1f} track")
-        ax_ds.tick_params(labelbottom=False, bottom=False)
-
-        cb_ds = fig.colorbar(im_ds, cax=cax, orientation="vertical")
-        cb_ds.set_label("Flux density (Jy)", fontsize=9)
-
-        # Time-averaged spectrum to the right of imshow (wspace=0)
-        beam_spec = np.nanmean(ds_slice, axis=0)
-        ax_spec.plot(beam_spec, ds_freqs, color="indigo", lw=1.2)
-        ax_spec.tick_params(labelleft=False, left=False)
-        ax_spec.set_xlabel("Mean (Jy)", fontsize=8)
-        ax_spec.grid(True, alpha=0.3)
-
-        # Frequency-averaged lightcurve below imshow (hspace=0)
-        beam_lc = np.nanmean(ds_slice, axis=1) * 1000.0  # mJy
-        ax_beam_lc.plot(ds_t_slice, beam_lc, color="teal", lw=1.2)
-        if np.isfinite(det_time):
-            t_det_rel = det_time - times[0]
-            if t_min_ds <= t_det_rel <= t_max_ds:
-                ax_beam_lc.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85)
-        ax_beam_lc.set_ylabel("Beamformed\n(mJy)", fontsize=8)
-        ax_beam_lc.tick_params(labelbottom=False)
-        ax_beam_lc.grid(True, alpha=0.3)
     else:
         ax_lc = fig.add_subplot(gs[1, 0:2])
+
+    _draw_aligned_summary_textbox(
+        fig,
+        ax_txt,
+        ax_cut,
+        txt,
+        title="Candidate Summary",
+        fontsize=9.5,
+        linespacing=1.24,
+    )
     if method.lower() == "variance" and var_highpass_cutoff_sec > 0:
         lc_filtered = np.empty_like(lc_full)
         ema = np.nanmean(lc_full)
@@ -807,6 +1057,8 @@ def save_candidate_summary(
 
     if not defer_summary_plots:
         fig.savefig(out_fig, bbox_inches="tight")
+        if save_png:
+            fig.savefig(str(Path(out_fig).with_suffix(".png")), bbox_inches="tight")
     fig.clf()
     plt.close(fig)
 
@@ -1730,6 +1982,8 @@ def update_candidate_summary_with_dynspec(
     dpi: int = 200,
     cmap: str = "viridis",
     candidate_store_path: Optional[Union[str, Path]] = None,
+    rfi_mad_thresh: float = 3.0,
+    dedisperse_dynspec: bool = True,
 ) -> Path:
     """
     Update an existing transient candidate summary plot to incorporate a dynamic spectrum waterfall.
@@ -1800,6 +2054,9 @@ def update_candidate_summary_with_dynspec(
                     cmap=cmap,
                     dynspec=ds_dict,
                     ds_path=ds_path,
+                    rfi_mad_thresh=rfi_mad_thresh,
+                    dedisperse_dynspec=dedisperse_dynspec,
+                    save_png=True,
                 )
                 return Path(out_path)
 
@@ -2076,18 +2333,18 @@ def update_candidate_summary_with_dynspec(
     else:
         casa_timerange = "—"
 
-    if ds_raw_times is not None and len(ds_raw_times) == ds_raw_data.shape[0] and len(lc_time) > 0:
-        idx0 = max(0, int(np.searchsorted(ds_raw_times, t_start)) - 1)
-        idx1 = min(len(ds_raw_times), int(np.searchsorted(ds_raw_times, t_end)) + 2)
-        if idx1 > idx0:
-            ds_slice = ds_raw_data[idx0:idx1, :]
-            ds_t_slice = ds_raw_times[idx0:idx1] - t_start
-        else:
-            ds_slice = ds_raw_data
-            ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
-    else:
-        ds_slice = ds_raw_data
-        ds_t_slice = ds_dict.get("time", np.arange(len(ds_slice), dtype=float))
+    ds_prep = _prepare_dynspec_for_summary(
+        ds_dict,
+        t_start=float(t_start) if len(lc_time) > 0 else None,
+        t_end=float(t_end) if len(lc_time) > 0 else None,
+        dm_pccc=cand_dm,
+        rfi_mad_thresh=rfi_mad_thresh,
+        dedisperse=dedisperse_dynspec,
+    )
+    if ds_prep is None:
+        raise ValueError(f"Dynamic spectrum in {ds_path} is empty or invalid.")
+    ds_freqs = ds_prep["freqs"]
+    ds_t_slice = ds_prep["time_rel"]
 
     # Build 3-tier publication figure with dynamic spectrum & main lightcurve shorter by 20%
     fig = plt.figure(figsize=(18, 12.5), dpi=dpi)
@@ -2234,11 +2491,17 @@ def update_candidate_summary_with_dynspec(
         ax_cut.text(0.5, 0.5, "CUTOUT N/A", ha="center", va="center", color="silver", transform=ax_cut.transAxes)
         ax_cut.set_xticks([]); ax_cut.set_yticks([])
 
-    # Panel (1:3, 2): Tall Full Summary Metadata Box matching top cutout column width
+    # Panel (1:3, 2): Tall Full Summary Metadata Box right-aligned with top cutout panel
     f_min_ds = float(ds_freqs[0]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
     f_max_ds = float(ds_freqs[-1]) if (ds_freqs is not None and len(ds_freqs) > 0) else 0.0
     ax_txt = fig.add_subplot(gs_main[1:3, 2])
-    ax_txt.set_axis_off()
+    rfi_tag = (
+        f" | RFI flagged: {ds_prep['n_flagged_chans']}/{ds_prep['n_chans']} ch"
+        if ds_prep["rfi_mad_thresh"] > 0
+        else ""
+    )
+    uv_m = ds_prep.get("min_uv_distance_m")
+    uv_tag = f" | UV >= {float(uv_m):.0f} m" if (uv_m is not None and np.isfinite(float(uv_m)) and float(uv_m) > 0) else ""
     raw_txt = (
         f"Name: {srcname}\n"
         f"Field: {field or '—'}\n"
@@ -2256,130 +2519,32 @@ def update_candidate_summary_with_dynspec(
         f"{casa_timerange}\n"
         f"Dynamic Spectrum:\n"
         f"  {ds_path.name}\n"
-        f"  ({len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz | {t_end - t_start:.1f} s)"
+        f"  {len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz | {t_end - t_start:.1f} s{rfi_tag}{uv_tag}"
     )
-    wrapped_txt = wrap_candidate_metadata_text(raw_txt, max_width=33)
-    ax_txt.text(
-        0.03, 0.98, wrapped_txt,
-        transform=ax_txt.transAxes,
-        va="top", ha="left",
+
+    t_det_rel = float(det_time - t_start) if np.isfinite(det_time) else float("nan")
+    ax_lc = _plot_dynspec_panels(
+        fig,
+        gs_main[1, 0:2],
+        gs_main[2, 0:2],
+        ds_prep,
+        width_samples=w_int,
+        det_time_rel=t_det_rel,
+        cmap=cmap,
+        dpi=dpi,
+    )
+    _draw_aligned_summary_textbox(
+        fig,
+        ax_txt,
+        ax_cut,
+        raw_txt,
+        title="Candidate Summary",
         fontsize=9.5,
-        linespacing=1.26,
-        bbox=dict(boxstyle="square,pad=0.8", facecolor="#fcfcfc", edgecolor="#bbbbbb", lw=1.2),
-    )
-    ax_txt.set_title("Candidate Summary", pad=8, fontsize=11)
-
-    # Dynamic spectrum block & lightcurves within gs_main
-    fig.canvas.draw()
-    fig_w, fig_h = fig.get_size_inches()
-    bbox_ds_area = gs_main[1, 0:2].get_position(fig)
-    total_w_px = bbox_ds_area.width * fig_w * dpi
-    total_h_px = bbox_ds_area.height * fig_h * dpi
-    h_beam_px = (0.20 / 1.20) * total_h_px
-    w_cbar_px = 24.0
-    pad_cbar_px = 14.0
-    w_ds_spec_total = max(100.0, total_w_px - w_cbar_px - pad_cbar_px)
-    w_spec_px = h_beam_px
-    w_ds_px = max(100.0, w_ds_spec_total - w_spec_px)
-
-    gs_outer = GridSpecFromSubplotSpec(
-        nrows=1, ncols=2,
-        subplot_spec=gs_main[1, 0:2],
-        width_ratios=[w_ds_spec_total, w_cbar_px],
-        wspace=pad_cbar_px / w_ds_spec_total,
+        linespacing=1.24,
     )
 
-    gs_inner = GridSpecFromSubplotSpec(
-        nrows=2, ncols=2,
-        subplot_spec=gs_outer[0],
-        height_ratios=[1.0, 0.20],
-        width_ratios=[w_ds_px, w_spec_px],
-        hspace=0.0, wspace=0.0,
-    )
-
-    ax_ds = fig.add_subplot(gs_inner[0, 0])
-    ax_spec = fig.add_subplot(gs_inner[0, 1], sharey=ax_ds)
-    ax_beam_lc = fig.add_subplot(gs_inner[1, 0], sharex=ax_ds)
-    cax = fig.add_subplot(gs_outer[1])
-
-    # Row 2: Main Image-plane Lightcurve matching height and aligned with ax_ds
-    gs_lc_outer = GridSpecFromSubplotSpec(
-        nrows=1, ncols=2,
-        subplot_spec=gs_main[2, 0:2],
-        width_ratios=[w_ds_spec_total, w_cbar_px],
-        wspace=pad_cbar_px / w_ds_spec_total,
-    )
-    gs_lc_inner = GridSpecFromSubplotSpec(
-        nrows=1, ncols=2,
-        subplot_spec=gs_lc_outer[0],
-        width_ratios=[w_ds_px, w_spec_px],
-        wspace=0.0,
-    )
-    ax_lc = fig.add_subplot(gs_lc_inner[0, 0], sharex=ax_ds)
-
-    # Dynamic Spectrum Waterfall (averaged in time by W/4 and frequency by ~W/4)
-    ds_disp = ds_slice
-    t_bin = max(1, w_int // 4)
-    f_bin = t_bin
-    if (t_bin > 1 or f_bin > 1) and ds_slice.ndim == 2:
-        Nt, Nf = ds_slice.shape
-        Nt_trim = (Nt // t_bin) * t_bin
-        Nf_trim = (Nf // f_bin) * f_bin
-        if Nt_trim > 0 and Nf_trim > 0:
-            sub = ds_slice[:Nt_trim, :Nf_trim]
-            ds_disp = np.nanmean(
-                sub.reshape(Nt_trim // t_bin, t_bin, Nf_trim // f_bin, f_bin),
-                axis=(1, 3)
-            )
-
-    vmin_ds, vmax_ds = np.nanpercentile(ds_disp, [5.0, 99.5])
     t_min_ds = float(ds_t_slice[0])
     t_max_ds = float(ds_t_slice[-1])
-    f_min_ds = float(ds_freqs[0])
-    f_max_ds = float(ds_freqs[-1])
-    im_ds = ax_ds.imshow(
-        ds_disp.T,
-        origin="lower",
-        aspect="auto",
-        extent=[t_min_ds, t_max_ds, f_min_ds, f_max_ds],
-        cmap=cmap,
-        vmin=vmin_ds,
-        vmax=vmax_ds,
-    )
-    ax_ds.set_ylabel("Frequency (MHz)", fontsize=10)
-    ax_ds.set_title("Dynamic spectrum", fontsize=11, fontweight="normal")
-    if np.isfinite(det_time):
-        t_det_rel = det_time - t_start
-        if t_min_ds <= t_det_rel <= t_max_ds:
-            ax_ds.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85, label="Det Time")
-            if cand_dm > 0:
-                nu_top = max(f_min_ds, f_max_ds)
-                f_eval = np.linspace(min(f_min_ds, f_max_ds), nu_top, 100)
-                dt_sweep = 4.1488e3 * cand_dm * (f_eval**(-2) - nu_top**(-2))
-                ax_ds.plot(t_det_rel + dt_sweep, f_eval, color="gold", ls=":", lw=1.5, alpha=0.9, label=f"DM={cand_dm:.1f} track")
-    ax_ds.tick_params(labelbottom=False, bottom=False)
-
-    # Vertical Colorbar to the right of the dynamic spectrum block
-    cb_ds = fig.colorbar(im_ds, cax=cax, orientation="vertical")
-    cb_ds.set_label("Flux density (Jy)", fontsize=9)
-
-    # Time-averaged spectrum directly adjoining to the right along frequency axis (wspace=0)
-    beam_spec = np.nanmean(ds_slice, axis=0)
-    ax_spec.plot(beam_spec, ds_freqs, color="indigo", lw=1.2)
-    ax_spec.tick_params(labelleft=False, left=False)
-    ax_spec.set_xlabel("Mean (Jy)", fontsize=8)
-    ax_spec.grid(True, alpha=0.3)
-
-    # Frequency-averaged lightcurve directly adjoining below along time axis (hspace=0)
-    beam_lc = np.nanmean(ds_slice, axis=1) * 1000.0  # mJy
-    ax_beam_lc.plot(ds_t_slice, beam_lc, color="teal", lw=1.2)
-    if np.isfinite(det_time):
-        t_det_rel = det_time - t_start
-        if t_min_ds <= t_det_rel <= t_max_ds:
-            ax_beam_lc.axvline(t_det_rel, color="crimson", ls="--", lw=1.2, alpha=0.85)
-    ax_beam_lc.set_ylabel("Beamformed\n(mJy)", fontsize=8)
-    ax_beam_lc.tick_params(labelbottom=False)
-    ax_beam_lc.grid(True, alpha=0.3)
 
     # Main Image-plane Lightcurve below (matching height of image cutouts)
     ax_lc.plot(rel_times_start, lc_flux, color="tab:blue", lw=1.2, label="Raw", alpha=0.75, zorder=2)
@@ -2417,6 +2582,10 @@ def render_candidate_summary_from_record(
     cmap: str = "viridis",
     dynspec: Optional[Dict[str, Any]] = None,
     ds_path: Optional[Union[str, Path]] = None,
+    rfi_mad_thresh: float = 3.0,
+    dedisperse_dynspec: bool = True,
+    save_png: bool = False,
+    extra_meta: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Dict[str, str]:
     """Render a FastDUCC diagnostic summary PDF directly from an HDF5 :class:`CandidateRecord`.
@@ -2482,7 +2651,22 @@ def render_candidate_summary_from_record(
 
         ds_dict = load_dynamic_spectrum_hdf5(ds_path)
 
-    has_dynspec = bool(ds_dict is not None and "data" in ds_dict and "freq" in ds_dict and np.asarray(ds_dict["data"]).size > 0)
+    dm_val = float(record.dm) if np.isfinite(record.dm) else 0.0
+    t_lc_start = float(lc.time[0]) if (lc is not None and len(lc) > 0) else None
+    t_lc_end = float(lc.time[-1]) if (lc is not None and len(lc) > 0) else None
+    ds_prep = (
+        _prepare_dynspec_for_summary(
+            ds_dict,
+            t_start=t_lc_start,
+            t_end=t_lc_end,
+            dm_pccc=dm_val,
+            rfi_mad_thresh=rfi_mad_thresh,
+            dedisperse=dedisperse_dynspec,
+        )
+        if ds_dict is not None
+        else None
+    )
+    has_dynspec = ds_prep is not None
 
     # Continuum cutout
     cont_im, cont_wcs, cont_vmin, cont_vmax = None, None, None, None
@@ -2598,29 +2782,26 @@ def render_candidate_summary_from_record(
         ax_cut.set_yticks([])
 
     # Dynamic spectrum panel (row 1) + lightcurve panel (row 2 or row 1)
-    if has_dynspec:
-        ax_ds = fig.add_subplot(gs[1, 0:2])
-        ds_raw = np.asarray(ds_dict["data"], dtype=np.float32)
-        ds_freqs = np.asarray(ds_dict["freq"], dtype=np.float64)
-        ds_t = np.asarray(ds_dict.get("time", np.arange(ds_raw.shape[0], dtype=np.float64)), dtype=np.float64)
-        finite_ds = ds_raw[np.isfinite(ds_raw)]
-        v0_ds, v1_ds = (np.percentile(finite_ds, [5.0, 99.5]) if finite_ds.size > 0 else (0.0, 1.0))
-        im_ds = ax_ds.imshow(
-            ds_raw.T, origin="lower", aspect="auto",
-            extent=[float(ds_t[0]), float(ds_t[-1]), float(ds_freqs[0]), float(ds_freqs[-1])],
-            cmap=cmap, vmin=v0_ds, vmax=v1_ds,
+    w = max(1, int(record.width_samples))
+    if has_dynspec and ds_prep is not None:
+        t_ref0 = t_lc_start if t_lc_start is not None else 0.0
+        t_det_rel = float(det_time - t_ref0) if (np.isfinite(det_time) and t_lc_start is not None) else float("nan")
+        ax_lc = _plot_dynspec_panels(
+            fig,
+            gs[1, 0:2],
+            gs[2, 0:2],
+            ds_prep,
+            width_samples=w,
+            det_time_rel=t_det_rel,
+            cmap=cmap,
+            dpi=dpi,
         )
-        ax_ds.set_ylabel("Frequency (MHz)")
-        ax_ds.set_title("Dynamic Spectrum")
-        fig.colorbar(im_ds, ax=ax_ds, orientation="vertical", fraction=0.03, pad=0.02, label="Flux (Jy)")
-        ax_lc = fig.add_subplot(gs[2, 0:2])
         ax_txt = fig.add_subplot(gs[1:3, 2])
     else:
         ax_lc = fig.add_subplot(gs[1, 0:2])
         ax_txt = fig.add_subplot(gs[1, 2])
 
     # Lightcurve panel
-    w = max(1, int(record.width_samples))
     if lc is not None and len(lc) > 0:
         t0 = float(lc.time[0])
         rel_t = lc.time - t0
@@ -2647,25 +2828,51 @@ def render_candidate_summary_from_record(
         ax_lc.set_xticks([])
         ax_lc.set_yticks([])
 
-    # Metadata panel
-    ax_txt.set_axis_off()
+    # Metadata panel right-aligned with top cutout panel
     ra_hms = record.ra_hms
     dec_dms = record.dec_dms
     if (not ra_hms or not dec_dms) and np.isfinite(ra_deg) and np.isfinite(dec_deg):
         ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(np.deg2rad(ra_deg), np.deg2rad(dec_deg), dp=1)
-    dm_val = record.dm if np.isfinite(record.dm) else 0.0
+
+    merged_meta = dict(record.meta)
+    if extra_meta:
+        for k, v in extra_meta.items():
+            if v is not None and str(v).strip() not in ("", "None", "nan", "--"):
+                merged_meta.setdefault(k, v)
+
     extra_lines = []
     for lbl, key in (
+        ("Source ID", "source_id"),
+        ("Events", "n_events"),
         ("Beams", "beams_all"),
         ("DMs", "dm_all"),
         ("Widths", "width_samples_all"),
         ("PSRCAT", "psrcat_match_name"),
         ("RACS", "racs_match_name"),
     ):
-        val = record.meta.get(key)
-        if val:
+        val = merged_meta.get(key)
+        if val not in (None, "", "None", "--"):
             extra_lines.append(f"{lbl}: {val}")
     extra_block = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+
+    ds_block = ""
+    if has_dynspec and ds_prep is not None:
+        ds_freqs = ds_prep["freqs"]
+        f_min_ds = float(ds_freqs[0]) if ds_freqs.size > 0 else 0.0
+        f_max_ds = float(ds_freqs[-1]) if ds_freqs.size > 0 else 0.0
+        ds_lbl = Path(ds_path).name if ds_path is not None else "embedded (HDF5)"
+        rfi_tag = (
+            f" | RFI flagged: {ds_prep['n_flagged_chans']}/{ds_prep['n_chans']} ch"
+            if ds_prep["rfi_mad_thresh"] > 0
+            else ""
+        )
+        uv_m = ds_prep.get("min_uv_distance_m")
+        uv_tag = f" | UV >= {float(uv_m):.0f} m" if (uv_m is not None and np.isfinite(float(uv_m)) and float(uv_m) > 0) else ""
+        ds_block = (
+            f"\nDynamic Spectrum:\n"
+            f"  {ds_lbl}\n"
+            f"  {len(ds_freqs)} ch | {f_min_ds:.1f}-{f_max_ds:.1f} MHz{rfi_tag}{uv_tag}"
+        )
 
     txt = (
         f"Name: {record.srcname or '—'}\n"
@@ -2682,11 +2889,238 @@ def render_candidate_summary_from_record(
         f"Width: {w if method == 'boxcar' else '—'}\n"
         f"HDF5: {record.store_path.name} [{record.h5_index}]"
         f"{extra_block}"
+        f"{ds_block}"
     )
-    ax_txt.add_artist(AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10}))
-    ax_txt.set_title("Summary", pad=12)
+    _draw_aligned_summary_textbox(
+        fig,
+        ax_txt,
+        ax_cut,
+        txt,
+        title="Candidate Summary",
+        fontsize=9.5,
+        linespacing=1.24,
+    )
+
+    gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    meta_footer = f"Generated: {gen_time} | Container: {record.store_path.name} [{record.h5_index}]"
+    fig.text(0.5, 0.01, meta_footer, ha="center", va="bottom", fontsize=8, color="gray", alpha=0.7)
 
     fig.savefig(str(out_p), bbox_inches="tight")
+    out_res: Dict[str, str] = {"figure": str(out_p), "summary_plot": str(out_p)}
+    if save_png:
+        png_p = out_p.with_suffix(".png")
+        fig.savefig(str(png_p), bbox_inches="tight")
+        out_res["png"] = str(png_p)
     fig.clf()
     plt.close(fig)
-    return {"figure": str(out_p), "summary_plot": str(out_p)}
+    return out_res
+
+
+def _resolve_external_dynspec(
+    dynspec_dir: Optional[Union[str, Path]],
+    srcname: str,
+    beam: str = "",
+) -> Optional[Path]:
+    """Locate an external ``.ds`` file matching *srcname* (and optionally *beam*) under *dynspec_dir*."""
+    if not dynspec_dir or not srcname:
+        return None
+    dpath = Path(dynspec_dir)
+    if not dpath.is_dir():
+        return None
+    patterns = []
+    if beam:
+        patterns.append(f"*{beam}*{srcname}*.ds")
+    patterns.append(f"*{srcname}*.ds")
+    for pat in patterns:
+        matches = sorted(dpath.glob(pat))
+        if matches:
+            return matches[0]
+    return None
+
+
+def plot_summaries_from_catalogue_and_h5(
+    h5_path: Union[str, Path],
+    out_dir: Union[str, Path],
+    *,
+    catalogue_path: Optional[Union[str, Path]] = None,
+    continuum_dir: Optional[Union[str, Path]] = None,
+    dynspec_dir: Optional[Union[str, Path]] = None,
+    srcnames: Optional[List[str]] = None,
+    beam: Optional[str] = None,
+    min_snr: Optional[float] = None,
+    min_dm: Optional[float] = None,
+    top: Optional[int] = None,
+    dpi: int = 200,
+    cmap: str = "viridis",
+    rfi_mad_thresh: float = 3.0,
+    dedisperse_dynspec: bool = True,
+    save_png: bool = False,
+) -> Dict[str, Any]:
+    """Regenerate candidate summary plots directly from a final catalogue and HDF5 container.
+
+    Uses :class:`fastducc.candidate_store.CandidateStore` without re-running the search,
+    re-aggregating candidates, or re-reading Measurement Sets. When ``catalogue_path``
+    is supplied (CSV or VOTable), candidates are selected and ordered from the catalogue
+    and matched to their artefacts in ``h5_path``; when omitted, candidates are drawn
+    directly from ``h5_path``.
+    """
+    from astropy.table import Table
+    from fastducc.candidate_store import CandidateStore, normalise_beam
+
+    h5_p = Path(h5_path).resolve()
+    if not h5_p.is_file():
+        raise FileNotFoundError(f"Candidate HDF5 container not found: {h5_p}")
+
+    out_d = Path(out_dir).resolve()
+    out_d.mkdir(parents=True, exist_ok=True)
+    cont_dir_str = str(Path(continuum_dir).resolve()) if continuum_dir else None
+
+    src_filter = {s.strip() for s in srcnames if s and s.strip()} if srcnames else None
+    beam_filter = normalise_beam(beam) if beam else ""
+
+    rendered_outputs: List[Dict[str, str]] = []
+    missing_rows: List[str] = []
+
+    with CandidateStore(h5_p) as store:
+        if catalogue_path is not None:
+            cat_p = Path(catalogue_path).resolve()
+            if not cat_p.is_file():
+                raise FileNotFoundError(f"Candidate catalogue not found: {cat_p}")
+            fmt = "votable" if cat_p.suffix.lower() in (".vot", ".xml") else "ascii.csv"
+            tbl = Table.read(cat_p, format=fmt)
+
+            def _col(*names: str) -> Optional[str]:
+                return next((n for n in names if n in tbl.colnames), None)
+
+            c_name = _col("srcname", "source_name", "name")
+            c_sid = _col("source_id")
+            c_snr = _col("max_snr", "snr", "SNR", "peak_snr")
+            c_dm = _col("best_dm", "dm", "DM")
+            c_beam = _col("max_snr_beam", "beam", "primary_beam")
+            c_time = _col("max_snr_time_center", "time_center")
+            c_h5idx = _col("h5_index")
+            c_x = _col("x")
+            c_y = _col("y")
+
+            rows_to_plot: List[Tuple[float, Dict[str, Any]]] = []
+            for row in tbl:
+                name_val = str(row[c_name]).strip() if c_name else ""
+                sid_val = str(row[c_sid]).strip() if c_sid else ""
+                if src_filter and (name_val not in src_filter) and (sid_val not in src_filter):
+                    continue
+
+                beam_val = normalise_beam(row[c_beam]) if c_beam else ""
+                if beam_filter and beam_val and beam_val != beam_filter:
+                    continue
+
+                snr_val = float("nan")
+                if c_snr:
+                    try:
+                        snr_val = float(str(row[c_snr]).split(",")[0])
+                    except (TypeError, ValueError):
+                        snr_val = float("nan")
+                if min_snr is not None and np.isfinite(snr_val) and snr_val < float(min_snr):
+                    continue
+
+                dm_val = float("nan")
+                if c_dm:
+                    try:
+                        dm_val = float(str(row[c_dm]).split(",")[0])
+                    except (TypeError, ValueError):
+                        dm_val = float("nan")
+                if min_dm is not None and np.isfinite(dm_val) and dm_val < float(min_dm):
+                    continue
+
+                row_dict = {col: row[col] for col in tbl.colnames}
+                row_dict["_parsed_srcname"] = name_val
+                row_dict["_parsed_beam"] = beam_val
+                row_dict["_parsed_snr"] = snr_val
+                row_dict["_parsed_dm"] = dm_val
+                row_dict["_parsed_time"] = float(row[c_time]) if (c_time and np.isfinite(float(row[c_time]))) else None
+                row_dict["_parsed_h5_index"] = int(row[c_h5idx]) if (c_h5idx and np.isfinite(float(row[c_h5idx]))) else None
+                row_dict["_parsed_x"] = int(row[c_x]) if (c_x and np.isfinite(float(row[c_x]))) else None
+                row_dict["_parsed_y"] = int(row[c_y]) if (c_y and np.isfinite(float(row[c_y]))) else None
+                rows_to_plot.append((snr_val if np.isfinite(snr_val) else -1e9, row_dict))
+
+            rows_to_plot.sort(key=lambda item: item[0], reverse=True)
+            if top is not None and int(top) > 0:
+                rows_to_plot = rows_to_plot[: int(top)]
+
+            for rank, (_, rdict) in enumerate(rows_to_plot, start=1):
+                rec = store.find(
+                    h5_index=rdict["_parsed_h5_index"],
+                    srcname=rdict["_parsed_srcname"] or None,
+                    beam=rdict["_parsed_beam"] or None,
+                    dm=rdict["_parsed_dm"] if np.isfinite(rdict["_parsed_dm"]) else None,
+                    time_center=rdict["_parsed_time"],
+                    x=rdict["_parsed_x"],
+                    y=rdict["_parsed_y"],
+                )
+                if rec is None:
+                    missing_rows.append(rdict["_parsed_srcname"] or f"row_{rank}")
+                    logger.warning("Candidate '%s' from catalogue not found in %s", rdict["_parsed_srcname"], h5_p.name)
+                    continue
+
+                ext_ds = None
+                if rec.dynspec is None and dynspec_dir is not None:
+                    ext_ds = _resolve_external_dynspec(dynspec_dir, rec.srcname or rdict["_parsed_srcname"], rec.beam or rdict["_parsed_beam"])
+
+                extra_meta = {
+                    k: rdict[k]
+                    for k in ("source_id", "n_events", "beams_all", "dm_all", "width_samples_all", "psrcat_match_name", "racs_match_name")
+                    if k in rdict
+                }
+                stem = f"{rec.srcname or f'cand{rec.cand_idx:04d}'}_{rec.beam or 'beamXX'}_dm{rec.dm:.2f}_{rec.method}_rank{rank:04d}"
+                out_pdf = out_d / f"{stem}_summary.pdf"
+                res = render_candidate_summary_from_record(
+                    rec,
+                    out_path=out_pdf,
+                    continuum_dir=cont_dir_str,
+                    dpi=dpi,
+                    cmap=cmap,
+                    ds_path=ext_ds,
+                    rfi_mad_thresh=rfi_mad_thresh,
+                    dedisperse_dynspec=dedisperse_dynspec,
+                    save_png=save_png,
+                    extra_meta=extra_meta,
+                )
+                rendered_outputs.append(res)
+        else:
+            if src_filter:
+                recs = [store[s] for s in store.keys() if s in src_filter]
+            else:
+                all_recs = list(store.values())
+                if beam_filter:
+                    all_recs = [r for r in all_recs if normalise_beam(r.beam) == beam_filter]
+                if min_snr is not None:
+                    all_recs = [r for r in all_recs if np.isfinite(r.snr) and r.snr >= float(min_snr)]
+                if min_dm is not None:
+                    all_recs = [r for r in all_recs if np.isfinite(r.dm) and r.dm >= float(min_dm)]
+                all_recs.sort(key=lambda r: r.snr if np.isfinite(r.snr) else -1e9, reverse=True)
+                recs = all_recs[: int(top)] if (top is not None and int(top) > 0) else all_recs
+
+            for rank, rec in enumerate(recs, start=1):
+                ext_ds = None
+                if rec.dynspec is None and dynspec_dir is not None:
+                    ext_ds = _resolve_external_dynspec(dynspec_dir, rec.srcname, rec.beam)
+                stem = f"{rec.srcname or f'cand{rec.cand_idx:04d}'}_{rec.beam or 'beamXX'}_dm{rec.dm:.2f}_{rec.method}_rank{rank:04d}"
+                out_pdf = out_d / f"{stem}_summary.pdf"
+                res = render_candidate_summary_from_record(
+                    rec,
+                    out_path=out_pdf,
+                    continuum_dir=cont_dir_str,
+                    dpi=dpi,
+                    cmap=cmap,
+                    ds_path=ext_ds,
+                    rfi_mad_thresh=rfi_mad_thresh,
+                    dedisperse_dynspec=dedisperse_dynspec,
+                    save_png=save_png,
+                )
+                rendered_outputs.append(res)
+
+    return {
+        "rendered": len(rendered_outputs),
+        "missing": len(missing_rows),
+        "missing_srcnames": missing_rows,
+        "outputs": rendered_outputs,
+    }

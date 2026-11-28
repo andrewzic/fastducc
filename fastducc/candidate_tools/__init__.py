@@ -31,6 +31,8 @@ from fastducc.candidate_tools.plotting import (
     save_candidate_snippet_products,
     save_periodicity_candidate_summary,
     update_candidate_summary_with_dynspec,
+    render_candidate_summary_from_record,
+    plot_summaries_from_catalogue_and_h5,
 )
 from fastducc.candidate_tools.catalogues import (
     _load_psrcat_csv,

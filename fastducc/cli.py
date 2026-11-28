@@ -203,8 +203,10 @@ def build_cli_extract_ds(argv: Sequence[str] | None = None) -> argparse.Namespac
     p.add_argument("--pol", default="I", help="Polarisation to extract ('I', 'XX', 'YY', etc.)")
     p.add_argument("--datacolumn", default="DATA", help="MS data column (DATA, CORRECTED_DATA, MODEL_DATA)")
     p.add_argument("--chunk-rows", type=int, default=100000, help="Chunk size for MS streaming (default: 100000)")
-    p.add_argument("--min-uv-distance-m", "--minuvdist", dest="min_uv_distance_m", type=float, default=0.0,
-                   help="Minimum baseline UV distance in metres (default: 0.0)")
+    p.add_argument("--min-uv-distance-m", "--minuvdist", dest="min_uv_distance_m", type=float, default=200.0,
+                   help="Minimum baseline UV distance in metres (default: 200.0, matching transient search; set 0 to disable)")
+    p.add_argument("--no-uv-clip", action="store_true",
+                   help="Disable minimum baseline UV distance clipping (equivalent to --min-uv-distance-m 0.0)")
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing .ds files")
     p.add_argument("--dry-run", action="store_true", help="Print planned batches without extracting")
     p.add_argument("--update-summary-plots", dest="update_summary_plots", action="store_true", default=True,
@@ -261,7 +263,7 @@ Available Subcommands:
   periodicity           3D DUCC NUFFT periodicity search on MS visibilities
   extract_ds (extract-ds) High-performance in-memory phased visibility dynamic spectrum extraction
   merge_h5 (merge-h5)   Merge or consolidate per-(method, beam, DM) candidate HDF5 containers
-  plot_h5 (plot-h5)     Render FastDUCC candidate summary PDFs from a candidate HDF5 container
+  plot_h5 (plot-h5, plot-summaries) Render candidate summary PDFs/PNGs from an HDF5 container and optional final catalogue
 
 Quick Examples:
   fastducc --msname /path/to/MS --chunk-size 512
@@ -346,6 +348,7 @@ def run_extract_ds(argv: Sequence[str]) -> int:
     from pathlib import Path
 
     args = build_cli_extract_ds(list(argv))
+    eff_min_uv = 0.0 if getattr(args, "no_uv_clip", False) else float(args.min_uv_distance_m)
 
     if args.catalogue or args.sbid:
         from fastducc.dynspec import batch_extract_catalogue
@@ -368,7 +371,7 @@ def run_extract_ds(argv: Sequence[str]) -> int:
             chunk_rows=args.chunk_rows,
             pol=args.pol,
             datacolumn=args.datacolumn,
-            min_uv_distance_m=args.min_uv_distance_m,
+            min_uv_distance_m=eff_min_uv,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
             update_summary_plots=args.update_summary_plots,
@@ -414,7 +417,7 @@ def run_extract_ds(argv: Sequence[str]) -> int:
         chunk_rows=args.chunk_rows,
         pol=args.pol,
         datacolumn=args.datacolumn,
-        min_uv_distance_m=args.min_uv_distance_m,
+        min_uv_distance_m=eff_min_uv,
         verbose=args.verbose,
     )
 
@@ -470,16 +473,29 @@ def build_cli_merge_h5(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def build_cli_plot_h5(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """CLI parser for 'fastducc plot_h5'."""
+    """CLI parser for 'fastducc plot_h5' / 'fastducc plot-summaries'."""
     p = argparse.ArgumentParser(
         prog="fastducc plot_h5",
-        description="Render FastDUCC candidate summary PDFs directly from a candidate HDF5 container",
+        description="Render FastDUCC candidate summary PDFs/PNGs directly from a candidate HDF5 container and optional final catalogue",
     )
-    p.add_argument("--h5", required=True, help="Path to candidate HDF5 container")
-    p.add_argument("--outdir", "-o", required=True, help="Output directory for rendered summary PDFs")
-    p.add_argument("--srcname", nargs="+", default=None, help="Specific candidate srcname(s) to plot")
-    p.add_argument("--top", type=int, default=20, help="Number of top-S/N candidates to plot when --srcname is omitted (default: 20)")
+    p.add_argument("--h5", required=True, help="Path to consolidated or per-trial candidate HDF5 container")
+    p.add_argument("--catalogue", "--catalog", dest="catalogue", default=None,
+                   help="Optional final candidate catalogue (CSV or VOTable) to select, order, and annotate candidates")
+    p.add_argument("--outdir", "-o", required=True, help="Output directory for rendered summary plots")
+    p.add_argument("--srcname", nargs="+", default=None, help="Specific candidate srcname(s) or source_id(s) to plot")
+    p.add_argument("--beam", default=None, help="Filter candidates to a specific beam (e.g. beam28)")
+    p.add_argument("--min-snr", type=float, default=None, help="Minimum candidate S/N threshold")
+    p.add_argument("--min-dm", type=float, default=None, help="Minimum candidate DM threshold (pc cm^-3)")
+    p.add_argument("--top", type=int, default=20,
+                   help="Maximum number of top-S/N candidates to plot when --srcname is omitted (default: 20; <=0 for all)")
     p.add_argument("--continuum-dir", default=None, help="Directory containing continuum reference FITS images")
+    p.add_argument("--dynspec-dir", default=None, help="Optional directory containing external .ds files when not embedded in HDF5")
+    p.add_argument("--rfi-mad-thresh", type=float, default=3.0,
+                   help="Frequency-axis MAD variance RFI flagging threshold (default: 3.0; <=0 to disable)")
+    p.add_argument("--no-dedisperse", action="store_true",
+                   help="Disable dedispersion of the dynamic spectrum to the candidate DM")
+    p.add_argument("--png", action="store_true", help="Also save PNG copies alongside summary PDFs")
+    p.add_argument("--cmap", default="viridis", help="Matplotlib colourmap name (default: viridis)")
     p.add_argument("--dpi", type=int, default=200, help="Output figure DPI (default: 200)")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
     return p.parse_args(argv)
@@ -528,24 +544,36 @@ def run_merge_h5(argv: Sequence[str]) -> int:
 
 
 def run_plot_h5(argv: Sequence[str]) -> int:
-    """Render candidate summary plots directly from a candidate HDF5 container."""
-    from pathlib import Path
-    from fastducc.candidate_store import CandidateStore
+    """Render candidate summary plots directly from a candidate HDF5 container and optional final catalogue."""
+    from fastducc.candidate_tools.plotting import plot_summaries_from_catalogue_and_h5
 
     args = build_cli_plot_h5(list(argv))
-    out_dir = Path(args.outdir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with CandidateStore(args.h5) as store:
-        if args.srcname:
-            recs = [store[s] for s in args.srcname if s in store]
-        else:
-            recs = store.top(args.top)
-        for rank, rec in enumerate(recs, start=1):
-            stem = f"{rec.srcname or f'cand{rec.cand_idx:04d}'}_{rec.beam or 'beamXX'}_dm{rec.dm:.2f}_{rec.method}_rank{rank:04d}"
-            out_pdf = out_dir / f"{stem}_summary.pdf"
-            rec.plot_summary(out_pdf, continuum_dir=args.continuum_dir, dpi=args.dpi)
-        logger.info("Rendered %d summary plot(s) from %s -> %s", len(recs), args.h5, out_dir)
+    top_val = None if (args.srcname or (args.top is not None and args.top <= 0)) else args.top
+    summary = plot_summaries_from_catalogue_and_h5(
+        h5_path=args.h5,
+        out_dir=args.outdir,
+        catalogue_path=args.catalogue,
+        continuum_dir=args.continuum_dir,
+        dynspec_dir=args.dynspec_dir,
+        srcnames=args.srcname,
+        beam=args.beam,
+        min_snr=args.min_snr,
+        min_dm=args.min_dm,
+        top=top_val,
+        dpi=args.dpi,
+        cmap=args.cmap,
+        rfi_mad_thresh=args.rfi_mad_thresh,
+        dedisperse_dynspec=not args.no_dedisperse,
+        save_png=args.png,
+    )
+    logger.info(
+        "Rendered %d summary plot(s) from %s%s -> %s (%d missing)",
+        summary["rendered"],
+        args.h5,
+        f" + {args.catalogue}" if args.catalogue else "",
+        args.outdir,
+        summary["missing"],
+    )
     return 0
 
 
@@ -567,6 +595,8 @@ _SUBCOMMAND_DISPATCH = {
     "merge-h5": run_merge_h5,
     "plot_h5": run_plot_h5,
     "plot-h5": run_plot_h5,
+    "plot_summaries": run_plot_h5,
+    "plot-summaries": run_plot_h5,
 }
 
 
