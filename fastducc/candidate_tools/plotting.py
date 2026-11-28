@@ -43,7 +43,7 @@ from fastducc import kernels
 from fastducc.candidate_tools.utils import parse_candidate_filename
 from fastducc.candidate_tools.snippets import compute_candidate_local_rms
 
-_CONTINUUM_IMAGE_CACHE: Dict[str, Tuple[np.ndarray, WCS, str]] = {}
+_CONTINUUM_IMAGE_CACHE: Dict[str, tuple[np.ndarray, WCS, str]] = {}
 
 
 def get_cached_continuum_image(fits_path: str) -> Tuple[np.ndarray, WCS, str]:
@@ -118,7 +118,7 @@ def wrap_candidate_metadata_text(text: str, max_width: int = 33) -> str:
 def save_candidate_summary(
     times: Optional[np.ndarray] = None,
     cube: Optional[np.ndarray] = None,
-    candidate: Optional[Dict[str, Any]] = None,
+    candidate: Optional[Any] = None,
     out_prefix: str = "",
     *,
     continuum_dir: Optional[str] = None,
@@ -143,12 +143,48 @@ def save_candidate_summary(
 ) -> Dict[str, str]:
     """
     Build a prepfold-like single candidate summary PDF page and save cutout/fullframe FITS.
-    Automatically dispatches to save_periodicity_candidate_summary when processing periodicity candidates.
+    Accepts either a candidate dict or a :class:`fastducc.candidate_store.CandidateRecord`.
+    Automatically dispatches to HDF5 record rendering or periodicity summary plotting as appropriate.
     """
     if candidate is None:
-        raise ValueError("candidate dict must be provided.")
+        raise ValueError("candidate dict or CandidateRecord must be provided.")
 
-    if times is None or cube is None or ("period_s" in candidate or "f_hz" in candidate or candidate.get("algo") in ("uv_ffa", "periodicity", "nufft")):
+    from fastducc.candidate_store import CandidateRecord, CandidateStore
+
+    if isinstance(candidate, CandidateRecord):
+        out_fig = f"{out_prefix}_summary.pdf" if not str(out_prefix).endswith(".pdf") else str(out_prefix)
+        return render_candidate_summary_from_record(
+            candidate,
+            out_path=out_fig,
+            continuum_dir=continuum_dir,
+            cmap=cmap,
+            dpi=dpi,
+            **kwargs,
+        )
+
+    if (times is None or cube is None) and candidate.get("products_h5") and os.path.isfile(str(candidate["products_h5"])):
+        with CandidateStore(str(candidate["products_h5"])) as store:
+            rec = store.find(
+                h5_index=candidate.get("h5_index"),
+                srcname=candidate.get("srcname"),
+                dm=candidate.get("dm"),
+                period_s=candidate.get("period_s"),
+                time_center=candidate.get("time_center"),
+                x=candidate.get("x"),
+                y=candidate.get("y"),
+            )
+            if rec is not None:
+                out_fig = f"{out_prefix}_summary.pdf" if not str(out_prefix).endswith(".pdf") else str(out_prefix)
+                return render_candidate_summary_from_record(
+                    rec,
+                    out_path=out_fig,
+                    continuum_dir=continuum_dir,
+                    cmap=cmap,
+                    dpi=dpi,
+                    **kwargs,
+                )
+
+    if times is None or cube is None or ("period_s" in candidate or "f_hz" in candidate or candidate.get("algo") in ("uv_ffa", "ffa", "periodicity", "nufft")):
         return save_periodicity_candidate_summary(
             candidate=candidate,
             out_prefix=out_prefix,
@@ -907,7 +943,7 @@ def _crop_or_pad_cutout(img: np.ndarray, target_size: int) -> np.ndarray:
 
 
 def save_periodicity_candidate_summary(
-    candidate: Dict[str, Any],
+    candidate: Any,
     out_prefix: str,
     *,
     cutout: Optional[np.ndarray] = None,
@@ -933,12 +969,58 @@ def save_periodicity_candidate_summary(
     out_dir_cutouts: Optional[str] = None,
     out_dir_profiles: Optional[str] = None,
     out_dir_fullframes: Optional[str] = None,
+    write_artefacts: bool = True,
 ) -> Dict[str, str]:
     """
-    Build a publication-quality FastDUCC candidate summary PDF and candidate artefacts
+    Build a publication-quality FastDUCC candidate summary PDF and optional candidate artefacts
     (FITS cutouts, FITS fullframes, folded profile arrays) for periodicity search candidates.
-    Matches the 2x3 GridSpec layout, information density, and style of FastDUCC transient summaries.
+    Accepts either a candidate dict or a :class:`fastducc.candidate_store.CandidateRecord`.
     """
+    from fastducc.candidate_store import CandidateRecord, CandidateStore
+
+    if isinstance(candidate, CandidateRecord):
+        rec = candidate
+        candidate = rec.to_dict(load_arrays=True)
+        if cutout is None:
+            cutout = rec.cutout
+        if cutout_off is None:
+            cutout_off = rec.cutout_off
+        if fullframe is None:
+            fullframe = rec.fullframe
+        if profile is None:
+            profile = rec.profile if rec.profile is not None else (rec.spectrum.power if rec.spectrum is not None else None)
+        if wcs_full is None:
+            wcs_full = rec.wcs_full
+    elif (
+        cutout is None
+        and candidate.get("cutout") is None
+        and candidate.get("cutout_on_res") is None
+        and candidate.get("products_h5")
+        and os.path.isfile(str(candidate["products_h5"]))
+    ):
+        with CandidateStore(str(candidate["products_h5"])) as store:
+            rec = store.find(
+                h5_index=candidate.get("h5_index"),
+                srcname=candidate.get("srcname"),
+                dm=candidate.get("dm", candidate.get("best_dm")),
+                period_s=candidate.get("period_s"),
+                x=candidate.get("x"),
+                y=candidate.get("y"),
+            )
+            if rec is not None:
+                cutout = rec.cutout
+                if cutout_off is None:
+                    cutout_off = rec.cutout_off
+                if fullframe is None:
+                    fullframe = rec.fullframe
+                if profile is None:
+                    profile = rec.profile if rec.profile is not None else (rec.spectrum.power if rec.spectrum is not None else None)
+                if wcs_full is None:
+                    wcs_full = rec.wcs_full
+                if rec.spectrum is not None:
+                    candidate = dict(candidate)
+                    candidate.setdefault("spectrum_1d", rec.spectrum.power)
+                    candidate.setdefault("spectrum_freqs", rec.spectrum.freqs_hz)
     x = int(candidate.get("x", 0))
     y = int(candidate.get("y", 0))
     snr_val = float(candidate.get("snr", 0.0))
@@ -1521,7 +1603,11 @@ def save_periodicity_candidate_summary(
 
     # Save Cutout FITS with WCS & metadata if available
     out_fits = ""
-    if has_cutout and cutout_det is not None and wcs_cut is not None:
+    out_fits_off = ""
+    out_fits_full = ""
+    out_npz = ""
+    out_spec_npz = ""
+    if write_artefacts and has_cutout and cutout_det is not None and wcs_cut is not None:
         if out_dir_cutouts:
             os.makedirs(out_dir_cutouts, exist_ok=True)
             out_fits = os.path.join(out_dir_cutouts, f"{base_stem}_cutout.fits")
@@ -1549,8 +1635,7 @@ def save_periodicity_candidate_summary(
             hdr["RADESYS"] = str(wcs_cut.wcs.radesys)
         fits.writeto(out_fits, cutout_det.astype(np.float32), header=hdr, overwrite=True)
 
-    out_fits_off = ""
-    if has_cutout and cutout_off_det is not None and wcs_cut is not None:
+    if write_artefacts and has_cutout and cutout_off_det is not None and wcs_cut is not None:
         if out_dir_cutouts:
             os.makedirs(out_dir_cutouts, exist_ok=True)
             out_fits_off = os.path.join(out_dir_cutouts, f"{base_stem}_cutout_off.fits")
@@ -1559,8 +1644,7 @@ def save_periodicity_candidate_summary(
         fits.writeto(out_fits_off, cutout_off_det.astype(np.float32), header=hdr, overwrite=True)
 
     # Save Fullframe FITS if available
-    out_fits_full = ""
-    if fullframe is not None and wcs_full is not None:
+    if write_artefacts and fullframe is not None and wcs_full is not None:
         if out_dir_fullframes:
             os.makedirs(out_dir_fullframes, exist_ok=True)
             out_fits_full = os.path.join(out_dir_fullframes, f"{base_stem}_fullframe.fits")
@@ -1580,9 +1664,7 @@ def save_periodicity_candidate_summary(
         fits.writeto(out_fits_full, fullframe.astype(np.float32), header=hdr_full, overwrite=True)
 
     # Save 1D Folded Pulse Profile NPZ or Spin-Frequency Spectrum NPZ if available
-    out_npz = ""
-    out_spec_npz = ""
-    if is_nufft_mode and spectrum_1d is not None:
+    if write_artefacts and is_nufft_mode and spectrum_1d is not None:
         if out_dir_profiles:
             os.makedirs(out_dir_profiles, exist_ok=True)
             out_spec_npz = os.path.join(out_dir_profiles, f"{base_stem}_nufft_spectrum.npz")
@@ -1605,7 +1687,7 @@ def save_periodicity_candidate_summary(
             np_save_dict["spec_local_contrast"] = float(candidate["spec_local_contrast"])
         np.savez(out_spec_npz, **np_save_dict)
 
-    if has_profile and p_norm is not None:
+    if write_artefacts and has_profile and p_norm is not None:
         if out_dir_profiles:
             os.makedirs(out_dir_profiles, exist_ok=True)
             out_npz = os.path.join(out_dir_profiles, f"{base_stem}_profile.npz")
@@ -1647,6 +1729,7 @@ def update_candidate_summary_with_dynspec(
     candidate_info: Optional[Dict[str, Any]] = None,
     dpi: int = 200,
     cmap: str = "viridis",
+    candidate_store_path: Optional[Union[str, Path]] = None,
 ) -> Path:
     """
     Update an existing transient candidate summary plot to incorporate a dynamic spectrum waterfall.
@@ -1693,6 +1776,32 @@ def update_candidate_summary_with_dynspec(
     ds_raw_data = np.asarray(ds_dict["data"], dtype=np.float32)
     ds_freqs = np.asarray(ds_dict["freq"], dtype=np.float64)
     ds_raw_times = ds_dict.get("time_raw")
+
+    # 1b. If an HDF5 candidate store is provided (or referenced in candidate_info), render directly from it
+    h5_source = candidate_store_path or (candidate_info or {}).get("products_h5")
+    if h5_source and Path(str(h5_source)).is_file():
+        from fastducc.candidate_store import CandidateStore
+
+        c_info = candidate_info or {}
+        with CandidateStore(str(h5_source)) as store:
+            rec = store.find(
+                h5_index=c_info.get("h5_index"),
+                srcname=c_info.get("srcname"),
+                beam=c_info.get("beam"),
+                dm=c_info.get("dm"),
+                time_center=c_info.get("time_center"),
+            )
+            if rec is not None:
+                render_candidate_summary_from_record(
+                    rec,
+                    out_path=out_path,
+                    continuum_dir=c_info.get("continuum_dir"),
+                    dpi=dpi,
+                    cmap=cmap,
+                    dynspec=ds_dict,
+                    ds_path=ds_path,
+                )
+                return Path(out_path)
 
     # 2. Discover candidate artefacts (cutout, fullframe, lightcurve)
     pdir = summary_plot_path.parent
@@ -2297,3 +2406,287 @@ def update_candidate_summary_with_dynspec(
 
     logger.info(f"Updated candidate summary with dynamic spectrum: {out_path} and {png_path}")
     return out_path
+
+
+def render_candidate_summary_from_record(
+    record: Any,
+    out_path: Union[str, Path],
+    *,
+    continuum_dir: Optional[str] = None,
+    dpi: int = 200,
+    cmap: str = "viridis",
+    dynspec: Optional[Dict[str, Any]] = None,
+    ds_path: Optional[Union[str, Path]] = None,
+    **kwargs: Any,
+) -> Dict[str, str]:
+    """Render a FastDUCC diagnostic summary PDF directly from an HDF5 :class:`CandidateRecord`.
+
+    Dispatches cleanly across all four search methods (``boxcar``, ``variance``,
+    ``ffa``, ``nufft``) without requiring full 3D image cubes or writing loose
+    FITS/NPZ artefact files.
+    """
+    out_p = Path(out_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    method = str(record.method).lower().strip()
+
+    # Periodicity searches (NUFFT / FFA) reuse save_periodicity_candidate_summary with write_artefacts=False
+    if method in ("nufft", "ffa"):
+        cand_dict = record.to_dict(load_arrays=True)
+        cut_on = record.cutout
+        cut_off = record.cutout_off
+        fullframe = record.fullframe
+        spec = record.spectrum
+        prof = record.profile
+        spatial_size = int(cut_on.shape[0]) if cut_on is not None else int(record._store.cutout_size)
+        method_label = "NUFFT (Harmonic Sum)" if method == "nufft" else "UV-FFA (c2r)"
+        stem = out_p.stem
+        if stem.endswith("_summary"):
+            stem = stem[: -len("_summary")]
+        raw = save_periodicity_candidate_summary(
+            candidate=cand_dict,
+            out_prefix=stem,
+            cutout=cut_on,
+            cutout_off=cut_off,
+            fullframe=fullframe,
+            profile=prof if method == "ffa" else (spec.power if spec is not None else None),
+            continuum_dir=continuum_dir,
+            spatial_size=spatial_size,
+            cmap=cmap,
+            dpi=dpi,
+            wcs_full=record.wcs_full,
+            method=method_label,
+            out_dir_plots=str(out_p.parent),
+            write_artefacts=False,
+        )
+        gen_pdf = raw.get("summary_plot", "")
+        if gen_pdf and Path(gen_pdf).resolve() != out_p.resolve() and os.path.exists(gen_pdf):
+            os.replace(gen_pdf, str(out_p))
+            raw["summary_plot"] = str(out_p)
+            raw["figure"] = str(out_p)
+        return raw
+
+    # Transient searches (boxcar / variance) rendered directly from HDF5 artefacts
+    cut_data = record.cutout
+    cut_wcs = record.cutout_wcs
+    fullframe = record.fullframe
+    if fullframe is None and method == "variance":
+        fullframe = record._store.std_map
+    wcs_full = record.wcs_full
+    lc = record.lightcurve
+
+    ds_dict = dynspec
+    if ds_dict is None and record.dynspec is not None:
+        ds_dict = record.dynspec.to_dict()
+    elif ds_dict is None and ds_path is not None and os.path.isfile(str(ds_path)):
+        from fastducc.dynspec import load_dynamic_spectrum_hdf5
+
+        ds_dict = load_dynamic_spectrum_hdf5(ds_path)
+
+    has_dynspec = bool(ds_dict is not None and "data" in ds_dict and "freq" in ds_dict and np.asarray(ds_dict["data"]).size > 0)
+
+    # Continuum cutout
+    cont_im, cont_wcs, cont_vmin, cont_vmax = None, None, None, None
+    ra_deg = record.ra_deg
+    dec_deg = record.dec_deg
+    if continuum_dir and os.path.isdir(continuum_dir) and np.isfinite(ra_deg) and np.isfinite(dec_deg):
+        beam_lbl = record.beam
+        fits_cands = sorted(glob.glob(os.path.join(continuum_dir, f"*{beam_lbl}*.fits"))) if beam_lbl else []
+        if not fits_cands:
+            fits_cands = sorted(glob.glob(os.path.join(continuum_dir, "*.fits")))
+        if fits_cands:
+            try:
+                cdata, cw, bunit = get_cached_continuum_image(fits_cands[-1])
+                sp_sz = int(cut_data.shape[0]) if cut_data is not None else 50
+                pix_deg = abs(float(cut_wcs.wcs.cdelt[1])) if cut_wcs is not None else (22.0 / 3600.0)
+                pos = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+                c2d = Cutout2D(
+                    data=cdata,
+                    position=pos,
+                    size=(sp_sz * pix_deg * u.deg, sp_sz * pix_deg * u.deg),
+                    wcs=cw,
+                    mode="partial",
+                    fill_value=np.nan,
+                )
+                cont_im = c2d.data.copy()
+                if "JY" in bunit and "MJY" not in bunit and "UJY" not in bunit:
+                    cont_im = cont_im * 1000.0
+                cont_wcs = c2d.wcs
+                cont_vmin = float(np.nanpercentile(cont_im, 5.0))
+                cont_vmax = float(np.nanpercentile(cont_im, 99.5))
+            except Exception as exc:
+                logger.debug("Could not load continuum cutout for %s: %s", record.srcname, exc)
+
+    if has_dynspec:
+        fig = plt.figure(figsize=(18, 12.5), dpi=dpi)
+        gs = GridSpec(
+            nrows=3, ncols=3, figure=fig,
+            height_ratios=[1.0, 0.96, 0.80], width_ratios=[1.0, 1.0, 0.95],
+            hspace=0.28, wspace=0.20,
+        )
+    else:
+        fig = plt.figure(figsize=(18, 12), dpi=dpi)
+        gs = GridSpec(
+            nrows=2, ncols=3, figure=fig,
+            height_ratios=[2.0, 1.0], width_ratios=[1.0, 1.0, 1.0],
+        )
+
+    # Panel (0, 0): Continuum
+    if cont_wcs is not None and cont_im is not None:
+        ax_cont = fig.add_subplot(gs[0, 0], projection=cont_wcs)
+        im_cont = ax_cont.imshow(cont_im, origin="lower", cmap=cmap, vmin=cont_vmin, vmax=cont_vmax)
+        ax_cont.coords.grid(True, color="white", alpha=0.35, ls=":")
+        ax_cont.set_xlabel("RA (J2000)")
+        ax_cont.set_ylabel("Dec (J2000)")
+        ax_cont.set_aspect("equal", adjustable="box")
+        ax_cont.plot([ra_deg], [dec_deg], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none", transform=ax_cont.get_transform("world"))
+        ax_cont.plot([ra_deg], [dec_deg], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none", transform=ax_cont.get_transform("world"))
+        fig.colorbar(im_cont, ax=ax_cont, orientation="horizontal", fraction=0.046, pad=0.10, label="Flux density (mJy/beam)")
+        ax_cont.set_title("Continuum")
+    else:
+        ax_cont = fig.add_subplot(gs[0, 0])
+        ax_cont.set_facecolor("#222222")
+        ax_cont.text(0.5, 0.5, "NO CONTINUUM REFERENCE\nAVAILABLE", ha="center", va="center", color="silver", weight="bold", fontsize=11, transform=ax_cont.transAxes)
+        ax_cont.set_title("Continuum (Unavailable)")
+        ax_cont.set_xticks([])
+        ax_cont.set_yticks([])
+
+    # Panel (0, 1): Full Field (if archived)
+    det_time = record.time_center
+    det_time_mjd = det_time / 86400.0 if np.isfinite(det_time) else float("nan")
+    det_time_str = f"{det_time_mjd:.7f} MJD" if np.isfinite(det_time_mjd) else "—"
+    if fullframe is not None and wcs_full is not None:
+        ax_full = fig.add_subplot(gs[0, 1], projection=wcs_full)
+        ff_v0, ff_v1 = np.nanpercentile(fullframe, [5.0, 99.5])
+        im_full = ax_full.imshow(fullframe, origin="lower", cmap=cmap, vmin=ff_v0, vmax=ff_v1)
+        ax_full.set_xlabel("RA (J2000)")
+        ax_full.set_ylabel("Dec (J2000)")
+        ax_full.set_aspect("equal", adjustable="box")
+        if record.x >= 0 and record.y >= 0:
+            ax_full.plot([record.x], [record.y], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+            ax_full.plot([record.x], [record.y], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+        fig.colorbar(im_full, ax=ax_full, orientation="horizontal", fraction=0.046, pad=0.10, label="Flux density")
+        ax_full.set_title(f"Field @ {det_time_str}")
+    else:
+        ax_full = fig.add_subplot(gs[0, 1])
+        ax_full.set_facecolor("#222222")
+        ax_full.text(0.5, 0.5, "FULL FRAME NOT ARCHIVED\n(HDF5 cutout-only mode)", ha="center", va="center", color="silver", weight="bold", fontsize=11, transform=ax_full.transAxes)
+        ax_full.set_title(f"Field @ {det_time_str}")
+        ax_full.set_xticks([])
+        ax_full.set_yticks([])
+
+    # Panel (0, 2): Detection Cutout
+    if cut_data is not None and cut_data.size > 0:
+        ax_cut = fig.add_subplot(gs[0, 2], projection=cut_wcs) if cut_wcs is not None else fig.add_subplot(gs[0, 2])
+        finite_c = cut_data[np.isfinite(cut_data)]
+        c_v0 = float(np.nanpercentile(finite_c, 5.0)) if finite_c.size > 0 else 0.0
+        c_v1 = float(np.nanpercentile(finite_c, 99.5)) if finite_c.size > 0 else 1.0
+        im_cut = ax_cut.imshow(cut_data, origin="lower", cmap=cmap, vmin=c_v0, vmax=c_v1)
+        if cut_wcs is not None:
+            ax_cut.set_xlabel("RA (J2000)")
+            ax_cut.set_ylabel("Dec (J2000)")
+        ax_cut.set_aspect("equal", adjustable="box")
+        cx, cy = cut_data.shape[1] // 2, cut_data.shape[0] // 2
+        ax_cut.plot([cx], [cy], marker=reticle(which="rt"), ms=39, mec="black", mew=3.0, mfc="none")
+        ax_cut.plot([cx], [cy], marker=reticle(which="rt"), ms=36, mec="white", mew=1.5, mfc="none")
+        fig.colorbar(im_cut, ax=ax_cut, orientation="horizontal", fraction=0.046, pad=0.10, label="Flux density")
+        ax_cut.set_title(f"Cutout ({method}, S/N={record.snr:.2f})")
+    else:
+        ax_cut = fig.add_subplot(gs[0, 2])
+        ax_cut.set_facecolor("#222222")
+        ax_cut.text(0.5, 0.5, "NO CUTOUT AVAILABLE", ha="center", va="center", color="silver", weight="bold", fontsize=11, transform=ax_cut.transAxes)
+        ax_cut.set_xticks([])
+        ax_cut.set_yticks([])
+
+    # Dynamic spectrum panel (row 1) + lightcurve panel (row 2 or row 1)
+    if has_dynspec:
+        ax_ds = fig.add_subplot(gs[1, 0:2])
+        ds_raw = np.asarray(ds_dict["data"], dtype=np.float32)
+        ds_freqs = np.asarray(ds_dict["freq"], dtype=np.float64)
+        ds_t = np.asarray(ds_dict.get("time", np.arange(ds_raw.shape[0], dtype=np.float64)), dtype=np.float64)
+        finite_ds = ds_raw[np.isfinite(ds_raw)]
+        v0_ds, v1_ds = (np.percentile(finite_ds, [5.0, 99.5]) if finite_ds.size > 0 else (0.0, 1.0))
+        im_ds = ax_ds.imshow(
+            ds_raw.T, origin="lower", aspect="auto",
+            extent=[float(ds_t[0]), float(ds_t[-1]), float(ds_freqs[0]), float(ds_freqs[-1])],
+            cmap=cmap, vmin=v0_ds, vmax=v1_ds,
+        )
+        ax_ds.set_ylabel("Frequency (MHz)")
+        ax_ds.set_title("Dynamic Spectrum")
+        fig.colorbar(im_ds, ax=ax_ds, orientation="vertical", fraction=0.03, pad=0.02, label="Flux (Jy)")
+        ax_lc = fig.add_subplot(gs[2, 0:2])
+        ax_txt = fig.add_subplot(gs[1:3, 2])
+    else:
+        ax_lc = fig.add_subplot(gs[1, 0:2])
+        ax_txt = fig.add_subplot(gs[1, 2])
+
+    # Lightcurve panel
+    w = max(1, int(record.width_samples))
+    if lc is not None and len(lc) > 0:
+        t0 = float(lc.time[0])
+        rel_t = lc.time - t0
+        mjd0 = t0 / 86400.0
+        has_err = np.any(lc.flux_err > 0)
+        if has_err:
+            ax_lc.errorbar(rel_t, lc.flux, yerr=lc.flux_err, fmt="none", ecolor="grey", elinewidth=0.8, capsize=0, alpha=0.6, zorder=1)
+        ax_lc.plot(rel_t, lc.flux, color="tab:blue", lw=1.3, label="Raw", zorder=2)
+        if method == "boxcar" and w > 1:
+            t_sm, f_sm, _ = lc.smoothed(w)
+            if t_sm.size > 0:
+                ax_lc.plot(t_sm - t0, f_sm, color="tab:green", lw=1.6, label=f"Boxcar (w={w})", zorder=3)
+        if np.isfinite(det_time):
+            t_det_rel = det_time - t0
+            if rel_t[0] <= t_det_rel <= rel_t[-1]:
+                ax_lc.axvline(t_det_rel, color="crimson", ls="--", lw=1.1, zorder=4, label="Detection")
+        ax_lc.set_xlabel(f"Time from MJD {mjd0:.7f} (s)")
+        ax_lc.set_ylabel("Flux density")
+        ax_lc.grid(True, alpha=0.3)
+        ax_lc.legend(loc="best")
+    else:
+        ax_lc.set_facecolor("#222222")
+        ax_lc.text(0.5, 0.5, "NO LIGHTCURVE DATA AVAILABLE", ha="center", va="center", color="silver", weight="bold", fontsize=12, transform=ax_lc.transAxes)
+        ax_lc.set_xticks([])
+        ax_lc.set_yticks([])
+
+    # Metadata panel
+    ax_txt.set_axis_off()
+    ra_hms = record.ra_hms
+    dec_dms = record.dec_dms
+    if (not ra_hms or not dec_dms) and np.isfinite(ra_deg) and np.isfinite(dec_deg):
+        ra_hms, dec_dms = ducc_wcs.rad_to_hmsdms(np.deg2rad(ra_deg), np.deg2rad(dec_deg), dp=1)
+    dm_val = record.dm if np.isfinite(record.dm) else 0.0
+    extra_lines = []
+    for lbl, key in (
+        ("Beams", "beams_all"),
+        ("DMs", "dm_all"),
+        ("Widths", "width_samples_all"),
+        ("PSRCAT", "psrcat_match_name"),
+        ("RACS", "racs_match_name"),
+    ):
+        val = record.meta.get(key)
+        if val:
+            extra_lines.append(f"{lbl}: {val}")
+    extra_block = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+
+    txt = (
+        f"Name: {record.srcname or '—'}\n"
+        f"Field: {record.field or '—'}\n"
+        f"S/N: {record.snr:.2f}\n"
+        f"DM: {dm_val:.2f} pc/cm³\n"
+        f"SBID: {record.sbid or '—'}\n"
+        f"Beam: {record.beam or '—'}\n"
+        f"Scan: {record.scan_id or '—'}\n"
+        f"Coord (J2000): {ra_hms} {dec_dms}\n"
+        f"Coord (x,y): ({record.x}, {record.y})\n"
+        f"Det. time: {det_time_str}\n"
+        f"Method: {method}\n"
+        f"Width: {w if method == 'boxcar' else '—'}\n"
+        f"HDF5: {record.store_path.name} [{record.h5_index}]"
+        f"{extra_block}"
+    )
+    ax_txt.add_artist(AnchoredText(txt, loc="upper left", frameon=True, pad=1.0, prop={"size": 10}))
+    ax_txt.set_title("Summary", pad=12)
+
+    fig.savefig(str(out_p), bbox_inches="tight")
+    fig.clf()
+    plt.close(fig)
+    return {"figure": str(out_p), "summary_plot": str(out_p)}
